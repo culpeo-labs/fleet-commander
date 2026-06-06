@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use crate::agent::{Agent, AgentId, AgentStatus};
 use crate::agent_runtime;
 use crate::change_source::ChangeEvent;
+use crate::completion::{PathCompleter, split_command_and_path};
 use crate::config::{Action, Config};
 use crate::event::AppEvent;
 
@@ -71,6 +72,14 @@ pub struct App {
     pub should_quit: bool,
     /// Text the user is composing in insert mode.
     pub input_buffer: String,
+    /// When true, the user is typing a `:` command (vim-style command mode).
+    pub command_mode: bool,
+    /// Buffer for the current command being typed.
+    pub command_buffer: String,
+    /// Ephemeral status message shown in the footer (e.g. error from a command).
+    pub status_message: Option<String>,
+    /// Tab-completion state for command mode paths.
+    pub completer: PathCompleter,
     /// Channel for sending events (used to dispatch messages to agents).
     pub tx: mpsc::UnboundedSender<AppEvent>,
 }
@@ -83,6 +92,10 @@ impl App {
             screen: Screen::AgentList { selected: 0 },
             should_quit: false,
             input_buffer: String::new(),
+            command_mode: false,
+            command_buffer: String::new(),
+            status_message: None,
+            completer: PathCompleter::default(),
             tx,
         }
     }
@@ -165,6 +178,54 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // Clear status message on any keypress.
+        self.status_message = None;
+
+        // Command mode (`:` prompt) — intercept all keys.
+        if self.command_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.command_mode = false;
+                    self.command_buffer.clear();
+                    self.completer.reset();
+                }
+                KeyCode::Enter => {
+                    let cmd = std::mem::take(&mut self.command_buffer);
+                    self.command_mode = false;
+                    self.completer.reset();
+                    self.execute_command(&cmd);
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
+                    let (verb, partial) = split_command_and_path(&self.command_buffer);
+                    let verb = verb.to_string();
+                    // Only complete paths for commands that take a path arg.
+                    if matches!(verb.as_str(), "open" | "o") {
+                        let partial = partial.to_string();
+                        let completed = if key.code == KeyCode::Tab {
+                            self.completer.complete(&partial).map(String::from)
+                        } else {
+                            self.completer.complete_prev(&partial).map(String::from)
+                        };
+                        if let Some(path) = completed {
+                            self.command_buffer = format!("{verb} {path}");
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.completer.reset();
+                    if self.command_buffer.pop().is_none() {
+                        self.command_mode = false;
+                    }
+                }
+                KeyCode::Char(c) => {
+                    self.completer.reset();
+                    self.command_buffer.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // In input mode, capture text instead of dispatching actions.
         if let Screen::AgentSession {
             input_mode: true,
@@ -211,6 +272,13 @@ impl App {
         let Some(action) = self.config.bindings.action_for(&key) else {
             return;
         };
+
+        // Command mode activation works on any screen.
+        if action == Action::Command {
+            self.command_mode = true;
+            self.command_buffer.clear();
+            return;
+        }
 
         let next = match &mut self.screen {
             Screen::AgentList { selected } => {
@@ -310,6 +378,68 @@ impl App {
                 };
             }
         }
+    }
+
+    /// Parse and execute a `:` command.
+    fn execute_command(&mut self, cmd: &str) {
+        let cmd = cmd.trim();
+        if cmd.is_empty() {
+            return;
+        }
+        let (verb, rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
+        let rest = rest.trim();
+        match verb {
+            "open" | "o" => {
+                if rest.is_empty() {
+                    self.status_message = Some("Usage: :open <path/to/repo>".into());
+                } else {
+                    self.open_workspace(rest);
+                }
+            }
+            "q" | "quit" => {
+                self.should_quit = true;
+            }
+            _ => {
+                self.status_message = Some(format!("Unknown command: {verb}"));
+            }
+        }
+    }
+
+    /// Create a new Copilot agent for the given workspace path and navigate to it.
+    pub fn open_workspace(&mut self, path: &str) {
+        let workspace = PathBuf::from(path);
+        let dir_name = workspace
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace");
+        let agent_id = format!("copilot-{dir_name}");
+
+        // Check if an agent with this workspace already exists.
+        if let Some(existing) = self.agents.iter().find(|a| a.id == agent_id) {
+            self.screen = Screen::AgentSession {
+                agent_id: existing.id.clone(),
+                focus: SessionFocus::Conversation,
+                side_pane: None,
+                scroll: 0,
+                input_mode: false,
+            };
+            self.ensure_agent_connected(agent_id);
+            return;
+        }
+
+        let agent = Agent::new(&agent_id, format!("Copilot ({dir_name})"))
+            .with_acp_command("copilot --acp --stdio")
+            .with_workspace(&workspace);
+        self.agents.push(agent);
+
+        self.screen = Screen::AgentSession {
+            agent_id: agent_id.clone(),
+            focus: SessionFocus::Conversation,
+            side_pane: None,
+            scroll: 0,
+            input_mode: false,
+        };
+        self.ensure_agent_connected(agent_id);
     }
 }
 

@@ -13,6 +13,7 @@ mod agent;
 mod agent_runtime;
 mod app;
 mod change_source;
+mod completion;
 mod config;
 mod container;
 mod event;

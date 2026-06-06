@@ -39,6 +39,39 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             &app.input_buffer,
         ),
     }
+
+    // Command bar overlay — drawn last so it sits on top of the footer.
+    if app.command_mode {
+        let bar_area = Rect {
+            x: area.x,
+            y: area.y + area.height.saturating_sub(1),
+            width: area.width,
+            height: 1,
+        };
+        let text = format!(":{}", app.command_buffer);
+        let bar = Paragraph::new(Span::styled(
+            text,
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(Color::DarkGray));
+        frame.render_widget(bar, bar_area);
+    } else if let Some(msg) = &app.status_message {
+        let bar_area = Rect {
+            x: area.x,
+            y: area.y + area.height.saturating_sub(1),
+            width: area.width,
+            height: 1,
+        };
+        let bar = Paragraph::new(Span::styled(
+            msg.as_str(),
+            Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+        ))
+        .style(Style::default().bg(Color::DarkGray));
+        frame.render_widget(bar, bar_area);
+    }
 }
 
 fn render_agent_list(frame: &mut Frame<'_>, area: Rect, agents: &[Agent], selected: usize) {
@@ -81,7 +114,7 @@ fn render_agent_list(frame: &mut Frame<'_>, area: Rect, agents: &[Agent], select
     state.select(Some(selected));
     frame.render_stateful_widget(list, layout[0], &mut state);
 
-    let footer = Paragraph::new("↑/k  ↓/j  Enter open  q quit")
+    let footer = Paragraph::new("↑/k  ↓/j  Enter open  :open <path>  q quit")
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL).title(" Keys "));
     frame.render_widget(footer, layout[1]);
