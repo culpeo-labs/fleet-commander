@@ -28,14 +28,29 @@ pub struct ContainerInfo {
 /// Start a dev container for the given workspace.
 ///
 /// Runs `devcontainer up --workspace-folder <path>` and parses the JSON output.
+/// Mounts the host's `~/.copilot` directory into the container so that agents
+/// share the host's authentication — no separate login required per container.
 /// This may take a while on first run (image build + container creation).
 pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, ContainerError> {
+    let mut args = vec![
+        "up".to_string(),
+        "--workspace-folder".to_string(),
+        config.workspace_folder.to_str().unwrap_or(".").to_string(),
+    ];
+
+    // Mount host ~/.copilot into the container so credentials are shared.
+    // We use a fixed target path and set COPILOT_HOME via --remote-env
+    // at exec time so the copilot CLI finds it regardless of container user.
+    if let Some(copilot_dir) = copilot_config_dir().filter(|d| d.exists()) {
+        args.push("--mount".to_string());
+        args.push(format!(
+            "type=bind,source={},target=/opt/copilot-config",
+            copilot_dir.display()
+        ));
+    }
+
     let output = Command::new("devcontainer")
-        .args([
-            "up",
-            "--workspace-folder",
-            config.workspace_folder.to_str().unwrap_or("."),
-        ])
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -65,6 +80,12 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
         )));
     }
 
+    let remote_user = parsed
+        .get("remoteUser")
+        .and_then(|v| v.as_str())
+        .unwrap_or("root")
+        .to_string();
+
     Ok(ContainerInfo {
         workspace_folder: config.workspace_folder.clone(),
         remote_workspace_folder: parsed
@@ -72,12 +93,13 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
             .and_then(|v| v.as_str())
             .unwrap_or("/workspace")
             .to_string(),
-        remote_user: parsed
-            .get("remoteUser")
-            .and_then(|v| v.as_str())
-            .unwrap_or("root")
-            .to_string(),
+        remote_user,
     })
+}
+
+/// Path to the host's `~/.copilot` directory.
+fn copilot_config_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".copilot"))
 }
 
 /// Build the command string for running an ACP agent inside a dev container.
@@ -95,7 +117,13 @@ pub fn build_exec_command(workspace_folder: &Path, acp_command: &str) -> String 
         workspace_folder.display().to_string(),
     ];
 
-    // Forward auth-related env vars so the agent can authenticate inside the container.
+    // Point COPILOT_HOME to the mounted host config so credentials are shared.
+    if copilot_config_dir().is_some_and(|d| d.exists()) {
+        parts.push("--remote-env".to_string());
+        parts.push("COPILOT_HOME=/opt/copilot-config".to_string());
+    }
+
+    // Also forward explicit auth env vars if set.
     for var in &["GITHUB_TOKEN", "GH_TOKEN"] {
         if let Ok(val) = std::env::var(var) {
             if val.is_empty() {
@@ -137,10 +165,8 @@ mod tests {
             &PathBuf::from("/home/user/my-repo"),
             "copilot --acp --stdio",
         );
-        assert_eq!(
-            cmd,
-            "devcontainer exec --workspace-folder /home/user/my-repo copilot --acp --stdio"
-        );
+        assert!(cmd.starts_with("devcontainer exec --workspace-folder /home/user/my-repo"));
+        assert!(cmd.ends_with("copilot --acp --stdio"));
     }
 
     #[test]
@@ -150,10 +176,8 @@ mod tests {
             std::env::remove_var("GH_TOKEN");
         }
         let cmd = build_exec_command(&PathBuf::from("/projects/web-app"), "claude-agent-acp");
-        assert_eq!(
-            cmd,
-            "devcontainer exec --workspace-folder /projects/web-app claude-agent-acp"
-        );
+        assert!(cmd.starts_with("devcontainer exec --workspace-folder /projects/web-app"));
+        assert!(cmd.ends_with("claude-agent-acp"));
     }
 
     #[test]

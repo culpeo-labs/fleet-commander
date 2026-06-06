@@ -100,9 +100,8 @@ mod tests {
         let agent = Agent::new("test", "Test")
             .with_acp_command("copilot --acp --stdio")
             .with_workspace("/home/user/my-repo");
-        assert_eq!(
-            agent.effective_acp_command(),
-            "devcontainer exec --workspace-folder /home/user/my-repo copilot --acp --stdio"
-        );
+        let cmd = agent.effective_acp_command();
+        assert!(cmd.starts_with("devcontainer exec --workspace-folder /home/user/my-repo"));
+        assert!(cmd.ends_with("copilot --acp --stdio"));
     }
 }
