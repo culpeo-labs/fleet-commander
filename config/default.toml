@@ -1,0 +1,20 @@
+# Bindings use a small DSL:
+#   "h", "Tab", "Enter", "Esc", "Backspace", "Space", "Left"/"Right"/"Up"/"Down",
+#   "Home", "End", "PageUp", "PageDown", "Delete", "BackTab"
+# Modifiers prefix the key with "C-" (Ctrl), "S-" (Shift), or "M-" (Alt/Meta),
+# e.g. "C-c", "S-Tab", "M-x". A bare uppercase letter ("Q") implies Shift.
+#
+# Missing fields fall back to the built-in defaults so partial configs are safe.
+
+[bindings]
+quit         = ["q", "C-c"]
+up           = ["k", "Up"]
+down         = ["j", "Down"]
+left         = ["h", "Left"]
+right        = ["l", "Right"]
+activate     = ["Enter"]
+back         = ["Esc"]
+toggle_pane  = ["Tab"]
+dismiss_pane = ["d"]
+insert       = ["i"]
+command      = [":"]
