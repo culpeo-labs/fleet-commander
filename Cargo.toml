@@ -1,5 +1,5 @@
 [package]
-name = "multi-agent-tui"
+name = "fleet-commander"
 version = "0.1.0"
 edition = "2024"
 

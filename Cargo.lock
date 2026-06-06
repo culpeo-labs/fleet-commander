@@ -750,6 +750,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleet-commander"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "axum",
+ "crossterm",
+ "futures-util",
+ "notify",
+ "ratatui",
+ "rmcp",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "syntect",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "toml",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1380,29 +1403,6 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "multi-agent-tui"
-version = "0.1.0"
-dependencies = [
- "agent-client-protocol",
- "anyhow",
- "axum",
- "crossterm",
- "futures-util",
- "notify",
- "ratatui",
- "rmcp",
- "schemars 1.2.1",
- "serde",
- "serde_json",
- "syntect",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "toml",
 ]
 
 [[package]]

@@ -126,7 +126,7 @@ impl TuiMcpServer {
 impl ServerHandler for TuiMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("multi-agent-tui", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("fleet-commander", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "MCP server for the multi-agent TUI. \
                  Tools: show_diff (display a diff), show_file (display a file), \
