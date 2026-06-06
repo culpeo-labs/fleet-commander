@@ -14,6 +14,7 @@ mod agent_runtime;
 mod app;
 mod change_source;
 mod config;
+mod container;
 mod event;
 mod keybind;
 mod mcp_server;

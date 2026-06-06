@@ -246,12 +246,17 @@ impl App {
         }
         let prompt_tx = agent_runtime::start_agent(
             agent.id.clone(),
-            agent.acp_command.clone(),
+            agent.effective_acp_command(),
+            agent.workspace_folder.clone(),
             self.tx.clone(),
         );
         agent.prompt_tx = Some(prompt_tx);
         agent.status = AgentStatus::Running;
-        agent.history.push("Connecting...".into());
+        let label = match &agent.workspace_folder {
+            Some(ws) => format!("Starting container ({})...", ws.display()),
+            None => "Connecting...".into(),
+        };
+        agent.history.push(label);
     }
 
     /// Scroll to the bottom when content arrives for the currently viewed agent.

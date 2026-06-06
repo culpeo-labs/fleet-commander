@@ -1,9 +1,10 @@
 //! Agent state held by the UI.
 //!
 //! Each agent wraps an ACP connection. The `acp_command` field specifies
-//! what command to launch (e.g. "copilot --acp --stdio"). Once connected,
-//! `prompt_tx` holds a channel for sending messages into the persistent
-//! ACP session without respawning the process.
+//! what command to launch (e.g. "copilot --acp --stdio"). When `workspace_folder`
+//! is set, the agent runs inside a dev container for that repo.
+
+use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 
@@ -35,6 +36,9 @@ pub struct Agent {
     pub history: Vec<String>,
     /// Command to launch the ACP agent (e.g. "copilot --acp --stdio").
     pub acp_command: String,
+    /// Optional repo path with `.devcontainer/` config.
+    /// When set, the agent runs inside a dev container.
+    pub workspace_folder: Option<PathBuf>,
     /// Accumulates streaming deltas for the current assistant turn.
     pub pending_response: String,
     /// Channel for sending prompts to the persistent ACP connection.
@@ -50,6 +54,7 @@ impl Agent {
             status: AgentStatus::Idle,
             history: Vec::new(),
             acp_command: String::new(),
+            workspace_folder: None,
             pending_response: String::new(),
             prompt_tx: None,
         }
@@ -58,6 +63,21 @@ impl Agent {
     pub fn with_acp_command(mut self, command: impl Into<String>) -> Self {
         self.acp_command = command.into();
         self
+    }
+
+    #[allow(dead_code)] // Used when configuring agents with dev containers.
+    pub fn with_workspace(mut self, path: impl Into<PathBuf>) -> Self {
+        self.workspace_folder = Some(path.into());
+        self
+    }
+
+    /// The effective command to run — wraps with `devcontainer exec` if
+    /// a workspace folder is configured.
+    pub fn effective_acp_command(&self) -> String {
+        match &self.workspace_folder {
+            Some(ws) => crate::container::build_exec_command(ws, &self.acp_command),
+            None => self.acp_command.clone(),
+        }
     }
 }
 
@@ -70,4 +90,27 @@ pub fn default_agents() -> Vec<Agent> {
         Agent::new("claude", "Claude Agent")
             .with_acp_command("claude-agent-acp"),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_command_without_workspace() {
+        let agent = Agent::new("test", "Test")
+            .with_acp_command("copilot --acp --stdio");
+        assert_eq!(agent.effective_acp_command(), "copilot --acp --stdio");
+    }
+
+    #[test]
+    fn effective_command_with_workspace() {
+        let agent = Agent::new("test", "Test")
+            .with_acp_command("copilot --acp --stdio")
+            .with_workspace("/home/user/my-repo");
+        assert_eq!(
+            agent.effective_acp_command(),
+            "devcontainer exec --workspace-folder /home/user/my-repo copilot --acp --stdio"
+        );
+    }
 }

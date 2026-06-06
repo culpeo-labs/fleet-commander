@@ -3,9 +3,12 @@
 //! Manages the lifecycle of ACP agent subprocesses. Each agent gets a
 //! persistent connection: the process is spawned once, a session is created,
 //! and a prompt channel allows the TUI to send messages without respawning.
-//! Session update notifications are forwarded into the TUI's [`AppEvent`]
-//! channel so the UI reacts in real time.
+//!
+//! When an agent has a `workspace_folder`, the container is started first
+//! via `devcontainer up`, and the ACP command is wrapped with
+//! `devcontainer exec`.
 
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use agent_client_protocol::schema::{
@@ -17,31 +20,67 @@ use agent_client_protocol::{AcpAgent, Agent as AcpAgentRole, ConnectionTo};
 use tokio::sync::mpsc;
 
 use crate::agent::AgentId;
+use crate::container::{self, ContainerConfig};
 use crate::event::AppEvent;
 
 /// Spawn a persistent ACP connection for an agent.
 ///
-/// Returns an `mpsc::UnboundedSender<String>` that the TUI can use to send
-/// prompts into the running session. The spawned task:
-/// 1. Starts the ACP subprocess
-/// 2. Initializes the protocol
-/// 3. Creates a session
-/// 4. Sends `AgentConnected` event
-/// 5. Loops waiting for prompts on the returned channel
-///
-/// All session updates (message chunks, tool calls, etc.) are forwarded
-/// as `AppEvent`s through `event_tx`.
+/// If the agent has a workspace folder, starts the dev container first.
+/// Returns an `mpsc::UnboundedSender<String>` for sending prompts.
 pub fn start_agent(
     agent_id: AgentId,
-    acp_command: String,
+    effective_command: String,
+    workspace_folder: Option<PathBuf>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> mpsc::UnboundedSender<String> {
     let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<String>();
 
     tokio::spawn(async move {
-        if let Err(err) =
-            run_persistent_connection(agent_id.clone(), &acp_command, prompt_rx, event_tx.clone())
-                .await
+        // If workspace_folder is set, start the dev container first.
+        let session_cwd = if let Some(ref ws) = workspace_folder {
+            let _ = event_tx.send(AppEvent::AgentOutput {
+                agent_id: agent_id.clone(),
+                line: format!("Starting container for {}...", ws.display()),
+            });
+
+            let config = ContainerConfig {
+                workspace_folder: ws.clone(),
+            };
+            match container::start_container(&config).await {
+                Ok(info) => {
+                    let _ = event_tx.send(AppEvent::AgentOutput {
+                        agent_id: agent_id.clone(),
+                        line: format!(
+                            "Container ready (user: {}, workspace: {})",
+                            info.remote_user, info.remote_workspace_folder
+                        ),
+                    });
+                    PathBuf::from(info.remote_workspace_folder)
+                }
+                Err(err) => {
+                    let _ = event_tx.send(AppEvent::SessionError {
+                        agent_id: agent_id.clone(),
+                        message: format!("Container failed: {err}"),
+                    });
+                    let _ = event_tx.send(AppEvent::AgentExited {
+                        agent_id,
+                        code: None,
+                    });
+                    return;
+                }
+            }
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| "/".into())
+        };
+
+        if let Err(err) = run_persistent_connection(
+            agent_id.clone(),
+            &effective_command,
+            session_cwd,
+            prompt_rx,
+            event_tx.clone(),
+        )
+        .await
         {
             let _ = event_tx.send(AppEvent::SessionError {
                 agent_id: agent_id.clone(),
@@ -59,9 +98,6 @@ pub fn start_agent(
 }
 
 /// Send a prompt through an existing agent connection.
-///
-/// If the agent has a `prompt_tx`, the message is sent through it.
-/// If not (no connection yet), the agent is started first.
 pub fn send_message(
     agent_id: AgentId,
     prompt_tx: Option<&mpsc::UnboundedSender<String>>,
@@ -95,6 +131,7 @@ pub fn send_message(
 async fn run_persistent_connection(
     agent_id: AgentId,
     acp_command: &str,
+    session_cwd: PathBuf,
     mut prompt_rx: mpsc::UnboundedReceiver<String>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -155,10 +192,9 @@ async fn run_persistent_connection(
                     .block_task()
                     .await?;
 
-                // Create a session.
-                let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+                // Create a session with the appropriate working directory.
                 let session_resp = connection
-                    .send_request(NewSessionRequest::new(cwd))
+                    .send_request(NewSessionRequest::new(session_cwd))
                     .block_task()
                     .await?;
 

@@ -16,6 +16,7 @@ schemars = { version = "1.0", features = ["chrono04"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 syntect = "5.3.0"
+thiserror = "2.0"
 tokio = { version = "1.52.3", features = ["rt", "macros", "sync", "process", "signal", "time", "rt-multi-thread", "io-util", "net"] }
 tokio-util = "0.7"
 toml = "1.1.2"
