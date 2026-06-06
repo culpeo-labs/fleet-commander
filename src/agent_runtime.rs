@@ -38,10 +38,16 @@ async fn handle_auth_if_needed(
     // Try to extract the terminal-auth command from _meta.
     for method in &init_resp.auth_methods {
         if let Some(terminal_auth) = method.meta().and_then(|m| m.get("terminal-auth")) {
-            let command = terminal_auth
+            let raw_command = terminal_auth
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            // Use just the binary name so it resolves via PATH,
+            // regardless of the absolute path the agent reports.
+            let command = std::path::Path::new(raw_command)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(raw_command);
             let args: Vec<&str> = terminal_auth
                 .get("args")
                 .and_then(|v| v.as_array())
