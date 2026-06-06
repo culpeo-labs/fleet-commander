@@ -1,141 +1,256 @@
-//! Copilot SDK integration layer.
+//! ACP (Agent Client Protocol) integration layer.
 //!
-//! Manages the lifecycle of a [`github_copilot_sdk::Client`] and creates
-//! one [`Session`] per agent. Streaming session events are forwarded into
-//! the TUI's [`AppEvent`] channel so the UI reacts in real time.
+//! Manages the lifecycle of ACP agent subprocesses. Each agent is spawned
+//! as a separate process (e.g. `copilot --acp --stdio`) and communicated
+//! with via JSON-RPC over stdio. Session update notifications are forwarded
+//! into the TUI's [`AppEvent`] channel so the UI reacts in real time.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::str::FromStr;
 
-use github_copilot_sdk::handler::ApproveAllHandler;
-use github_copilot_sdk::types::{MessageOptions, SessionConfig};
-use github_copilot_sdk::{Client, ClientOptions};
+use agent_client_protocol::schema::{
+    ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, ProtocolVersion,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, TextContent,
+};
+use agent_client_protocol::{AcpAgent, Agent as AcpAgentRole, ConnectionTo};
 use tokio::sync::mpsc;
 
-use crate::agent::{Agent, AgentStatus};
+use crate::agent::AgentId;
 use crate::event::AppEvent;
 
-/// Start the Copilot SDK client and attach sessions to each agent.
+/// Spawn an ACP agent process, initialize it, create a session, and return
+/// a handle for sending prompts.
 ///
-/// This spawns a background task that:
-/// 1. Starts the Copilot CLI client.
-/// 2. Creates a session for each agent using its system prompt.
-/// 3. Subscribes to each session's event stream and forwards events as
-///    `AppEvent`s through `tx`.
-///
-/// Returns a handle to the client for graceful shutdown.
-pub async fn start_copilot_runtime(
-    agents: &mut [Agent],
+/// Session update notifications are forwarded as `AppEvent`s through `tx`.
+/// The entire lifecycle runs in a spawned task so it doesn't block the UI.
+#[allow(dead_code)] // Will be used when persistent connections are implemented.
+pub fn spawn_agent(
+    agent_id: AgentId,
+    acp_command: String,
     tx: mpsc::UnboundedSender<AppEvent>,
-) -> Option<Client> {
-    let client = match Client::start(ClientOptions::default()).await {
-        Ok(c) => c,
-        Err(err) => {
-            let _ = tx.send(AppEvent::CopilotClientError {
-                message: format!("Failed to start Copilot client: {err}"),
-            });
-            return None;
-        }
-    };
-
-    for agent in agents.iter_mut() {
-        let config = SessionConfig::default()
-            .with_permission_handler(Arc::new(ApproveAllHandler))
-            .with_streaming(true);
-
-        match client.create_session(config).await {
-            Ok(session) => {
-                let session = Arc::new(session);
-                agent.session = Some(Arc::clone(&session));
-                agent.status = AgentStatus::Idle;
-                agent.history.push("Session connected.".into());
-
-                // Spawn event-forwarding task for this session.
-                let agent_id = agent.id.clone();
-                let tx = tx.clone();
-                let mut events = session.subscribe();
-                tokio::spawn(async move {
-                    while let Ok(event) = events.recv().await {
-                        let evt = match event.event_type.as_str() {
-                            "assistant.message_delta" => {
-                                let text = event
-                                    .data
-                                    .get("deltaContent")
-                                    .and_then(|c| c.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                if text.is_empty() {
-                                    continue;
-                                }
-                                AppEvent::AssistantDelta {
-                                    agent_id: agent_id.clone(),
-                                    text,
-                                }
-                            }
-                            "assistant.message" => AppEvent::AssistantDone {
-                                agent_id: agent_id.clone(),
-                            },
-                            "session.error" => {
-                                let msg = event
-                                    .data
-                                    .get("message")
-                                    .and_then(|m| m.as_str())
-                                    .unwrap_or("unknown error")
-                                    .to_string();
-                                AppEvent::SessionError {
-                                    agent_id: agent_id.clone(),
-                                    message: msg,
-                                }
-                            }
-                            _ => continue,
-                        };
-                        if tx.send(evt).is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
-            Err(err) => {
-                agent.status = AgentStatus::Error;
-                agent.history.push(format!("Session error: {err}"));
-            }
-        }
-    }
-
-    Some(client)
-}
-
-/// Send a user message to the agent's Copilot session.
-///
-/// This is called from the TUI when the user submits input in insert mode.
-/// The response arrives asynchronously via the event-forwarding task.
-pub fn send_message(agent: &Agent, message: String, tx: mpsc::UnboundedSender<AppEvent>) {
-    let Some(session) = agent.session.as_ref() else {
-        let _ = tx.send(AppEvent::SessionError {
-            agent_id: agent.id.clone(),
-            message: "No active session".into(),
-        });
-        return;
-    };
-
-    let session = Arc::clone(session);
-    let agent_id = agent.id.clone();
-    let tx = tx.clone();
-
+) {
     tokio::spawn(async move {
-        let opts = MessageOptions::new(&message).with_wait_timeout(Duration::from_secs(120));
-
-        // Mark the agent as running via an event.
-        let _ = tx.send(AppEvent::AgentOutput {
-            agent_id: agent_id.clone(),
-            line: format!("> {message}"),
-        });
-
-        if let Err(err) = session.send_and_wait(opts).await {
+        if let Err(err) = run_agent_connection(agent_id.clone(), &acp_command, tx.clone()).await {
             let _ = tx.send(AppEvent::SessionError {
-                agent_id: agent_id.clone(),
-                message: format!("Send failed: {err}"),
+                agent_id,
+                message: format!("ACP connection failed: {err}"),
             });
         }
     });
+}
+
+/// Send a user prompt to an ACP agent by spawning a fresh connection.
+///
+/// In the current architecture, each prompt creates a new ACP connection.
+/// A future iteration will maintain persistent connections with session resume.
+pub fn send_message(agent_id: AgentId, acp_command: String, message: String, tx: mpsc::UnboundedSender<AppEvent>) {
+    // Echo the user's message first.
+    let _ = tx.send(AppEvent::AgentOutput {
+        agent_id: agent_id.clone(),
+        line: format!("> {message}"),
+    });
+
+    tokio::spawn(async move {
+        if let Err(err) = run_prompt(agent_id.clone(), &acp_command, &message, tx.clone()).await {
+            let _ = tx.send(AppEvent::SessionError {
+                agent_id,
+                message: format!("Prompt failed: {err}"),
+            });
+        }
+    });
+}
+
+#[allow(dead_code)] // Will be used when persistent connections are implemented.
+async fn run_agent_connection(
+    agent_id: AgentId,
+    acp_command: &str,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let agent = AcpAgent::from_str(acp_command)?;
+    let tx_notif = tx.clone();
+    let aid = agent_id.clone();
+
+    agent_client_protocol::Client
+        .builder()
+        .on_receive_notification(
+            {
+                let aid = aid.clone();
+                let tx = tx_notif.clone();
+                async move |notification: SessionNotification, _cx| {
+                    forward_session_update(&aid, &notification.update, &tx);
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            async move |request: RequestPermissionRequest, responder, _connection| {
+                // Auto-approve for now; future: route to TUI for user decision.
+                let option_id = request.options.first().map(|opt| opt.option_id.clone());
+                if let Some(id) = option_id {
+                    responder.respond(RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)),
+                    ))
+                } else {
+                    responder.respond(RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Cancelled,
+                    ))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| {
+            let aid = aid.clone();
+            let tx = tx.clone();
+            async move {
+                // Initialize
+                let _init = connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+
+                // Create session
+                let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+                let session_resp = connection
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?;
+
+                let _ = tx.send(AppEvent::AgentConnected {
+                    agent_id: aid.clone(),
+                });
+                let _ = tx.send(AppEvent::AgentOutput {
+                    agent_id: aid.clone(),
+                    line: format!("Session created: {}", session_resp.session_id),
+                });
+
+                // Keep connection alive — the process will exit when dropped.
+                // In a full implementation, we'd hold this and accept prompts.
+                // For now, signal readiness and let the connection close.
+                Ok(())
+            }
+        })
+        .await?;
+
+    Ok(())
+}
+
+async fn run_prompt(
+    agent_id: AgentId,
+    acp_command: &str,
+    message: &str,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let agent = AcpAgent::from_str(acp_command)?;
+    let tx_notif = tx.clone();
+    let aid = agent_id.clone();
+    let prompt_text = message.to_string();
+
+    agent_client_protocol::Client
+        .builder()
+        .on_receive_notification(
+            {
+                let aid = aid.clone();
+                let tx = tx_notif.clone();
+                async move |notification: SessionNotification, _cx| {
+                    forward_session_update(&aid, &notification.update, &tx);
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            async move |request: RequestPermissionRequest, responder, _connection| {
+                let option_id = request.options.first().map(|opt| opt.option_id.clone());
+                if let Some(id) = option_id {
+                    responder.respond(RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)),
+                    ))
+                } else {
+                    responder.respond(RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Cancelled,
+                    ))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| {
+            let aid = aid.clone();
+            let tx = tx.clone();
+            let prompt_text = prompt_text.clone();
+            async move {
+                // Initialize
+                let _init = connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+
+                // Create session
+                let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+                let session_resp = connection
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?;
+
+                // Send prompt
+                let _prompt_resp = connection
+                    .send_request(PromptRequest::new(
+                        session_resp.session_id,
+                        vec![ContentBlock::Text(TextContent::new(prompt_text))],
+                    ))
+                    .block_task()
+                    .await?;
+
+                let _ = tx.send(AppEvent::AssistantDone {
+                    agent_id: aid,
+                });
+
+                Ok(())
+            }
+        })
+        .await?;
+
+    Ok(())
+}
+
+/// Map an ACP `SessionUpdate` to `AppEvent`s and send them.
+fn forward_session_update(
+    agent_id: &str,
+    update: &SessionUpdate,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    match update {
+        SessionUpdate::AgentMessageChunk(chunk) => {
+            if let ContentBlock::Text(text) = &chunk.content {
+                let _ = tx.send(AppEvent::AssistantDelta {
+                    agent_id: agent_id.to_string(),
+                    text: text.text.clone(),
+                });
+            }
+        }
+        SessionUpdate::AgentThoughtChunk(chunk) => {
+            if let ContentBlock::Text(text) = &chunk.content {
+                let _ = tx.send(AppEvent::AgentOutput {
+                    agent_id: agent_id.to_string(),
+                    line: format!("[thought] {}", text.text),
+                });
+            }
+        }
+        SessionUpdate::ToolCall(tool_call) => {
+            let _ = tx.send(AppEvent::ToolCallUpdate {
+                agent_id: agent_id.to_string(),
+                tool_name: tool_call.title.clone(),
+                status: "started".to_string(),
+            });
+        }
+        SessionUpdate::ToolCallUpdate(update) => {
+            let status = format!("{:?}", update.fields.status);
+            let _ = tx.send(AppEvent::ToolCallUpdate {
+                agent_id: agent_id.to_string(),
+                tool_name: String::new(),
+                status,
+            });
+        }
+        _ => {}
+    }
 }

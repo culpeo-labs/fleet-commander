@@ -137,10 +137,24 @@ impl App {
                     agent.status = AgentStatus::Error;
                 }
             }
-            AppEvent::CopilotClientError { message } => {
-                // Show error on all agents.
-                for agent in &mut self.agents {
-                    agent.history.push(format!("[copilot] {message}"));
+            AppEvent::ToolCallUpdate {
+                agent_id,
+                tool_name,
+                status,
+            } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    let label = if tool_name.is_empty() {
+                        format!("[tool] {status}")
+                    } else {
+                        format!("[tool: {tool_name}] {status}")
+                    };
+                    agent.history.push(label);
+                }
+            }
+            AppEvent::AgentConnected { agent_id } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    agent.status = AgentStatus::Idle;
+                    agent.history.push("ACP session connected.".into());
                 }
             }
         }
@@ -167,7 +181,12 @@ impl App {
                         if let Some(agent) =
                             self.agents.iter().find(|a| a.id == *agent_id)
                         {
-                            agent_runtime::send_message(agent, message, self.tx.clone());
+                            agent_runtime::send_message(
+                                agent.id.clone(),
+                                agent.acp_command.clone(),
+                                message,
+                                self.tx.clone(),
+                            );
                         }
                     }
                     if let Screen::AgentSession { input_mode, .. } = &mut self.screen {

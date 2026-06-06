@@ -32,10 +32,10 @@ async fn main() -> Result<()> {
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 
-    let mut agents = agent::default_agents();
+    let agents = agent::default_agents();
 
-    // Start the Copilot SDK client and create sessions for each agent.
-    let _copilot_client = agent_runtime::start_copilot_runtime(&mut agents, tx.clone()).await;
+    // ACP agents are spawned on-demand when the user sends a message.
+    // No upfront connection needed — each prompt creates an ACP session.
 
     let mut app = App::new(config, agents, tx.clone());
 

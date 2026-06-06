@@ -1,11 +1,8 @@
 //! Agent state held by the UI.
 //!
-//! Each agent wraps a Copilot SDK session. The `session` field is `None`
-//! until the Copilot client is connected and sessions are created; the UI
-//! works fine either way (placeholder or live).
-
-use github_copilot_sdk::session::Session;
-use std::sync::Arc;
+//! Each agent wraps an ACP connection. The `acp_command` field specifies
+//! what command to launch (e.g. "copilot --acp --stdio"). The connection
+//! is established by the agent runtime and updates flow through AppEvents.
 
 pub type AgentId = String;
 
@@ -33,10 +30,8 @@ pub struct Agent {
     pub name: String,
     pub status: AgentStatus,
     pub history: Vec<String>,
-    /// System prompt sent when creating the Copilot session.
-    pub system_prompt: String,
-    /// Live Copilot SDK session handle, if connected.
-    pub session: Option<Arc<Session>>,
+    /// Command to launch the ACP agent (e.g. "copilot --acp --stdio").
+    pub acp_command: String,
     /// Accumulates streaming deltas for the current assistant turn.
     pub pending_response: String,
 }
@@ -48,33 +43,24 @@ impl Agent {
             name: name.into(),
             status: AgentStatus::Idle,
             history: Vec::new(),
-            system_prompt: String::new(),
-            session: None,
+            acp_command: String::new(),
             pending_response: String::new(),
         }
     }
 
-    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
-        self.system_prompt = prompt.into();
+    pub fn with_acp_command(mut self, command: impl Into<String>) -> Self {
+        self.acp_command = command.into();
         self
     }
 }
 
-/// Agent definitions used by the TUI. Sessions are attached later by the
-/// agent runtime once the Copilot client is connected.
+/// Agent definitions used by the TUI. ACP connections are established
+/// later by the agent runtime.
 pub fn default_agents() -> Vec<Agent> {
     vec![
-        Agent::new("reviewer", "Code reviewer").with_system_prompt(
-            "You are a code reviewer. When asked, review code for bugs, \
-             style issues, and suggest improvements. Be concise and actionable.",
-        ),
-        Agent::new("refactor", "Refactorer").with_system_prompt(
-            "You are a refactoring assistant. Suggest and apply refactorings \
-             to improve code quality, readability, and performance.",
-        ),
-        Agent::new("tester", "Test writer").with_system_prompt(
-            "You are a test-writing assistant. Write comprehensive tests \
-             for the code you are given. Prefer unit tests and cover edge cases.",
-        ),
+        Agent::new("copilot", "Copilot Agent")
+            .with_acp_command("copilot --acp --stdio"),
+        Agent::new("claude", "Claude Agent")
+            .with_acp_command("claude-agent-acp"),
     ]
 }

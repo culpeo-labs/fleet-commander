@@ -37,22 +37,28 @@ pub enum AppEvent {
         agent_id: AgentId,
         message: String,
     },
-    /// Streaming text delta from the Copilot SDK assistant.
+    /// Streaming text chunk from the ACP agent.
     AssistantDelta {
         agent_id: AgentId,
         text: String,
     },
-    /// The Copilot SDK assistant finished its response.
+    /// The ACP agent finished its response (prompt completed).
     AssistantDone {
         agent_id: AgentId,
     },
-    /// A Copilot SDK session encountered an error.
+    /// An ACP session or connection error.
     SessionError {
         agent_id: AgentId,
         message: String,
     },
-    /// The Copilot SDK client failed to start.
-    CopilotClientError {
-        message: String,
+    /// The ACP agent reported a tool call.
+    ToolCallUpdate {
+        agent_id: AgentId,
+        tool_name: String,
+        status: String,
+    },
+    /// ACP agent connected and session created.
+    AgentConnected {
+        agent_id: AgentId,
     },
 }
