@@ -11,10 +11,12 @@
 //! Input handling is dispatched per-screen so a keypress can never silently
 //! mutate a hidden buffer.
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use std::path::PathBuf;
+use tokio::sync::mpsc;
 
 use crate::agent::{Agent, AgentId, AgentStatus};
+use crate::agent_runtime;
 use crate::change_source::ChangeEvent;
 use crate::config::{Action, Config};
 use crate::event::AppEvent;
@@ -29,6 +31,8 @@ pub enum Screen {
         focus: SessionFocus,
         side_pane: Option<SidePane>,
         scroll: usize,
+        /// When true, the user is typing a message to send to the agent.
+        input_mode: bool,
     },
 }
 
@@ -65,15 +69,21 @@ pub struct App {
     pub agents: Vec<Agent>,
     pub screen: Screen,
     pub should_quit: bool,
+    /// Text the user is composing in insert mode.
+    pub input_buffer: String,
+    /// Channel for sending events (used to dispatch messages to agents).
+    pub tx: mpsc::UnboundedSender<AppEvent>,
 }
 
 impl App {
-    pub fn new(config: Config, agents: Vec<Agent>) -> Self {
+    pub fn new(config: Config, agents: Vec<Agent>, tx: mpsc::UnboundedSender<AppEvent>) -> Self {
         Self {
             config,
             agents,
             screen: Screen::AgentList { selected: 0 },
             should_quit: false,
+            input_buffer: String::new(),
+            tx,
         }
     }
 
@@ -106,10 +116,75 @@ impl App {
                     agent.history.push(message);
                 }
             }
+            AppEvent::AssistantDelta { agent_id, text } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    agent.status = AgentStatus::Running;
+                    agent.pending_response.push_str(&text);
+                }
+            }
+            AppEvent::AssistantDone { agent_id } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    if !agent.pending_response.is_empty() {
+                        let response = std::mem::take(&mut agent.pending_response);
+                        agent.history.push(response);
+                    }
+                    agent.status = AgentStatus::Idle;
+                }
+            }
+            AppEvent::SessionError { agent_id, message } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    agent.history.push(format!("[error] {message}"));
+                    agent.status = AgentStatus::Error;
+                }
+            }
+            AppEvent::CopilotClientError { message } => {
+                // Show error on all agents.
+                for agent in &mut self.agents {
+                    agent.history.push(format!("[copilot] {message}"));
+                }
+            }
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // In input mode, capture text instead of dispatching actions.
+        if let Screen::AgentSession {
+            input_mode: true,
+            agent_id,
+            ..
+        } = &self.screen
+        {
+            match key.code {
+                KeyCode::Esc => {
+                    if let Screen::AgentSession { input_mode, .. } = &mut self.screen {
+                        *input_mode = false;
+                    }
+                    self.input_buffer.clear();
+                }
+                KeyCode::Enter => {
+                    let message = std::mem::take(&mut self.input_buffer);
+                    if !message.is_empty() {
+                        if let Some(agent) =
+                            self.agents.iter().find(|a| a.id == *agent_id)
+                        {
+                            agent_runtime::send_message(agent, message, self.tx.clone());
+                        }
+                    }
+                    if let Screen::AgentSession { input_mode, .. } = &mut self.screen {
+                        *input_mode = false;
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.input_buffer.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.input_buffer.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         let Some(action) = self.config.bindings.action_for(&key) else {
             return;
         };
@@ -123,6 +198,7 @@ impl App {
                 focus,
                 side_pane,
                 scroll,
+                ..
             } => handle_session_action(action, agent_id, focus, side_pane, scroll, &self.agents),
         };
         if let Some(next) = next {
@@ -158,6 +234,7 @@ impl App {
                     focus: SessionFocus::Conversation,
                     side_pane: Some(pane),
                     scroll: 0,
+                    input_mode: false,
                 };
             }
         }
@@ -192,6 +269,7 @@ fn handle_list_action(
             focus: SessionFocus::Conversation,
             side_pane: None,
             scroll: 0,
+            input_mode: false,
         }),
         _ => None,
     }
@@ -210,6 +288,13 @@ fn handle_session_action(
             let idx = agents.iter().position(|a| &a.id == agent_id).unwrap_or(0);
             Some(Screen::AgentList { selected: idx })
         }
+        Action::Insert => Some(Screen::AgentSession {
+            agent_id: agent_id.clone(),
+            focus: SessionFocus::Conversation,
+            side_pane: side_pane.clone(),
+            scroll: *scroll,
+            input_mode: true,
+        }),
         Action::DismissPane if side_pane.is_some() => {
             *side_pane = None;
             *focus = SessionFocus::Conversation;
@@ -246,7 +331,8 @@ mod tests {
             Agent::new("a2", "Second"),
             Agent::new("a3", "Third"),
         ];
-        App::new(Config::default(), agents)
+        let (tx, _rx) = mpsc::unbounded_channel();
+        App::new(Config::default(), agents, tx)
     }
 
     fn press(code: KeyCode) -> AppEvent {
@@ -410,5 +496,80 @@ mod tests {
         });
         let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
         assert_eq!(a1.status, AgentStatus::Stopped);
+    }
+
+    #[test]
+    fn assistant_delta_accumulates_pending_response() {
+        let mut app = app_with_agents();
+        app.handle(AppEvent::AssistantDelta {
+            agent_id: "a1".into(),
+            text: "Hello".into(),
+        });
+        app.handle(AppEvent::AssistantDelta {
+            agent_id: "a1".into(),
+            text: " world".into(),
+        });
+        let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        assert_eq!(a1.pending_response, "Hello world");
+        assert_eq!(a1.status, AgentStatus::Running);
+    }
+
+    #[test]
+    fn assistant_done_flushes_pending_to_history() {
+        let mut app = app_with_agents();
+        app.handle(AppEvent::AssistantDelta {
+            agent_id: "a1".into(),
+            text: "response text".into(),
+        });
+        app.handle(AppEvent::AssistantDone {
+            agent_id: "a1".into(),
+        });
+        let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        assert!(a1.pending_response.is_empty());
+        assert_eq!(a1.history.last().unwrap(), "response text");
+        assert_eq!(a1.status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn session_error_appends_to_history() {
+        let mut app = app_with_agents();
+        app.handle(AppEvent::SessionError {
+            agent_id: "a2".into(),
+            message: "connection lost".into(),
+        });
+        let a2 = app.agents.iter().find(|a| a.id == "a2").unwrap();
+        assert!(a2.history.last().unwrap().contains("connection lost"));
+        assert_eq!(a2.status, AgentStatus::Error);
+    }
+
+    #[test]
+    fn insert_action_enters_input_mode() {
+        let mut app = app_with_agents();
+        app.handle(press(KeyCode::Enter)); // enter session
+        app.handle(press(KeyCode::Char('i'))); // insert mode
+        match &app.screen {
+            Screen::AgentSession { input_mode, .. } => assert!(*input_mode),
+            _ => panic!("expected AgentSession"),
+        }
+    }
+
+    #[test]
+    fn esc_in_input_mode_cancels_input() {
+        let mut app = app_with_agents();
+        app.handle(press(KeyCode::Enter));
+        app.handle(press(KeyCode::Char('i')));
+        // Type some text
+        app.handle(AppEvent::Input(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.input_buffer, "h");
+        // Esc cancels
+        app.handle(press(KeyCode::Esc));
+        match &app.screen {
+            Screen::AgentSession { input_mode, .. } => assert!(!*input_mode),
+            _ => panic!("expected AgentSession"),
+        }
+        assert!(app.input_buffer.is_empty());
     }
 }

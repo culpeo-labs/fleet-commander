@@ -26,6 +26,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             focus,
             side_pane,
             scroll,
+            input_mode,
         } => render_agent_session(
             frame,
             area,
@@ -34,6 +35,8 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             *focus,
             side_pane.as_ref(),
             *scroll,
+            *input_mode,
+            &app.input_buffer,
         ),
     }
 }
@@ -89,6 +92,7 @@ fn status_color(status: &crate::agent::AgentStatus) -> Color {
         crate::agent::AgentStatus::Idle => Color::Gray,
         crate::agent::AgentStatus::Running => Color::Green,
         crate::agent::AgentStatus::Stopped => Color::DarkGray,
+        crate::agent::AgentStatus::Error => Color::Red,
     }
 }
 
@@ -100,14 +104,27 @@ fn render_agent_session(
     focus: SessionFocus,
     side_pane: Option<&SidePane>,
     scroll: usize,
+    input_mode: bool,
+    input_buffer: &str,
 ) {
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    let constraints = if input_mode {
+        vec![
             Constraint::Length(3),
             Constraint::Min(0),
             Constraint::Length(3),
-        ])
+            Constraint::Length(3),
+        ]
+    } else {
+        vec![
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ]
+    };
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(area);
 
     let agent = app.agents.iter().find(|a| a.id == agent_id);
@@ -143,15 +160,30 @@ fn render_agent_session(
         render_conversation(frame, body_area, agent, scroll, true);
     }
 
-    let hint = if side_pane.is_some() {
-        "Esc back  Tab switch focus  d dismiss pane  ↑/↓ scroll"
+    let hint = if input_mode {
+        "Enter send  Esc cancel"
+    } else if side_pane.is_some() {
+        "Esc back  Tab switch focus  d dismiss pane  i input  ↑/↓ scroll"
     } else {
-        "Esc back  ↑/↓ scroll  (side pane opens when agent changes a file)"
+        "Esc back  i input  ↑/↓ scroll"
     };
     let footer = Paragraph::new(hint)
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL).title(" Keys "));
-    frame.render_widget(footer, layout[2]);
+    let footer_idx = if input_mode { 3 } else { 2 };
+    frame.render_widget(footer, layout[footer_idx]);
+
+    // Render input box when in input mode.
+    if input_mode {
+        let input = Paragraph::new(input_buffer)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Message ")
+                    .border_style(Style::default().fg(Color::Yellow)),
+            );
+        frame.render_widget(input, layout[2]);
+    }
 }
 
 fn render_conversation(
@@ -270,9 +302,15 @@ mod tests {
     use crate::config::Config;
     use ratatui::{Terminal, backend::TestBackend};
     use std::path::PathBuf;
+    use tokio::sync::mpsc;
 
     fn agents() -> Vec<Agent> {
         vec![Agent::new("a1", "First"), Agent::new("a2", "Second")]
+    }
+
+    fn test_app() -> App {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        App::new(Config::default(), agents(), tx)
     }
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -291,7 +329,7 @@ mod tests {
     #[test]
     fn agent_list_renders_each_agent() {
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-        let app = App::new(Config::default(), agents());
+        let app = test_app();
         terminal.draw(|f| render(f, &app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("Agents"));
@@ -302,12 +340,13 @@ mod tests {
     #[test]
     fn agent_session_without_side_pane_does_not_show_diff_or_editor() {
         let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
-        let mut app = App::new(Config::default(), agents());
+        let mut app = test_app();
         app.screen = Screen::AgentSession {
             agent_id: "a1".into(),
             focus: SessionFocus::Conversation,
             side_pane: None,
             scroll: 0,
+            input_mode: false,
         };
         terminal.draw(|f| render(f, &app)).unwrap();
         let text = buffer_text(&terminal);
@@ -319,7 +358,7 @@ mod tests {
     #[test]
     fn agent_session_with_diff_side_pane_renders_diff_title() {
         let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
-        let mut app = App::new(Config::default(), agents());
+        let mut app = test_app();
         app.screen = Screen::AgentSession {
             agent_id: "a1".into(),
             focus: SessionFocus::Conversation,
@@ -328,6 +367,7 @@ mod tests {
                 content: "fn main() {}\n".into(),
             }),
             scroll: 0,
+            input_mode: false,
         };
         terminal.draw(|f| render(f, &app)).unwrap();
         let text = buffer_text(&terminal);

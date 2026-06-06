@@ -10,6 +10,7 @@ use std::{io, path::PathBuf};
 use tokio::sync::mpsc;
 
 mod agent;
+mod agent_runtime;
 mod app;
 mod change_source;
 mod config;
@@ -23,21 +24,26 @@ use crate::change_source::{ChangeSource, ChangeSourceHandle, FsWatcher};
 use crate::config::Config;
 use crate::event::AppEvent;
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<()> {
     let config = load_config_or_default();
     install_panic_hook();
     let mut terminal = setup_terminal()?;
-    let agents = agent::sample_agents();
-    let mut app = App::new(config, agents);
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+
+    let mut agents = agent::default_agents();
+
+    // Start the Copilot SDK client and create sessions for each agent.
+    let _copilot_client = agent_runtime::start_copilot_runtime(&mut agents, tx.clone()).await;
+
+    let mut app = App::new(config, agents, tx.clone());
+
     let _input_task = spawn_input_task(tx.clone());
     let _change_handle = start_default_change_source(tx.clone())?;
 
     let mcp_addr = "127.0.0.1:6100";
     let _mcp_handle = mcp_server::start_mcp_server(mcp_addr, tx.clone()).await?;
-    eprintln!("MCP server listening on http://{mcp_addr}/mcp");
 
     let result = run(&mut terminal, &mut app, &mut rx).await;
 

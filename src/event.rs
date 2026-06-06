@@ -8,7 +8,7 @@ use crate::agent::AgentId;
 use crate::change_source::ChangeEvent;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // AgentOutput/AgentExited are emitted once agent runtime lands.
+#[allow(dead_code)]
 pub enum AppEvent {
     Input(KeyEvent),
     Change(ChangeEvent),
@@ -35,6 +35,24 @@ pub enum AppEvent {
     /// An MCP client called the `notify` tool.
     McpNotify {
         agent_id: AgentId,
+        message: String,
+    },
+    /// Streaming text delta from the Copilot SDK assistant.
+    AssistantDelta {
+        agent_id: AgentId,
+        text: String,
+    },
+    /// The Copilot SDK assistant finished its response.
+    AssistantDone {
+        agent_id: AgentId,
+    },
+    /// A Copilot SDK session encountered an error.
+    SessionError {
+        agent_id: AgentId,
+        message: String,
+    },
+    /// The Copilot SDK client failed to start.
+    CopilotClientError {
         message: String,
     },
 }
