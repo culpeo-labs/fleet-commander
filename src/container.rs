@@ -82,14 +82,32 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
 
 /// Build the command string for running an ACP agent inside a dev container.
 ///
+/// Forwards GitHub auth env vars (`GITHUB_TOKEN`, `GH_TOKEN`) into the
+/// container so that tools like `copilot` and `gh` can authenticate.
+///
 /// Returns a command like:
-/// `devcontainer exec --workspace-folder /path/to/repo copilot --acp --stdio`
+/// `devcontainer exec --workspace-folder /path/to/repo --remote-env GITHUB_TOKEN=... copilot --acp --stdio`
 pub fn build_exec_command(workspace_folder: &Path, acp_command: &str) -> String {
-    format!(
-        "devcontainer exec --workspace-folder {} {}",
-        workspace_folder.display(),
-        acp_command
-    )
+    let mut parts = vec![
+        "devcontainer".to_string(),
+        "exec".to_string(),
+        "--workspace-folder".to_string(),
+        workspace_folder.display().to_string(),
+    ];
+
+    // Forward auth-related env vars so the agent can authenticate inside the container.
+    for var in &["GITHUB_TOKEN", "GH_TOKEN"] {
+        if let Ok(val) = std::env::var(var) {
+            if val.is_empty() {
+                continue;
+            }
+            parts.push("--remote-env".to_string());
+            parts.push(format!("{var}={val}"));
+        }
+    }
+
+    parts.push(acp_command.to_string());
+    parts.join(" ")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -109,6 +127,12 @@ mod tests {
 
     #[test]
     fn build_exec_command_formats_correctly() {
+        // Clear auth env vars so the test is deterministic.
+        // SAFETY: test runs single-threaded; no other thread reads these vars.
+        unsafe {
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::remove_var("GH_TOKEN");
+        }
         let cmd = build_exec_command(
             &PathBuf::from("/home/user/my-repo"),
             "copilot --acp --stdio",
@@ -121,10 +145,29 @@ mod tests {
 
     #[test]
     fn build_exec_command_with_claude() {
+        unsafe {
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::remove_var("GH_TOKEN");
+        }
         let cmd = build_exec_command(&PathBuf::from("/projects/web-app"), "claude-agent-acp");
         assert_eq!(
             cmd,
             "devcontainer exec --workspace-folder /projects/web-app claude-agent-acp"
         );
+    }
+
+    #[test]
+    fn build_exec_command_forwards_auth_env() {
+        unsafe {
+            std::env::set_var("GITHUB_TOKEN", "ghp_test123");
+            std::env::remove_var("GH_TOKEN");
+        }
+        let cmd = build_exec_command(&PathBuf::from("/repo"), "copilot --acp --stdio");
+        assert!(cmd.contains("--remote-env GITHUB_TOKEN=ghp_test123"));
+        assert!(cmd.starts_with("devcontainer exec --workspace-folder /repo"));
+        assert!(cmd.ends_with("copilot --acp --stdio"));
+        unsafe {
+            std::env::remove_var("GITHUB_TOKEN");
+        }
     }
 }

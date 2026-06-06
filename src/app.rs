@@ -5,7 +5,7 @@
 //!   * `Screen::AgentList` — top-level overview of all agents.
 //!   * `Screen::AgentSession` — immersive view of a single agent. The
 //!     conversation/history is the main pane; a `SidePane` (Diff or Editor)
-//!     can appear on the left, but only when invoked by a change event or
+//!     can appear on the right, but only when invoked by a change event or
 //!     by the user.
 //!
 //! Input handling is dispatched per-screen so a keypress can never silently
@@ -21,6 +21,7 @@ use crate::change_source::ChangeEvent;
 use crate::completion::{PathCompleter, split_command_and_path};
 use crate::config::{Action, Config};
 use crate::event::AppEvent;
+use crate::workspace;
 
 #[derive(Debug, Clone)]
 pub enum Screen {
@@ -394,6 +395,9 @@ impl App {
                     self.open_workspace(rest);
                 }
             }
+            "close" => {
+                self.close_current_workspace();
+            }
             "q" | "quit" => {
                 self.should_quit = true;
             }
@@ -430,6 +434,11 @@ impl App {
             .with_workspace(&workspace);
         self.agents.push(agent);
 
+        // Persist to workspaces.yaml.
+        if let Err(err) = workspace::save(&workspace::from_agents(&self.agents)) {
+            self.status_message = Some(format!("Warning: {err}"));
+        }
+
         self.screen = Screen::AgentSession {
             agent_id: agent_id.clone(),
             focus: SessionFocus::Conversation,
@@ -438,6 +447,26 @@ impl App {
             input_mode: false,
         };
         self.ensure_agent_connected(agent_id);
+    }
+
+    /// Remove the currently viewed workspace agent and go back to the list.
+    fn close_current_workspace(&mut self) {
+        let agent_id = match &self.screen {
+            Screen::AgentSession { agent_id, .. } => agent_id.clone(),
+            _ => {
+                self.status_message = Some("No workspace open — use :close from a session".into());
+                return;
+            }
+        };
+
+        self.agents.retain(|a| a.id != agent_id);
+
+        // Persist removal.
+        if let Err(err) = workspace::save(&workspace::from_agents(&self.agents)) {
+            self.status_message = Some(format!("Warning: {err}"));
+        }
+
+        self.screen = Screen::AgentList { selected: 0 };
     }
 }
 

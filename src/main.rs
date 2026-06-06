@@ -20,6 +20,7 @@ mod event;
 mod keybind;
 mod mcp_server;
 mod ui;
+mod workspace;
 
 use crate::app::App;
 use crate::change_source::{ChangeSource, ChangeSourceHandle, FsWatcher};
@@ -34,9 +35,9 @@ async fn main() -> Result<()> {
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 
-    let agents = agent::default_agents();
-
-    // ACP connections start lazily when the user enters an agent session.
+    // Load persisted workspaces — no more hardcoded mock agents.
+    let saved = workspace::load();
+    let agents = workspace::to_agents(&saved);
 
     let mut app = App::new(config, agents, tx.clone());
 

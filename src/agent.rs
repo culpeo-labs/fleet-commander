@@ -81,15 +81,6 @@ impl Agent {
     }
 }
 
-/// Agent definitions used by the TUI. ACP connections are established
-/// later by the agent runtime.
-pub fn default_agents() -> Vec<Agent> {
-    vec![
-        Agent::new("copilot", "Copilot Agent").with_acp_command("copilot --acp --stdio"),
-        Agent::new("claude", "Claude Agent").with_acp_command("claude-agent-acp"),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +93,10 @@ mod tests {
 
     #[test]
     fn effective_command_with_workspace() {
+        unsafe {
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::remove_var("GH_TOKEN");
+        }
         let agent = Agent::new("test", "Test")
             .with_acp_command("copilot --acp --stdio")
             .with_workspace("/home/user/my-repo");

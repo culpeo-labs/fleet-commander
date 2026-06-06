@@ -23,6 +23,163 @@ use crate::agent::AgentId;
 use crate::container::{self, ContainerConfig};
 use crate::event::AppEvent;
 
+/// Check if the agent requires authentication and attempt to run the
+/// login flow automatically.  Returns `true` if auth was performed and
+/// the caller should reconnect.
+async fn handle_auth_if_needed(
+    init_resp: &agent_client_protocol::schema::InitializeResponse,
+    agent_id: &str,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) -> bool {
+    if init_resp.auth_methods.is_empty() {
+        return false;
+    }
+
+    // Try to extract the terminal-auth command from _meta.
+    for method in &init_resp.auth_methods {
+        if let Some(terminal_auth) = method.meta().and_then(|m| m.get("terminal-auth")) {
+            let command = terminal_auth
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let args: Vec<&str> = terminal_auth
+                .get("args")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let label = terminal_auth
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Login");
+
+            if command.is_empty() {
+                continue;
+            }
+
+            let _ = event_tx.send(AppEvent::AgentOutput {
+                agent_id: agent_id.to_string(),
+                line: format!("🔑 Authentication required — running {label}..."),
+            });
+            let _ = event_tx.send(AppEvent::AgentOutput {
+                agent_id: agent_id.to_string(),
+                line: format!("   {command} {}", args.join(" ")),
+            });
+
+            // Run the auth command and stream output.
+            match run_auth_command(command, &args, agent_id, event_tx).await {
+                Ok(true) => {
+                    let _ = event_tx.send(AppEvent::AgentOutput {
+                        agent_id: agent_id.to_string(),
+                        line: "✓ Authentication successful — reconnecting...".into(),
+                    });
+                    return true;
+                }
+                Ok(false) => {
+                    let _ = event_tx.send(AppEvent::SessionError {
+                        agent_id: agent_id.to_string(),
+                        message: format!(
+                            "Authentication failed. Run `{command} {}` manually in another terminal.",
+                            args.join(" ")
+                        ),
+                    });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(AppEvent::SessionError {
+                        agent_id: agent_id.to_string(),
+                        message: format!(
+                            "Could not run auth command: {err}. Run `{command} {}` manually in another terminal.",
+                            args.join(" ")
+                        ),
+                    });
+                }
+            }
+            return false;
+        }
+
+        // Fallback: show the description so the user knows what to do.
+        let _ = event_tx.send(AppEvent::AgentOutput {
+            agent_id: agent_id.to_string(),
+            line: format!(
+                "🔑 Authentication required: {} — {}",
+                method.name(),
+                method.description().unwrap_or("see agent docs")
+            ),
+        });
+    }
+
+    false
+}
+
+/// Run an auth command (e.g. `copilot login`), streaming stdout/stderr
+/// to the agent conversation.  Returns `Ok(true)` on success.
+async fn run_auth_command(
+    command: &str,
+    args: &[&str],
+    agent_id: &str,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::AsyncBufReadExt;
+    use tokio::process::Command;
+
+    let mut child = Command::new(command)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let aid = agent_id.to_string();
+    let tx = event_tx.clone();
+
+    // Stream stdout.
+    let stdout_handle = if let Some(out) = stdout {
+        let aid = aid.clone();
+        let tx = tx.clone();
+        Some(tokio::spawn(async move {
+            let reader = tokio::io::BufReader::new(out);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = tx.send(AppEvent::AgentOutput {
+                    agent_id: aid.clone(),
+                    line: format!("  {line}"),
+                });
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Stream stderr.
+    let stderr_handle = if let Some(err) = stderr {
+        let aid = aid.clone();
+        let tx = tx.clone();
+        Some(tokio::spawn(async move {
+            let reader = tokio::io::BufReader::new(err);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = tx.send(AppEvent::AgentOutput {
+                    agent_id: aid.clone(),
+                    line: format!("  {line}"),
+                });
+            }
+        }))
+    } else {
+        None
+    };
+
+    if let Some(h) = stdout_handle {
+        let _ = h.await;
+    }
+    if let Some(h) = stderr_handle {
+        let _ = h.await;
+    }
+
+    let status = child.wait().await?;
+    Ok(status.success())
+}
+
 /// Spawn a persistent ACP connection for an agent.
 ///
 /// If the agent has a workspace folder, starts the dev container first.
@@ -132,12 +289,56 @@ async fn run_persistent_connection(
     agent_id: AgentId,
     acp_command: &str,
     session_cwd: PathBuf,
-    mut prompt_rx: mpsc::UnboundedReceiver<String>,
+    prompt_rx: mpsc::UnboundedReceiver<String>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Wrap prompt_rx in Arc<Mutex> so we can move it across reconnect attempts.
+    let prompt_rx = std::sync::Arc::new(tokio::sync::Mutex::new(prompt_rx));
+
+    // First attempt — may trigger auth flow.
+    let auth_needed = connect_and_run(
+        agent_id.clone(),
+        acp_command,
+        session_cwd.clone(),
+        prompt_rx.clone(),
+        event_tx.clone(),
+        true, // check auth
+    )
+    .await?;
+
+    if auth_needed {
+        // Auth was handled — reconnect with fresh ACP process.
+        connect_and_run(
+            agent_id,
+            acp_command,
+            session_cwd,
+            prompt_rx,
+            event_tx,
+            false,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Connect to an ACP agent and run the prompt loop.
+/// Returns `Ok(true)` if auth is needed (caller should reconnect after auth).
+/// Returns `Ok(false)` when the session ends normally.
+async fn connect_and_run(
+    agent_id: AgentId,
+    acp_command: &str,
+    session_cwd: PathBuf,
+    prompt_rx: std::sync::Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<String>>>,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+    check_auth: bool,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let agent = AcpAgent::from_str(acp_command)?;
     let aid = agent_id.clone();
     let tx = event_tx.clone();
+
+    let auth_needed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let auth_flag = auth_needed.clone();
 
     agent_client_protocol::Client
         .builder()
@@ -157,7 +358,6 @@ async fn run_persistent_connection(
                 let aid = aid.clone();
                 let tx = tx.clone();
                 async move |request: RequestPermissionRequest, responder, _connection| {
-                    // Log the permission request for visibility.
                     let _ = tx.send(AppEvent::AgentOutput {
                         agent_id: aid.clone(),
                         line: format!(
@@ -170,7 +370,6 @@ async fn run_persistent_connection(
                                 .unwrap_or("unknown")
                         ),
                     });
-                    // Auto-approve by selecting the first option.
                     let option_id = request.options.first().map(|opt| opt.option_id.clone());
                     if let Some(id) = option_id {
                         responder.respond(RequestPermissionResponse::new(
@@ -190,10 +389,22 @@ async fn run_persistent_connection(
             let tx = event_tx;
             async move {
                 // Initialize the ACP protocol.
-                let _init = connection
+                let init_resp = connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
                     .block_task()
                     .await?;
+
+                // Check for auth requirements.
+                if check_auth && !init_resp.auth_methods.is_empty() {
+                    let did_auth = handle_auth_if_needed(&init_resp, &aid, &tx).await;
+                    if did_auth {
+                        auth_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        // Drop the connection — caller will reconnect.
+                        return Ok(());
+                    }
+                    // Auth method present but login failed — continue anyway,
+                    // the session/new will likely fail with a clear error.
+                }
 
                 // Create a session with the appropriate working directory.
                 let session_resp = connection
@@ -208,10 +419,11 @@ async fn run_persistent_connection(
                 });
 
                 // Prompt loop — wait for messages from the TUI and forward to agent.
-                while let Some(message) = prompt_rx.recv().await {
+                let mut rx = prompt_rx.lock().await;
+                while let Some(message) = rx.recv().await {
                     let _ = tx.send(AppEvent::AssistantDelta {
                         agent_id: aid.clone(),
-                        text: String::new(), // Signals "running" state.
+                        text: String::new(),
                     });
 
                     let result = connection
@@ -242,7 +454,7 @@ async fn run_persistent_connection(
         })
         .await?;
 
-    Ok(())
+    Ok(auth_needed.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 /// Map an ACP `SessionUpdate` to `AppEvent`s and send them.

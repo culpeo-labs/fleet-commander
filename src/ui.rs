@@ -175,21 +175,21 @@ fn render_agent_session(
     .block(Block::default().borders(Borders::ALL));
     frame.render_widget(header, layout[0]);
 
-    // Body: side pane (left) only when present.
+    // Body: conversation on the left, side pane on the right when present.
     let body_area = layout[1];
     if let Some(pane) = side_pane {
         let body = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(body_area);
-        render_side_pane(frame, body[0], pane, focus == SessionFocus::SidePane);
         render_conversation(
             frame,
-            body[1],
+            body[0],
             agent,
             scroll,
             focus == SessionFocus::Conversation,
         );
+        render_side_pane(frame, body[1], pane, focus == SessionFocus::SidePane);
     } else {
         render_conversation(frame, body_area, agent, scroll, true);
     }
