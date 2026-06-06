@@ -28,29 +28,14 @@ pub struct ContainerInfo {
 /// Start a dev container for the given workspace.
 ///
 /// Runs `devcontainer up --workspace-folder <path>` and parses the JSON output.
-/// Mounts the host's `~/.copilot` directory into the container so that agents
-/// share the host's authentication — no separate login required per container.
 /// This may take a while on first run (image build + container creation).
 pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, ContainerError> {
-    let mut args = vec![
-        "up".to_string(),
-        "--workspace-folder".to_string(),
-        config.workspace_folder.to_str().unwrap_or(".").to_string(),
-    ];
-
-    // Mount host ~/.copilot into the container so credentials are shared.
-    // We use a fixed target path and set COPILOT_HOME via --remote-env
-    // at exec time so the copilot CLI finds it regardless of container user.
-    if let Some(copilot_dir) = copilot_config_dir().filter(|d| d.exists()) {
-        args.push("--mount".to_string());
-        args.push(format!(
-            "type=bind,source={},target=/opt/copilot-config",
-            copilot_dir.display()
-        ));
-    }
-
     let output = Command::new("devcontainer")
-        .args(&args)
+        .args([
+            "up",
+            "--workspace-folder",
+            config.workspace_folder.to_str().unwrap_or("."),
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -97,18 +82,48 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
     })
 }
 
-/// Path to the host's `~/.copilot` directory.
-fn copilot_config_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".copilot"))
+/// Resolve a GitHub auth token from the host using a fallback chain:
+/// 1. `gh auth token` — cleanest, uses the `gh` CLI credential store
+/// 2. `~/.copilot/config.json` — reads the Copilot CLI's stored OAuth token
+///
+/// Returns `None` if neither source has a token.
+fn resolve_host_github_token() -> Option<String> {
+    // Try `gh auth token` first — clean subprocess, no file parsing.
+    if let Some(output) = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    {
+        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+
+    // Fall back to reading ~/.copilot/config.json.
+    let config_path = dirs::home_dir()?.join(".copilot").join("config.json");
+    let contents = std::fs::read_to_string(config_path).ok()?;
+    // Strip JS-style line comments that copilot puts in the file.
+    let cleaned: String = contents
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let parsed: serde_json::Value = serde_json::from_str(&cleaned).ok()?;
+    let tokens = parsed.get("copilotTokens")?.as_object()?;
+    tokens.values().next()?.as_str().map(String::from)
 }
 
 /// Build the command string for running an ACP agent inside a dev container.
 ///
-/// Forwards GitHub auth env vars (`GITHUB_TOKEN`, `GH_TOKEN`) into the
-/// container so that tools like `copilot` and `gh` can authenticate.
-///
-/// Returns a command like:
-/// `devcontainer exec --workspace-folder /path/to/repo --remote-env GITHUB_TOKEN=... copilot --acp --stdio`
+/// Resolves a GitHub token from the host (`gh auth token` or
+/// `~/.copilot/config.json`) and passes it as `COPILOT_GITHUB_TOKEN` via
+/// `--remote-env`. This env var has highest precedence in the Copilot CLI,
+/// so agents authenticate without needing their own login inside the
+/// container. Also forwards any explicit `GITHUB_TOKEN`/`GH_TOKEN` env vars.
 pub fn build_exec_command(workspace_folder: &Path, acp_command: &str) -> String {
     let mut parts = vec![
         "devcontainer".to_string(),
@@ -117,10 +132,10 @@ pub fn build_exec_command(workspace_folder: &Path, acp_command: &str) -> String 
         workspace_folder.display().to_string(),
     ];
 
-    // Point COPILOT_HOME to the mounted host config so credentials are shared.
-    if copilot_config_dir().is_some_and(|d| d.exists()) {
+    // Forward host's GitHub token so container agents don't need separate login.
+    if let Some(token) = resolve_host_github_token() {
         parts.push("--remote-env".to_string());
-        parts.push("COPILOT_HOME=/opt/copilot-config".to_string());
+        parts.push(format!("COPILOT_GITHUB_TOKEN={token}"));
     }
 
     // Also forward explicit auth env vars if set.
@@ -152,11 +167,15 @@ pub enum ContainerError {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    // Tests that manipulate env vars must not run in parallel.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn build_exec_command_formats_correctly() {
-        // Clear auth env vars so the test is deterministic.
-        // SAFETY: test runs single-threaded; no other thread reads these vars.
+        let _lock = ENV_LOCK.lock().unwrap();
+        // SAFETY: tests using ENV_LOCK run sequentially; no other thread reads these vars.
         unsafe {
             std::env::remove_var("GITHUB_TOKEN");
             std::env::remove_var("GH_TOKEN");
@@ -171,6 +190,7 @@ mod tests {
 
     #[test]
     fn build_exec_command_with_claude() {
+        let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("GITHUB_TOKEN");
             std::env::remove_var("GH_TOKEN");
@@ -182,16 +202,27 @@ mod tests {
 
     #[test]
     fn build_exec_command_forwards_auth_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("GITHUB_TOKEN", "ghp_test123");
             std::env::remove_var("GH_TOKEN");
         }
         let cmd = build_exec_command(&PathBuf::from("/repo"), "copilot --acp --stdio");
-        assert!(cmd.contains("--remote-env GITHUB_TOKEN=ghp_test123"));
+        assert!(
+            cmd.contains("--remote-env GITHUB_TOKEN=ghp_test123"),
+            "Expected GITHUB_TOKEN in command: {cmd}"
+        );
         assert!(cmd.starts_with("devcontainer exec --workspace-folder /repo"));
         assert!(cmd.ends_with("copilot --acp --stdio"));
         unsafe {
             std::env::remove_var("GITHUB_TOKEN");
         }
+    }
+
+    #[test]
+    fn resolve_token_returns_none_without_sources() {
+        // When neither `gh` is authed nor config.json exists, we get None.
+        // This test just verifies it doesn't panic.
+        let _ = resolve_host_github_token();
     }
 }
