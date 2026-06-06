@@ -196,17 +196,54 @@ fn render_conversation(
     let style = border_style(focused);
     let lines: Vec<Line> = agent
         .map(|a| {
-            if a.history.is_empty() {
-                vec![Line::from(Span::styled(
+            let mut result: Vec<Line> = Vec::new();
+            if a.history.is_empty() && a.pending_response.is_empty() {
+                result.push(Line::from(Span::styled(
                     "(no messages yet)",
                     Style::default().fg(Color::DarkGray),
-                ))]
+                )));
             } else {
-                a.history
-                    .iter()
-                    .map(|line| Line::from(line.as_str()))
-                    .collect()
+                for line in &a.history {
+                    if line.starts_with("> ") {
+                        // User message — highlight.
+                        result.push(Line::from(Span::styled(
+                            line.as_str(),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                    } else if line.starts_with("[error]") {
+                        result.push(Line::from(Span::styled(
+                            line.as_str(),
+                            Style::default().fg(Color::Red),
+                        )));
+                    } else if line.starts_with("[tool") {
+                        result.push(Line::from(Span::styled(
+                            line.as_str(),
+                            Style::default().fg(Color::Yellow),
+                        )));
+                    } else if line.starts_with("[thought]") || line.starts_with("[permission]") {
+                        result.push(Line::from(Span::styled(
+                            line.as_str(),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    } else {
+                        result.push(Line::from(line.as_str()));
+                    }
+                }
+                // Show streaming response in progress.
+                if !a.pending_response.is_empty() {
+                    result.push(Line::from(Span::styled(
+                        a.pending_response.as_str(),
+                        Style::default().fg(Color::Green),
+                    )));
+                    result.push(Line::from(Span::styled(
+                        "▊",
+                        Style::default().fg(Color::Green),
+                    )));
+                }
             }
+            result
         })
         .unwrap_or_default();
 

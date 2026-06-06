@@ -95,6 +95,7 @@ impl App {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.history.push(line);
                 }
+                self.auto_scroll_for(&agent_id);
             }
             AppEvent::AgentExited { agent_id, .. } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
@@ -122,6 +123,7 @@ impl App {
                     agent.status = AgentStatus::Running;
                     agent.pending_response.push_str(&text);
                 }
+                self.auto_scroll_for(&agent_id);
             }
             AppEvent::AssistantDone { agent_id } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
@@ -131,6 +133,7 @@ impl App {
                     }
                     agent.status = AgentStatus::Idle;
                 }
+                self.auto_scroll_for(&agent_id);
             }
             AppEvent::SessionError { agent_id, message } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
@@ -249,6 +252,25 @@ impl App {
         agent.prompt_tx = Some(prompt_tx);
         agent.status = AgentStatus::Running;
         agent.history.push("Connecting...".into());
+    }
+
+    /// Scroll to the bottom when content arrives for the currently viewed agent.
+    fn auto_scroll_for(&mut self, agent_id: &str) {
+        if let Screen::AgentSession {
+            agent_id: current,
+            scroll,
+            ..
+        } = &mut self.screen
+        {
+            if current == agent_id {
+                if let Some(agent) = self.agents.iter().find(|a| a.id == agent_id) {
+                    // Rough estimate: scroll to end of content.
+                    let line_count = agent.history.len()
+                        + agent.pending_response.lines().count();
+                    *scroll = line_count.saturating_sub(1);
+                }
+            }
+        }
     }
 
     fn handle_change(&mut self, change: ChangeEvent) {
