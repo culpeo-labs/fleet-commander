@@ -15,6 +15,7 @@ mod change_source;
 mod config;
 mod event;
 mod keybind;
+mod mcp_server;
 mod ui;
 
 use crate::app::App;
@@ -33,6 +34,10 @@ async fn main() -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     let _input_task = spawn_input_task(tx.clone());
     let _change_handle = start_default_change_source(tx.clone())?;
+
+    let mcp_addr = "127.0.0.1:6100";
+    let _mcp_handle = mcp_server::start_mcp_server(mcp_addr, tx.clone()).await?;
+    eprintln!("MCP server listening on http://{mcp_addr}/mcp");
 
     let result = run(&mut terminal, &mut app, &mut rx).await;
 

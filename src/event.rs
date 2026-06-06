@@ -20,4 +20,21 @@ pub enum AppEvent {
         agent_id: AgentId,
         code: Option<i32>,
     },
+    /// An MCP client called the `show_diff` tool.
+    McpShowDiff {
+        agent_id: AgentId,
+        path: std::path::PathBuf,
+        content: String,
+    },
+    /// An MCP client called the `show_file` tool.
+    McpShowFile {
+        agent_id: AgentId,
+        path: std::path::PathBuf,
+        content: String,
+    },
+    /// An MCP client called the `notify` tool.
+    McpNotify {
+        agent_id: AgentId,
+        message: String,
+    },
 }

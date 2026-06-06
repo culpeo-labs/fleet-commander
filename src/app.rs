@@ -91,6 +91,21 @@ impl App {
                     agent.status = AgentStatus::Stopped;
                 }
             }
+            AppEvent::McpShowDiff {
+                agent_id,
+                path,
+                content,
+            } => self.handle_mcp_side_pane(agent_id, SidePane::Diff { path, content }),
+            AppEvent::McpShowFile {
+                agent_id,
+                path,
+                content,
+            } => self.handle_mcp_side_pane(agent_id, SidePane::Diff { path, content }),
+            AppEvent::McpNotify { agent_id, message } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    agent.history.push(message);
+                }
+            }
         }
     }
 
@@ -122,6 +137,29 @@ impl App {
                 path: change.path,
                 content,
             });
+        }
+    }
+
+    /// Open or replace the side pane when an MCP tool targets a specific agent.
+    /// If that agent's session is currently visible, the pane updates immediately.
+    /// If the agent list is showing, we navigate into the agent's session.
+    fn handle_mcp_side_pane(&mut self, agent_id: AgentId, pane: SidePane) {
+        match &mut self.screen {
+            Screen::AgentSession {
+                agent_id: current,
+                side_pane,
+                ..
+            } if *current == agent_id => {
+                *side_pane = Some(pane);
+            }
+            _ => {
+                self.screen = Screen::AgentSession {
+                    agent_id,
+                    focus: SessionFocus::Conversation,
+                    side_pane: Some(pane),
+                    scroll: 0,
+                };
+            }
         }
     }
 }
