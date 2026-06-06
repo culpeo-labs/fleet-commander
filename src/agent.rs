@@ -85,10 +85,8 @@ impl Agent {
 /// later by the agent runtime.
 pub fn default_agents() -> Vec<Agent> {
     vec![
-        Agent::new("copilot", "Copilot Agent")
-            .with_acp_command("copilot --acp --stdio"),
-        Agent::new("claude", "Claude Agent")
-            .with_acp_command("claude-agent-acp"),
+        Agent::new("copilot", "Copilot Agent").with_acp_command("copilot --acp --stdio"),
+        Agent::new("claude", "Claude Agent").with_acp_command("claude-agent-acp"),
     ]
 }
 
@@ -98,8 +96,7 @@ mod tests {
 
     #[test]
     fn effective_command_without_workspace() {
-        let agent = Agent::new("test", "Test")
-            .with_acp_command("copilot --acp --stdio");
+        let agent = Agent::new("test", "Test").with_acp_command("copilot --acp --stdio");
         assert_eq!(agent.effective_acp_command(), "copilot --acp --stdio");
     }
 

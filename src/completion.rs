@@ -86,10 +86,7 @@ fn list_candidates(partial: &str) -> Vec<String> {
 
     // Split into parent dir + prefix.
     let parent = path.parent().unwrap_or(Path::new("."));
-    let prefix = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let prefix = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
     // If the partial is already a directory (no trailing slash), list children.
     if path.is_dir() {
@@ -166,7 +163,11 @@ mod tests {
             assert_eq!(candidates.len(), 2);
             let names: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
             assert!(names.iter().any(|n| n.contains("alpha-two")));
-            assert!(names.iter().any(|n| n.contains("alpha") && !n.contains("alpha-two")));
+            assert!(
+                names
+                    .iter()
+                    .any(|n| n.contains("alpha") && !n.contains("alpha-two"))
+            );
             // Directories get trailing slash.
             assert!(candidates.iter().all(|c| c.ends_with('/')));
         });

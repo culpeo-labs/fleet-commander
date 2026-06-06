@@ -8,11 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::{
-    ErrorData as McpError, ServerHandler,
-    handler::server::router::tool::ToolRouter,
-    model::*,
-    schemars, tool, tool_handler, tool_router,
-    handler::server::wrapper::Parameters,
+    ErrorData as McpError, ServerHandler, handler::server::router::tool::ToolRouter,
+    handler::server::wrapper::Parameters, model::*, schemars, tool, tool_handler, tool_router,
 };
 use tokio::sync::mpsc;
 
@@ -126,7 +123,10 @@ impl TuiMcpServer {
 impl ServerHandler for TuiMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("fleet-commander", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new(
+                "fleet-commander",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .with_instructions(
                 "MCP server for the multi-agent TUI. \
                  Tools: show_diff (display a diff), show_file (display a file), \
@@ -143,8 +143,7 @@ pub async fn start_mcp_server(
     tx: mpsc::UnboundedSender<AppEvent>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     use rmcp::transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService,
-        session::local::LocalSessionManager,
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
 
     let ct = tokio_util::sync::CancellationToken::new();

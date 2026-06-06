@@ -40,11 +40,11 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
         .stderr(Stdio::piped())
         .output()
         .await
-        .map_err(|e| ContainerError::SpawnFailed(format!("devcontainer up: {e}")))?;
+        .map_err(|e| ContainerError::Spawn(format!("devcontainer up: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ContainerError::StartFailed(stderr.to_string()));
+        return Err(ContainerError::Start(stderr.to_string()));
     }
 
     // devcontainer up outputs JSON on the last line of stdout.
@@ -53,17 +53,14 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
         .lines()
         .rev()
         .find(|line| line.starts_with('{'))
-        .ok_or_else(|| ContainerError::ParseFailed("No JSON in devcontainer up output".into()))?;
+        .ok_or_else(|| ContainerError::Parse("No JSON in devcontainer up output".into()))?;
 
     let parsed: serde_json::Value =
-        serde_json::from_str(json_line).map_err(|e| ContainerError::ParseFailed(e.to_string()))?;
+        serde_json::from_str(json_line).map_err(|e| ContainerError::Parse(e.to_string()))?;
 
-    let outcome = parsed
-        .get("outcome")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let outcome = parsed.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
     if outcome != "success" {
-        return Err(ContainerError::StartFailed(format!(
+        return Err(ContainerError::Start(format!(
             "devcontainer up outcome: {outcome}"
         )));
     }
@@ -98,11 +95,11 @@ pub fn build_exec_command(workspace_folder: &Path, acp_command: &str) -> String 
 #[derive(Debug, thiserror::Error)]
 pub enum ContainerError {
     #[error("Failed to spawn devcontainer CLI: {0}")]
-    SpawnFailed(String),
+    Spawn(String),
     #[error("Container failed to start: {0}")]
-    StartFailed(String),
+    Start(String),
     #[error("Failed to parse devcontainer output: {0}")]
-    ParseFailed(String),
+    Parse(String),
 }
 
 #[cfg(test)]
@@ -124,10 +121,7 @@ mod tests {
 
     #[test]
     fn build_exec_command_with_claude() {
-        let cmd = build_exec_command(
-            &PathBuf::from("/projects/web-app"),
-            "claude-agent-acp",
-        );
+        let cmd = build_exec_command(&PathBuf::from("/projects/web-app"), "claude-agent-acp");
         assert_eq!(
             cmd,
             "devcontainer exec --workspace-folder /projects/web-app claude-agent-acp"

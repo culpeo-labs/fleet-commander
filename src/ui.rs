@@ -129,6 +129,7 @@ fn status_color(status: &crate::agent::AgentStatus) -> Color {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_agent_session(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -208,13 +209,12 @@ fn render_agent_session(
 
     // Render input box when in input mode.
     if input_mode {
-        let input = Paragraph::new(input_buffer)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Message ")
-                    .border_style(Style::default().fg(Color::Yellow)),
-            );
+        let input = Paragraph::new(input_buffer).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Message ")
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
         frame.render_widget(input, layout[2]);
     }
 }

@@ -162,16 +162,19 @@ async fn run_persistent_connection(
                         agent_id: aid.clone(),
                         line: format!(
                             "[permission] auto-approved: {}",
-                            request.tool_call.fields.title.as_deref().unwrap_or("unknown")
+                            request
+                                .tool_call
+                                .fields
+                                .title
+                                .as_deref()
+                                .unwrap_or("unknown")
                         ),
                     });
                     // Auto-approve by selecting the first option.
                     let option_id = request.options.first().map(|opt| opt.option_id.clone());
                     if let Some(id) = option_id {
                         responder.respond(RequestPermissionResponse::new(
-                            RequestPermissionOutcome::Selected(
-                                SelectedPermissionOutcome::new(id),
-                            ),
+                            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)),
                         ))
                     } else {
                         responder.respond(RequestPermissionResponse::new(

@@ -242,17 +242,16 @@ impl App {
                 }
                 KeyCode::Enter => {
                     let message = std::mem::take(&mut self.input_buffer);
-                    if !message.is_empty() {
-                        if let Some(agent) =
-                            self.agents.iter().find(|a| a.id == *agent_id)
-                        {
-                            agent_runtime::send_message(
-                                agent.id.clone(),
-                                agent.prompt_tx.as_ref(),
-                                message,
-                                self.tx.clone(),
-                            );
-                        }
+                    if let Some(agent) = (!message.is_empty())
+                        .then(|| self.agents.iter().find(|a| a.id == *agent_id))
+                        .flatten()
+                    {
+                        agent_runtime::send_message(
+                            agent.id.clone(),
+                            agent.prompt_tx.as_ref(),
+                            message,
+                            self.tx.clone(),
+                        );
                     }
                     if let Screen::AgentSession { input_mode, .. } = &mut self.screen {
                         *input_mode = false;
@@ -335,13 +334,12 @@ impl App {
             ..
         } = &mut self.screen
         {
-            if current == agent_id {
-                if let Some(agent) = self.agents.iter().find(|a| a.id == agent_id) {
-                    // Rough estimate: scroll to end of content.
-                    let line_count = agent.history.len()
-                        + agent.pending_response.lines().count();
-                    *scroll = line_count.saturating_sub(1);
-                }
+            if current != agent_id {
+                return;
+            }
+            if let Some(agent) = self.agents.iter().find(|a| a.id == agent_id) {
+                let line_count = agent.history.len() + agent.pending_response.lines().count();
+                *scroll = line_count.saturating_sub(1);
             }
         }
     }
