@@ -1,8 +1,11 @@
 //! Agent state held by the UI.
 //!
 //! Each agent wraps an ACP connection. The `acp_command` field specifies
-//! what command to launch (e.g. "copilot --acp --stdio"). The connection
-//! is established by the agent runtime and updates flow through AppEvents.
+//! what command to launch (e.g. "copilot --acp --stdio"). Once connected,
+//! `prompt_tx` holds a channel for sending messages into the persistent
+//! ACP session without respawning the process.
+
+use tokio::sync::mpsc;
 
 pub type AgentId = String;
 
@@ -34,6 +37,9 @@ pub struct Agent {
     pub acp_command: String,
     /// Accumulates streaming deltas for the current assistant turn.
     pub pending_response: String,
+    /// Channel for sending prompts to the persistent ACP connection.
+    /// `None` until the connection is established.
+    pub prompt_tx: Option<mpsc::UnboundedSender<String>>,
 }
 
 impl Agent {
@@ -45,6 +51,7 @@ impl Agent {
             history: Vec::new(),
             acp_command: String::new(),
             pending_response: String::new(),
+            prompt_tx: None,
         }
     }
 

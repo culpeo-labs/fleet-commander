@@ -99,6 +99,7 @@ impl App {
             AppEvent::AgentExited { agent_id, .. } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.status = AgentStatus::Stopped;
+                    agent.prompt_tx = None;
                 }
             }
             AppEvent::McpShowDiff {
@@ -183,7 +184,7 @@ impl App {
                         {
                             agent_runtime::send_message(
                                 agent.id.clone(),
-                                agent.acp_command.clone(),
+                                agent.prompt_tx.as_ref(),
                                 message,
                                 self.tx.clone(),
                             );
@@ -222,7 +223,32 @@ impl App {
         };
         if let Some(next) = next {
             self.screen = next;
+            // Lazily start ACP connection when entering an agent session.
+            if let Screen::AgentSession { agent_id, .. } = &self.screen {
+                self.ensure_agent_connected(agent_id.clone());
+            }
         }
+    }
+
+    /// Start the ACP connection for an agent if not already connected.
+    fn ensure_agent_connected(&mut self, agent_id: AgentId) {
+        let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) else {
+            return;
+        };
+        if agent.prompt_tx.is_some() {
+            return; // Already connected.
+        }
+        if agent.acp_command.is_empty() {
+            return; // No command configured.
+        }
+        let prompt_tx = agent_runtime::start_agent(
+            agent.id.clone(),
+            agent.acp_command.clone(),
+            self.tx.clone(),
+        );
+        agent.prompt_tx = Some(prompt_tx);
+        agent.status = AgentStatus::Running;
+        agent.history.push("Connecting...".into());
     }
 
     fn handle_change(&mut self, change: ChangeEvent) {
@@ -590,5 +616,42 @@ mod tests {
             _ => panic!("expected AgentSession"),
         }
         assert!(app.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn agent_connected_sets_idle_status() {
+        let mut app = app_with_agents();
+        app.handle(AppEvent::AgentConnected {
+            agent_id: "a1".into(),
+        });
+        let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        assert_eq!(a1.status, AgentStatus::Idle);
+        assert!(a1.history.last().unwrap().contains("connected"));
+    }
+
+    #[test]
+    fn agent_exited_clears_prompt_tx() {
+        let mut app = app_with_agents();
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        app.agents[0].prompt_tx = Some(tx);
+        app.handle(AppEvent::AgentExited {
+            agent_id: "a1".into(),
+            code: Some(0),
+        });
+        let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        assert_eq!(a1.status, AgentStatus::Stopped);
+        assert!(a1.prompt_tx.is_none());
+    }
+
+    #[test]
+    fn tool_call_update_appends_to_history() {
+        let mut app = app_with_agents();
+        app.handle(AppEvent::ToolCallUpdate {
+            agent_id: "a1".into(),
+            tool_name: "read_file".into(),
+            status: "started".into(),
+        });
+        let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        assert!(a1.history.last().unwrap().contains("read_file"));
     }
 }

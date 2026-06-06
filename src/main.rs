@@ -34,8 +34,7 @@ async fn main() -> Result<()> {
 
     let agents = agent::default_agents();
 
-    // ACP agents are spawned on-demand when the user sends a message.
-    // No upfront connection needed — each prompt creates an ACP session.
+    // ACP connections start lazily when the user enters an agent session.
 
     let mut app = App::new(config, agents, tx.clone());
 

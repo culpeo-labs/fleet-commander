@@ -1,9 +1,10 @@
 //! ACP (Agent Client Protocol) integration layer.
 //!
-//! Manages the lifecycle of ACP agent subprocesses. Each agent is spawned
-//! as a separate process (e.g. `copilot --acp --stdio`) and communicated
-//! with via JSON-RPC over stdio. Session update notifications are forwarded
-//! into the TUI's [`AppEvent`] channel so the UI reacts in real time.
+//! Manages the lifecycle of ACP agent subprocesses. Each agent gets a
+//! persistent connection: the process is spawned once, a session is created,
+//! and a prompt channel allows the TUI to send messages without respawning.
+//! Session update notifications are forwarded into the TUI's [`AppEvent`]
+//! channel so the UI reacts in real time.
 
 use std::str::FromStr;
 
@@ -18,64 +19,95 @@ use tokio::sync::mpsc;
 use crate::agent::AgentId;
 use crate::event::AppEvent;
 
-/// Spawn an ACP agent process, initialize it, create a session, and return
-/// a handle for sending prompts.
+/// Spawn a persistent ACP connection for an agent.
 ///
-/// Session update notifications are forwarded as `AppEvent`s through `tx`.
-/// The entire lifecycle runs in a spawned task so it doesn't block the UI.
-#[allow(dead_code)] // Will be used when persistent connections are implemented.
-pub fn spawn_agent(
+/// Returns an `mpsc::UnboundedSender<String>` that the TUI can use to send
+/// prompts into the running session. The spawned task:
+/// 1. Starts the ACP subprocess
+/// 2. Initializes the protocol
+/// 3. Creates a session
+/// 4. Sends `AgentConnected` event
+/// 5. Loops waiting for prompts on the returned channel
+///
+/// All session updates (message chunks, tool calls, etc.) are forwarded
+/// as `AppEvent`s through `event_tx`.
+pub fn start_agent(
     agent_id: AgentId,
     acp_command: String,
-    tx: mpsc::UnboundedSender<AppEvent>,
-) {
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+) -> mpsc::UnboundedSender<String> {
+    let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<String>();
+
     tokio::spawn(async move {
-        if let Err(err) = run_agent_connection(agent_id.clone(), &acp_command, tx.clone()).await {
-            let _ = tx.send(AppEvent::SessionError {
-                agent_id,
+        if let Err(err) =
+            run_persistent_connection(agent_id.clone(), &acp_command, prompt_rx, event_tx.clone())
+                .await
+        {
+            let _ = event_tx.send(AppEvent::SessionError {
+                agent_id: agent_id.clone(),
                 message: format!("ACP connection failed: {err}"),
             });
         }
+        // Connection ended — mark agent as stopped.
+        let _ = event_tx.send(AppEvent::AgentExited {
+            agent_id,
+            code: None,
+        });
     });
+
+    prompt_tx
 }
 
-/// Send a user prompt to an ACP agent by spawning a fresh connection.
+/// Send a prompt through an existing agent connection.
 ///
-/// In the current architecture, each prompt creates a new ACP connection.
-/// A future iteration will maintain persistent connections with session resume.
-pub fn send_message(agent_id: AgentId, acp_command: String, message: String, tx: mpsc::UnboundedSender<AppEvent>) {
-    // Echo the user's message first.
-    let _ = tx.send(AppEvent::AgentOutput {
+/// If the agent has a `prompt_tx`, the message is sent through it.
+/// If not (no connection yet), the agent is started first.
+pub fn send_message(
+    agent_id: AgentId,
+    prompt_tx: Option<&mpsc::UnboundedSender<String>>,
+    message: String,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    // Echo the user's message.
+    let _ = event_tx.send(AppEvent::AgentOutput {
         agent_id: agent_id.clone(),
         line: format!("> {message}"),
     });
 
-    tokio::spawn(async move {
-        if let Err(err) = run_prompt(agent_id.clone(), &acp_command, &message, tx.clone()).await {
-            let _ = tx.send(AppEvent::SessionError {
+    match prompt_tx {
+        Some(tx) => {
+            if tx.send(message).is_err() {
+                let _ = event_tx.send(AppEvent::SessionError {
+                    agent_id,
+                    message: "Agent connection closed".into(),
+                });
+            }
+        }
+        None => {
+            let _ = event_tx.send(AppEvent::SessionError {
                 agent_id,
-                message: format!("Prompt failed: {err}"),
+                message: "Agent not connected — press Enter on agent list to connect".into(),
             });
         }
-    });
+    }
 }
 
-#[allow(dead_code)] // Will be used when persistent connections are implemented.
-async fn run_agent_connection(
+async fn run_persistent_connection(
     agent_id: AgentId,
     acp_command: &str,
-    tx: mpsc::UnboundedSender<AppEvent>,
+    mut prompt_rx: mpsc::UnboundedReceiver<String>,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let agent = AcpAgent::from_str(acp_command)?;
-    let tx_notif = tx.clone();
     let aid = agent_id.clone();
+    let tx = event_tx.clone();
 
     agent_client_protocol::Client
         .builder()
         .on_receive_notification(
             {
                 let aid = aid.clone();
-                let tx = tx_notif.clone();
+                let tx = tx.clone();
                 async move |notification: SessionNotification, _cx| {
                     forward_session_update(&aid, &notification.update, &tx);
                     Ok(())
@@ -84,126 +116,87 @@ async fn run_agent_connection(
             agent_client_protocol::on_receive_notification!(),
         )
         .on_receive_request(
-            async move |request: RequestPermissionRequest, responder, _connection| {
-                // Auto-approve for now; future: route to TUI for user decision.
-                let option_id = request.options.first().map(|opt| opt.option_id.clone());
-                if let Some(id) = option_id {
-                    responder.respond(RequestPermissionResponse::new(
-                        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)),
-                    ))
-                } else {
-                    responder.respond(RequestPermissionResponse::new(
-                        RequestPermissionOutcome::Cancelled,
-                    ))
+            {
+                let aid = aid.clone();
+                let tx = tx.clone();
+                async move |request: RequestPermissionRequest, responder, _connection| {
+                    // Log the permission request for visibility.
+                    let _ = tx.send(AppEvent::AgentOutput {
+                        agent_id: aid.clone(),
+                        line: format!(
+                            "[permission] auto-approved: {}",
+                            request.tool_call.fields.title.as_deref().unwrap_or("unknown")
+                        ),
+                    });
+                    // Auto-approve by selecting the first option.
+                    let option_id = request.options.first().map(|opt| opt.option_id.clone());
+                    if let Some(id) = option_id {
+                        responder.respond(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Selected(
+                                SelectedPermissionOutcome::new(id),
+                            ),
+                        ))
+                    } else {
+                        responder.respond(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Cancelled,
+                        ))
+                    }
                 }
             },
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| {
             let aid = aid.clone();
-            let tx = tx.clone();
+            let tx = event_tx;
             async move {
-                // Initialize
+                // Initialize the ACP protocol.
                 let _init = connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
                     .block_task()
                     .await?;
 
-                // Create session
+                // Create a session.
                 let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
                 let session_resp = connection
                     .send_request(NewSessionRequest::new(cwd))
                     .block_task()
                     .await?;
+
+                let session_id = session_resp.session_id;
 
                 let _ = tx.send(AppEvent::AgentConnected {
                     agent_id: aid.clone(),
                 });
-                let _ = tx.send(AppEvent::AgentOutput {
-                    agent_id: aid.clone(),
-                    line: format!("Session created: {}", session_resp.session_id),
-                });
 
-                // Keep connection alive — the process will exit when dropped.
-                // In a full implementation, we'd hold this and accept prompts.
-                // For now, signal readiness and let the connection close.
-                Ok(())
-            }
-        })
-        .await?;
+                // Prompt loop — wait for messages from the TUI and forward to agent.
+                while let Some(message) = prompt_rx.recv().await {
+                    let _ = tx.send(AppEvent::AssistantDelta {
+                        agent_id: aid.clone(),
+                        text: String::new(), // Signals "running" state.
+                    });
 
-    Ok(())
-}
+                    let result = connection
+                        .send_request(PromptRequest::new(
+                            session_id.clone(),
+                            vec![ContentBlock::Text(TextContent::new(message))],
+                        ))
+                        .block_task()
+                        .await;
 
-async fn run_prompt(
-    agent_id: AgentId,
-    acp_command: &str,
-    message: &str,
-    tx: mpsc::UnboundedSender<AppEvent>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let agent = AcpAgent::from_str(acp_command)?;
-    let tx_notif = tx.clone();
-    let aid = agent_id.clone();
-    let prompt_text = message.to_string();
-
-    agent_client_protocol::Client
-        .builder()
-        .on_receive_notification(
-            {
-                let aid = aid.clone();
-                let tx = tx_notif.clone();
-                async move |notification: SessionNotification, _cx| {
-                    forward_session_update(&aid, &notification.update, &tx);
-                    Ok(())
+                    match result {
+                        Ok(_prompt_resp) => {
+                            let _ = tx.send(AppEvent::AssistantDone {
+                                agent_id: aid.clone(),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = tx.send(AppEvent::SessionError {
+                                agent_id: aid.clone(),
+                                message: format!("Prompt error: {err}"),
+                            });
+                        }
+                    }
                 }
-            },
-            agent_client_protocol::on_receive_notification!(),
-        )
-        .on_receive_request(
-            async move |request: RequestPermissionRequest, responder, _connection| {
-                let option_id = request.options.first().map(|opt| opt.option_id.clone());
-                if let Some(id) = option_id {
-                    responder.respond(RequestPermissionResponse::new(
-                        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)),
-                    ))
-                } else {
-                    responder.respond(RequestPermissionResponse::new(
-                        RequestPermissionOutcome::Cancelled,
-                    ))
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| {
-            let aid = aid.clone();
-            let tx = tx.clone();
-            let prompt_text = prompt_text.clone();
-            async move {
-                // Initialize
-                let _init = connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
-                    .block_task()
-                    .await?;
-
-                // Create session
-                let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
-                let session_resp = connection
-                    .send_request(NewSessionRequest::new(cwd))
-                    .block_task()
-                    .await?;
-
-                // Send prompt
-                let _prompt_resp = connection
-                    .send_request(PromptRequest::new(
-                        session_resp.session_id,
-                        vec![ContentBlock::Text(TextContent::new(prompt_text))],
-                    ))
-                    .block_task()
-                    .await?;
-
-                let _ = tx.send(AppEvent::AssistantDone {
-                    agent_id: aid,
-                });
 
                 Ok(())
             }
