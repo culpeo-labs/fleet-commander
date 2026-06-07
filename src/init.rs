@@ -158,7 +158,11 @@ fn confirm_projects(projects: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(selected)
 }
 
-/// Generate the base devcontainer credential layer for the selected agent.
+/// Generate the base devcontainer layer for the selected agent.
+///
+/// The base layer only contains `containerEnv` entries the agent needs.
+/// Authentication is handled at runtime via the ACP auth flow (device-code
+/// login with plaintext token storage inside the container).
 fn generate_base_layer(agent_kind: AgentKind) -> Result<()> {
     let config_dir = fleet_commander_config_dir()?;
     std::fs::create_dir_all(&config_dir)?;
@@ -167,24 +171,17 @@ fn generate_base_layer(agent_kind: AgentKind) -> Result<()> {
 
     let mut base = serde_json::Map::new();
 
-    // Add credential environment variables.
-    let cred_env = agent_kind.credential_env();
-    if !cred_env.is_empty() {
-        let env_obj: serde_json::Value = serde_json::to_value(&cred_env)?;
-        base.insert("remoteEnv".to_string(), env_obj);
-    }
-
-    // Add credential mounts.
-    let cred_mounts = agent_kind.credential_mounts();
-    if !cred_mounts.is_empty() {
-        let mounts_arr: serde_json::Value = serde_json::to_value(&cred_mounts)?;
-        base.insert("mounts".to_string(), mounts_arr);
+    // Add container environment variables (if any).
+    let container_env = agent_kind.container_env();
+    if !container_env.is_empty() {
+        let env_obj: serde_json::Value = serde_json::to_value(&container_env)?;
+        base.insert("containerEnv".to_string(), env_obj);
     }
 
     let json = serde_json::to_string_pretty(&base)?;
     std::fs::write(&base_path, &json)?;
 
-    println!("Base credential layer written to {}", base_path.display());
+    println!("Base layer written to {}", base_path.display());
 
     Ok(())
 }
@@ -253,20 +250,16 @@ mod tests {
     #[test]
     fn generate_base_layer_creates_file() {
         let tmp = TempDir::new().unwrap();
-        // Override config dir for test.
         let base_path = tmp.path().join("base-devcontainer.json");
 
-        let mut base = serde_json::Map::new();
-        let cred_env = AgentKind::Copilot.credential_env();
-        base.insert("remoteEnv".to_string(), serde_json::to_value(&cred_env).unwrap());
-        let cred_mounts = AgentKind::Copilot.credential_mounts();
-        base.insert("mounts".to_string(), serde_json::to_value(&cred_mounts).unwrap());
-
+        // Simulate what generate_base_layer does for Copilot.
+        let base = serde_json::Map::new();
+        // Copilot currently has no container_env, so the base layer is empty.
         let json = serde_json::to_string_pretty(&base).unwrap();
         std::fs::write(&base_path, &json).unwrap();
 
-        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&base_path).unwrap()).unwrap();
-        assert!(parsed["remoteEnv"]["COPILOT_GITHUB_TOKEN"].is_string());
-        assert!(parsed["mounts"].is_array());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&base_path).unwrap()).unwrap();
+        assert!(parsed.is_object());
     }
 }

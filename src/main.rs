@@ -1,13 +1,14 @@
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
+    cursor,
     event::{Event, EventStream, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures_util::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
-use std::{io, path::PathBuf};
+use std::{io, path::PathBuf, process::Stdio};
 use tokio::sync::mpsc;
 
 mod agent;
@@ -23,6 +24,7 @@ mod event;
 mod init;
 mod keybind;
 mod mcp_server;
+mod terminal;
 mod ui;
 mod workspace;
 
@@ -95,14 +97,13 @@ fn install_panic_hook() {
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 fn teardown_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)?;
     Ok(())
 }
 
@@ -148,7 +149,64 @@ async fn run(
         if app.should_quit {
             break;
         }
+        // If auth is needed, suspend the TUI and run the login command interactively.
+        if let Some((agent_id, command)) = app.auth_pending.take() {
+            run_auth_terminal(terminal, &command)?;
+            // After auth completes, reconnect the agent.
+            app.ensure_agent_connected(agent_id);
+        }
         terminal.draw(|f| ui::render(f, app))?;
     }
+    Ok(())
+}
+
+/// Suspend the TUI and run an auth command with full interactive I/O.
+///
+/// Leaves the alternate screen, disables raw mode, spawns the command with
+/// inherited stdin/stdout/stderr so the user can complete the login flow,
+/// then restores the TUI.
+fn run_auth_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    command: &[String],
+) -> Result<()> {
+    // Leave TUI mode so the user gets a normal terminal.
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)?;
+
+    let (program, args) = command.split_first().expect("auth command cannot be empty");
+
+    eprintln!("\n── Fleet Commander: Authentication ──");
+    eprintln!("Running: {}\n", command.join(" "));
+
+    let status = std::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            eprintln!("\n✓ Auth command completed successfully. Resuming...\n");
+        }
+        Ok(s) => {
+            eprintln!(
+                "\n⚠ Auth command exited with code {}. Resuming...\n",
+                s.code().unwrap_or(-1)
+            );
+        }
+        Err(e) => {
+            eprintln!("\n✗ Failed to run auth command: {e}. Resuming...\n");
+        }
+    }
+
+    // Brief pause so the user can see the status.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Restore TUI mode.
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen, cursor::Hide)?;
+    terminal.clear()?;
+
     Ok(())
 }

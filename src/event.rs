@@ -61,4 +61,10 @@ pub enum AppEvent {
     AgentConnected {
         agent_id: AgentId,
     },
+    /// The agent needs interactive authentication (e.g. `copilot login`).
+    /// The main loop should suspend the TUI and run the command interactively.
+    AuthRequired {
+        agent_id: AgentId,
+        command: Vec<String>,
+    },
 }

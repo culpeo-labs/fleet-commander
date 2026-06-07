@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use devcontainer_lib::devcontainer::config::DevcontainerConfig;
+use devcontainer_lib::devcontainer::features::{
+    download_features, generate_feature_dockerfile_with_opts, order_features, resolve_features,
+    stage_feature_context,
+};
 use devcontainer_lib::devcontainer::merge::merge_layer;
 use devcontainer_lib::devcontainer::variables::{substitute_variables, substitute_variables_with_user};
 use devcontainer_lib::parse_jsonc;
@@ -170,17 +174,24 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
     })
 }
 
-/// Resolve the container image — pull if image-based, build if Dockerfile-based.
+/// Resolve the container image — pull/build base, then layer features if present.
 async fn resolve_image(
     rt: &dyn ContainerRuntime,
     workspace: &Path,
     config: &DevcontainerConfig,
     config_path: &Path,
 ) -> Result<String, ContainerError> {
-    if let Some(ref image) = config.image {
-        rt.pull_image(image).await
+    let folder_image = container_name(workspace);
+    let features = resolve_features(config).unwrap_or_default();
+    let has_features = !features.is_empty();
+    let devcontainer_dir = config_path.parent().map(|p| p.to_path_buf());
+
+    // 1. Pull or build the base image.
+    let base_image = if let Some(ref image) = config.image {
+        rt.pull_image(image)
+            .await
             .map_err(|e| ContainerError::Start(format!("Failed to pull image: {e}")))?;
-        Ok(image.clone())
+        image.clone()
     } else if let Some(ref build) = config.build {
         let context_dir = config_path
             .parent()
@@ -189,16 +200,68 @@ async fn resolve_image(
         let dockerfile_path = config_path.parent().unwrap().join(&build.dockerfile);
         let dockerfile_content = std::fs::read_to_string(&dockerfile_path)
             .map_err(|e| ContainerError::Parse(format!("Failed to read Dockerfile: {e}")))?;
-        let tag = container_name(workspace);
-        rt.build_image(&dockerfile_content, &context_dir, &tag, &HashMap::new(), false, false)
-            .await
-            .map_err(|e| ContainerError::Start(format!("Image build failed: {e}")))?;
-        Ok(tag)
+        let base_tag = if has_features {
+            folder_image.clone()
+        } else {
+            format!("{folder_image}-base")
+        };
+        rt.build_image(
+            &dockerfile_content,
+            &context_dir,
+            &base_tag,
+            &HashMap::new(),
+            false,
+            false,
+        )
+        .await
+        .map_err(|e| ContainerError::Start(format!("Image build failed: {e}")))?;
+        base_tag
     } else {
-        Err(ContainerError::Parse(
+        return Err(ContainerError::Parse(
             "devcontainer.json must specify 'image' or 'build.dockerfile'".into(),
-        ))
+        ));
+    };
+
+    if !has_features {
+        return Ok(base_image);
     }
+
+    // 2. Download and stage features.
+    let mut features = features;
+    download_features(&mut features, devcontainer_dir.as_deref())
+        .await
+        .map_err(|e| ContainerError::Start(format!("Failed to download features: {e}")))?;
+
+    let ordered = order_features(&features);
+    let staging_dir = stage_feature_context(&ordered)
+        .map_err(|e| ContainerError::Start(format!("Failed to stage features: {e}")))?;
+
+    // 3. Generate and build the feature layer.
+    let feature_user = runtime::resolve_remote_user(rt, &base_image, config.remote_user.as_deref())
+        .await
+        .ok()
+        .flatten();
+    let dockerfile = generate_feature_dockerfile_with_opts(
+        &base_image,
+        &ordered,
+        feature_user.as_deref(),
+        config,
+    );
+    let final_tag = format!("{folder_image}-features");
+    let result = rt
+        .build_image(
+            &dockerfile,
+            &staging_dir,
+            &final_tag,
+            &HashMap::new(),
+            false,
+            false,
+        )
+        .await;
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    result.map_err(|e| ContainerError::Start(format!("Feature image build failed: {e}")))?;
+
+    Ok(final_tag)
 }
 
 /// Resolve the effective remote user from config or image metadata.
@@ -234,13 +297,6 @@ fn build_env_and_mounts(
         for (k, v) in remote_env {
             env.insert(k.clone(), substitute_variables(v, workspace));
         }
-    }
-
-    // Inject host credentials if available (fallback for configs without base layer).
-    if !env.contains_key("COPILOT_GITHUB_TOKEN")
-        && let Some(token) = resolve_host_github_token()
-    {
-        env.insert("COPILOT_GITHUB_TOKEN".to_string(), token);
     }
 
     // Parse mounts from config with variable substitution.
@@ -284,13 +340,25 @@ fn parse_mount_string(s: &str) -> Option<BindMount> {
     })
 }
 
-/// Resolve a GitHub auth token from the host using a fallback chain:
-/// 1. `gh auth token` — cleanest, uses the `gh` CLI credential store
-/// 2. `~/.copilot/config.json` — reads the Copilot CLI's stored OAuth token
+/// Resolve a GitHub auth token from the host environment.
 ///
-/// Returns `None` if neither source has a token.
-fn resolve_host_github_token() -> Option<String> {
-    // Try `gh auth token` first — clean subprocess, no file parsing.
+/// Used to inject `COPILOT_GITHUB_TOKEN` into the agent process so the
+/// copilot CLI can authenticate in headless / keychain-less environments.
+///
+/// Checks, in order:
+/// 1. `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN` env vars
+/// 2. `gh auth token` — uses the GitHub CLI credential store
+pub fn resolve_host_github_token() -> Option<String> {
+    // Check environment variables first (same precedence as copilot CLI).
+    for var in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Ok(val) = std::env::var(var)
+            && !val.is_empty()
+        {
+            return Some(val);
+        }
+    }
+
+    // Try `gh auth token`.
     if let Some(output) = std::process::Command::new("gh")
         .args(["auth", "token"])
         .stdout(Stdio::piped())
@@ -305,18 +373,7 @@ fn resolve_host_github_token() -> Option<String> {
         }
     }
 
-    // Fall back to reading ~/.copilot/config.json.
-    let config_path = dirs::home_dir()?.join(".copilot").join("config.json");
-    let contents = std::fs::read_to_string(config_path).ok()?;
-    // Strip JS-style line comments that copilot puts in the file.
-    let cleaned: String = contents
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let parsed: serde_json::Value = serde_json::from_str(&cleaned).ok()?;
-    let tokens = parsed.get("copilotTokens")?.as_object()?;
-    tokens.values().next()?.as_str().map(String::from)
+    None
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -348,10 +405,5 @@ mod tests {
     #[test]
     fn parse_mount_string_missing_source() {
         assert!(parse_mount_string("target=/b,type=bind").is_none());
-    }
-
-    #[test]
-    fn resolve_token_returns_none_without_sources() {
-        let _ = resolve_host_github_token();
     }
 }

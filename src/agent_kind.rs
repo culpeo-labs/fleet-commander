@@ -1,8 +1,8 @@
 //! Agent kind registry.
 //!
 //! Defines the supported ACP agent types. Each kind knows its command,
-//! display name, and what credential environment variables it needs
-//! injected into containers.
+//! display name, and what container environment it needs for in-container
+//! authentication (device-flow login with plaintext token storage).
 
 use std::collections::HashMap;
 
@@ -33,29 +33,13 @@ impl AgentKind {
         }
     }
 
-    /// Environment variables to inject into containers for authentication.
-    /// Keys are env var names, values are devcontainer variable expressions
-    /// (e.g. `${localEnv:VAR}`) that get expanded at container start.
-    pub fn credential_env(self) -> HashMap<String, String> {
-        let mut env = HashMap::new();
+    /// Environment variables to inject into containers.
+    ///
+    /// These are written into the base devcontainer layer's `containerEnv`
+    /// so they are available for the in-container auth flow.
+    pub fn container_env(self) -> HashMap<String, String> {
         match self {
-            AgentKind::Copilot => {
-                env.insert(
-                    "COPILOT_GITHUB_TOKEN".to_string(),
-                    "${localEnv:COPILOT_GITHUB_TOKEN}".to_string(),
-                );
-            }
-        }
-        env
-    }
-
-    /// Bind mounts to inject into containers for credential sharing.
-    /// Each entry is a devcontainer mount string with variable expressions.
-    pub fn credential_mounts(self) -> Vec<String> {
-        match self {
-            AgentKind::Copilot => vec![
-                "source=${localEnv:HOME}/.copilot,target=/home/vscode/.copilot,type=bind,readonly".to_string(),
-            ],
+            AgentKind::Copilot => HashMap::new(),
         }
     }
 }
@@ -76,16 +60,9 @@ mod tests {
     }
 
     #[test]
-    fn copilot_credential_env() {
-        let env = AgentKind::Copilot.credential_env();
-        assert!(env.contains_key("COPILOT_GITHUB_TOKEN"));
-    }
-
-    #[test]
-    fn copilot_credential_mounts() {
-        let mounts = AgentKind::Copilot.credential_mounts();
-        assert_eq!(mounts.len(), 1);
-        assert!(mounts[0].contains(".copilot"));
+    fn copilot_container_env() {
+        // Should not panic; may be empty if no extra env is needed.
+        let _env = AgentKind::Copilot.container_env();
     }
 
     #[test]

@@ -236,40 +236,24 @@ fn render_conversation(
                     Style::default().fg(Color::DarkGray),
                 )));
             } else {
-                for line in &a.history {
-                    if line.starts_with("> ") {
-                        // User message — highlight.
+                for entry in &a.history {
+                    let entry_style = classify_entry_style(entry);
+                    for line in entry.lines() {
                         result.push(Line::from(Span::styled(
-                            line.as_str(),
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
+                            line.to_string(),
+                            entry_style,
                         )));
-                    } else if line.starts_with("[error]") {
-                        result.push(Line::from(Span::styled(
-                            line.as_str(),
-                            Style::default().fg(Color::Red),
-                        )));
-                    } else if line.starts_with("[tool") {
-                        result.push(Line::from(Span::styled(
-                            line.as_str(),
-                            Style::default().fg(Color::Yellow),
-                        )));
-                    } else if line.starts_with("[thought]") || line.starts_with("[permission]") {
-                        result.push(Line::from(Span::styled(
-                            line.as_str(),
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    } else {
-                        result.push(Line::from(line.as_str()));
                     }
                 }
-                // Show streaming response in progress.
+                // Show streaming response in progress — split by lines.
                 if !a.pending_response.is_empty() {
-                    result.push(Line::from(Span::styled(
-                        a.pending_response.as_str(),
-                        Style::default().fg(Color::Green),
-                    )));
+                    for line in a.pending_response.lines() {
+                        result.push(Line::from(Span::styled(
+                            line.to_string(),
+                            Style::default().fg(Color::Green),
+                        )));
+                    }
+                    // Cursor indicator on a new line.
                     result.push(Line::from(Span::styled(
                         "▊",
                         Style::default().fg(Color::Green),
@@ -280,8 +264,17 @@ fn render_conversation(
         })
         .unwrap_or_default();
 
+    // Compute effective scroll: usize::MAX means "follow bottom".
+    let viewport_height = area.height.saturating_sub(2) as usize; // minus borders
+    let total_lines = lines.len();
+    let effective_scroll = if scroll == usize::MAX {
+        total_lines.saturating_sub(viewport_height)
+    } else {
+        scroll.min(total_lines.saturating_sub(viewport_height))
+    };
+
     let paragraph = Paragraph::new(lines)
-        .scroll((scroll as u16, 0))
+        .scroll((effective_scroll as u16, 0))
         .wrap(Wrap { trim: false })
         .block(
             Block::default()
@@ -290,6 +283,23 @@ fn render_conversation(
                 .border_style(style),
         );
     frame.render_widget(paragraph, area);
+}
+
+/// Determine the style for a history entry based on its prefix.
+fn classify_entry_style(entry: &str) -> Style {
+    if entry.starts_with("> ") {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if entry.starts_with("[error]") {
+        Style::default().fg(Color::Red)
+    } else if entry.starts_with("[tool") {
+        Style::default().fg(Color::Yellow)
+    } else if entry.starts_with("[thought]") || entry.starts_with("[permission]") {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    }
 }
 
 fn render_side_pane(frame: &mut Frame<'_>, area: Rect, pane: &SidePane, focused: bool) {

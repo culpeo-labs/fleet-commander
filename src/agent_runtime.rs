@@ -12,179 +12,17 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use agent_client_protocol::schema::{
-    ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, ProtocolVersion,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, TextContent,
+    AuthenticateRequest, ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest,
+    ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
+    TextContent,
 };
-use agent_client_protocol::{AcpAgent, Agent as AcpAgentRole, ConnectionTo};
+use agent_client_protocol::{AcpAgent, Agent as AcpAgentRole, ConnectionTo, LineDirection};
 use tokio::sync::mpsc;
 
 use crate::agent::AgentId;
 use crate::container::{self, ContainerConfig};
 use crate::event::AppEvent;
-
-/// Check if the agent requires authentication and attempt to run the
-/// login flow automatically.  Returns `true` if auth was performed and
-/// the caller should reconnect.
-async fn handle_auth_if_needed(
-    init_resp: &agent_client_protocol::schema::InitializeResponse,
-    agent_id: &str,
-    event_tx: &mpsc::UnboundedSender<AppEvent>,
-) -> bool {
-    if init_resp.auth_methods.is_empty() {
-        return false;
-    }
-
-    // Try to extract the terminal-auth command from _meta.
-    for method in &init_resp.auth_methods {
-        if let Some(terminal_auth) = method.meta().and_then(|m| m.get("terminal-auth")) {
-            let raw_command = terminal_auth
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            // Use just the binary name so it resolves via PATH,
-            // regardless of the absolute path the agent reports.
-            let command = std::path::Path::new(raw_command)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(raw_command);
-            let args: Vec<&str> = terminal_auth
-                .get("args")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
-            let label = terminal_auth
-                .get("label")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Login");
-
-            if command.is_empty() {
-                continue;
-            }
-
-            let _ = event_tx.send(AppEvent::AgentOutput {
-                agent_id: agent_id.to_string(),
-                line: format!("🔑 Authentication required — running {label}..."),
-            });
-            let _ = event_tx.send(AppEvent::AgentOutput {
-                agent_id: agent_id.to_string(),
-                line: format!("   {command} {}", args.join(" ")),
-            });
-
-            // Run the auth command and stream output.
-            match run_auth_command(command, &args, agent_id, event_tx).await {
-                Ok(true) => {
-                    let _ = event_tx.send(AppEvent::AgentOutput {
-                        agent_id: agent_id.to_string(),
-                        line: "✓ Authentication successful — reconnecting...".into(),
-                    });
-                    return true;
-                }
-                Ok(false) => {
-                    let _ = event_tx.send(AppEvent::SessionError {
-                        agent_id: agent_id.to_string(),
-                        message: format!(
-                            "Authentication failed. Run `{command} {}` manually in another terminal.",
-                            args.join(" ")
-                        ),
-                    });
-                }
-                Err(err) => {
-                    let _ = event_tx.send(AppEvent::SessionError {
-                        agent_id: agent_id.to_string(),
-                        message: format!(
-                            "Could not run auth command: {err}. Run `{command} {}` manually in another terminal.",
-                            args.join(" ")
-                        ),
-                    });
-                }
-            }
-            return false;
-        }
-
-        // Fallback: show the description so the user knows what to do.
-        let _ = event_tx.send(AppEvent::AgentOutput {
-            agent_id: agent_id.to_string(),
-            line: format!(
-                "🔑 Authentication required: {} — {}",
-                method.name(),
-                method.description().unwrap_or("see agent docs")
-            ),
-        });
-    }
-
-    false
-}
-
-/// Run an auth command (e.g. `copilot login`), streaming stdout/stderr
-/// to the agent conversation.  Returns `Ok(true)` on success.
-async fn run_auth_command(
-    command: &str,
-    args: &[&str],
-    agent_id: &str,
-    event_tx: &mpsc::UnboundedSender<AppEvent>,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::io::AsyncBufReadExt;
-    use tokio::process::Command;
-
-    let mut child = Command::new(command)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    let aid = agent_id.to_string();
-    let tx = event_tx.clone();
-
-    // Stream stdout.
-    let stdout_handle = if let Some(out) = stdout {
-        let aid = aid.clone();
-        let tx = tx.clone();
-        Some(tokio::spawn(async move {
-            let reader = tokio::io::BufReader::new(out);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = tx.send(AppEvent::AgentOutput {
-                    agent_id: aid.clone(),
-                    line: format!("  {line}"),
-                });
-            }
-        }))
-    } else {
-        None
-    };
-
-    // Stream stderr.
-    let stderr_handle = if let Some(err) = stderr {
-        let aid = aid.clone();
-        let tx = tx.clone();
-        Some(tokio::spawn(async move {
-            let reader = tokio::io::BufReader::new(err);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = tx.send(AppEvent::AgentOutput {
-                    agent_id: aid.clone(),
-                    line: format!("  {line}"),
-                });
-            }
-        }))
-    } else {
-        None
-    };
-
-    if let Some(h) = stdout_handle {
-        let _ = h.await;
-    }
-    if let Some(h) = stderr_handle {
-        let _ = h.await;
-    }
-
-    let status = child.wait().await?;
-    Ok(status.success())
-}
 
 /// Spawn a persistent ACP connection for an agent.
 ///
@@ -200,8 +38,14 @@ pub fn start_agent(
     let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<String>();
 
     tokio::spawn(async move {
+        // Resolve a host GitHub token for headless auth.
+        // The copilot CLI in --acp mode expects to already be authenticated;
+        // passing COPILOT_GITHUB_TOKEN lets it work without a keychain or
+        // interactive login.
+        let host_token = container::resolve_host_github_token();
+
         // If workspace_folder is set, start the dev container first.
-        let (effective_command, session_cwd) = if let Some(ref ws) = workspace_folder {
+        let (effective_command, session_cwd, container_info) = if let Some(ref ws) = workspace_folder {
             let _ = event_tx.send(AppEvent::AgentOutput {
                 agent_id: agent_id.clone(),
                 line: format!("Starting container for {}...", ws.display()),
@@ -221,15 +65,21 @@ pub fn start_agent(
                     });
 
                     // Wrap ACP command with docker exec to run inside the container.
+                    // Pass the host token via -e so the copilot CLI authenticates
+                    // without needing a keychain inside the container.
+                    let token_flag = host_token.as_ref()
+                        .map(|t| format!(" -e COPILOT_GITHUB_TOKEN={t}"))
+                        .unwrap_or_default();
                     let exec_cmd = format!(
-                        "docker exec -i -u {} -w {} {} {}",
+                        "docker exec -i{token_flag} -u {} -w {} {} {}",
                         info.remote_user,
                         info.remote_workspace_folder,
                         info.container_id,
                         acp_command,
                     );
 
-                    (exec_cmd, PathBuf::from(info.remote_workspace_folder))
+                    let cwd = PathBuf::from(&info.remote_workspace_folder);
+                    (exec_cmd, cwd, Some(info))
                 }
                 Err(err) => {
                     let _ = event_tx.send(AppEvent::SessionError {
@@ -244,14 +94,22 @@ pub fn start_agent(
                 }
             }
         } else {
+            // Running on the host — prepend the token as an env var in the
+            // ACP command string (the ACP crate parses NAME=value prefixes).
+            let cmd = if let Some(ref token) = host_token {
+                format!("COPILOT_GITHUB_TOKEN={token} {acp_command}")
+            } else {
+                acp_command
+            };
             let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
-            (acp_command, cwd)
+            (cmd, cwd, None)
         };
 
         if let Err(err) = run_persistent_connection(
             agent_id.clone(),
             &effective_command,
             session_cwd,
+            container_info.as_ref(),
             prompt_rx,
             event_tx.clone(),
         )
@@ -307,56 +165,51 @@ async fn run_persistent_connection(
     agent_id: AgentId,
     acp_command: &str,
     session_cwd: PathBuf,
+    container_info: Option<&container::ContainerInfo>,
     prompt_rx: mpsc::UnboundedReceiver<String>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Wrap prompt_rx in Arc<Mutex> so we can move it across reconnect attempts.
     let prompt_rx = std::sync::Arc::new(tokio::sync::Mutex::new(prompt_rx));
 
-    // First attempt — may trigger auth flow.
-    let auth_needed = connect_and_run(
-        agent_id.clone(),
-        acp_command,
-        session_cwd.clone(),
-        prompt_rx.clone(),
-        event_tx.clone(),
-        true, // check auth
-    )
-    .await?;
-
-    if auth_needed {
-        // Auth was handled — reconnect with fresh ACP process.
-        connect_and_run(
-            agent_id,
-            acp_command,
-            session_cwd,
-            prompt_rx,
-            event_tx,
-            false,
-        )
-        .await?;
-    }
-
-    Ok(())
+    connect_and_run(agent_id, acp_command, session_cwd, container_info, prompt_rx, event_tx).await
 }
 
 /// Connect to an ACP agent and run the prompt loop.
-/// Returns `Ok(true)` if auth is needed (caller should reconnect after auth).
-/// Returns `Ok(false)` when the session ends normally.
+///
+/// If the agent advertises `authMethods`, calls `authenticate` via the
+/// ACP protocol. If session creation fails with "Authentication required",
+/// sends an `AuthRequired` event so the main loop can run an interactive
+/// login flow.
 async fn connect_and_run(
     agent_id: AgentId,
     acp_command: &str,
     session_cwd: PathBuf,
+    container_info: Option<&container::ContainerInfo>,
     prompt_rx: std::sync::Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<String>>>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
-    check_auth: bool,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let agent = AcpAgent::from_str(acp_command)?;
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut agent = AcpAgent::from_str(acp_command)?;
+
+    // Forward agent stderr to the TUI so the user sees device-code URLs,
+    // diagnostic messages, etc.
+    let debug_aid = agent_id.clone();
+    let debug_tx = event_tx.clone();
+    agent = agent.with_debug(move |line, direction| {
+        if direction == LineDirection::Stderr {
+            let _ = debug_tx.send(AppEvent::AgentOutput {
+                agent_id: debug_aid.clone(),
+                line: format!("  {line}"),
+            });
+        }
+    });
+
+    // Clone container_info fields we need into the closure (can't move a reference).
+    let ci_for_auth: Option<(String, String, String)> = container_info.map(|ci| {
+        (ci.container_id.clone(), ci.remote_user.clone(), ci.remote_workspace_folder.clone())
+    });
+
     let aid = agent_id.clone();
     let tx = event_tx.clone();
-
-    let auth_needed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let auth_flag = auth_needed.clone();
 
     agent_client_protocol::Client
         .builder()
@@ -412,25 +265,65 @@ async fn connect_and_run(
                     .block_task()
                     .await?;
 
-                // Check for auth requirements.
-                if check_auth && !init_resp.auth_methods.is_empty() {
-                    let did_auth = handle_auth_if_needed(&init_resp, &aid, &tx).await;
-                    if did_auth {
-                        auth_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                        // Drop the connection — caller will reconnect.
-                        return Ok(());
+                // Authenticate if the agent requires it.
+                if !init_resp.auth_methods.is_empty() {
+                    let method = &init_resp.auth_methods[0];
+                    let _ = tx.send(AppEvent::AgentOutput {
+                        agent_id: aid.clone(),
+                        line: format!(
+                            "🔑 Authentication required: {} — {}",
+                            method.name(),
+                            method.description().unwrap_or("authenticating…"),
+                        ),
+                    });
+
+                    match connection
+                        .send_request(AuthenticateRequest::new(method.id().clone()))
+                        .block_task()
+                        .await
+                    {
+                        Ok(_) => {
+                            let _ = tx.send(AppEvent::AgentOutput {
+                                agent_id: aid.clone(),
+                                line: "✓ Authentication successful.".into(),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = tx.send(AppEvent::SessionError {
+                                agent_id: aid.clone(),
+                                message: format!("Authentication failed: {err}"),
+                            });
+                            return Ok(());
+                        }
                     }
-                    // Auth method present but login failed — continue anyway,
-                    // the session/new will likely fail with a clear error.
                 }
 
                 // Create a session with the appropriate working directory.
-                let session_resp = connection
+                let session_result = connection
                     .send_request(NewSessionRequest::new(session_cwd))
                     .block_task()
-                    .await?;
+                    .await;
 
-                let session_id = session_resp.session_id;
+                let session_id = match session_result {
+                    Ok(resp) => resp.session_id,
+                    Err(err) => {
+                        let msg = format!("{err}");
+                        if msg.contains("Authentication required") || msg.contains("auth") {
+                            // Build the interactive auth command.
+                            let auth_cmd = build_auth_command(ci_for_auth.as_ref());
+                            let _ = tx.send(AppEvent::AuthRequired {
+                                agent_id: aid.clone(),
+                                command: auth_cmd,
+                            });
+                        } else {
+                            let _ = tx.send(AppEvent::SessionError {
+                                agent_id: aid.clone(),
+                                message: format!("Session creation failed: {err}"),
+                            });
+                        }
+                        return Ok(());
+                    }
+                };
 
                 let _ = tx.send(AppEvent::AgentConnected {
                     agent_id: aid.clone(),
@@ -472,7 +365,7 @@ async fn connect_and_run(
         })
         .await?;
 
-    Ok(auth_needed.load(std::sync::atomic::Ordering::SeqCst))
+    Ok(())
 }
 
 /// Map an ACP `SessionUpdate` to `AppEvent`s and send them.
@@ -514,5 +407,31 @@ fn forward_session_update(
             });
         }
         _ => {}
+    }
+}
+
+/// Construct the interactive auth command for `copilot login`.
+///
+/// For container agents, wraps with `docker exec -it` so login runs inside
+/// the container where copilot stores its credentials. For host agents,
+/// runs `copilot login` directly.
+fn build_auth_command(
+    container_info: Option<&(String, String, String)>,
+) -> Vec<String> {
+    if let Some((container_id, remote_user, remote_workdir)) = container_info {
+        vec![
+            "docker".into(),
+            "exec".into(),
+            "-it".into(),
+            "-u".into(),
+            remote_user.clone(),
+            "-w".into(),
+            remote_workdir.clone(),
+            container_id.clone(),
+            "copilot".into(),
+            "login".into(),
+        ]
+    } else {
+        vec!["copilot".into(), "login".into()]
     }
 }

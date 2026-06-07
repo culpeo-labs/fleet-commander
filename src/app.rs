@@ -83,6 +83,9 @@ pub struct App {
     pub completer: PathCompleter,
     /// Channel for sending events (used to dispatch messages to agents).
     pub tx: mpsc::UnboundedSender<AppEvent>,
+    /// Set when an agent needs interactive auth — the main loop suspends the
+    /// TUI and runs this command with inherited stdio.
+    pub auth_pending: Option<(AgentId, Vec<String>)>,
 }
 
 impl App {
@@ -98,6 +101,7 @@ impl App {
             status_message: None,
             completer: PathCompleter::default(),
             tx,
+            auth_pending: None,
         }
     }
 
@@ -174,6 +178,14 @@ impl App {
                     agent.status = AgentStatus::Idle;
                     agent.history.push("ACP session connected.".into());
                 }
+            }
+            AppEvent::AuthRequired { agent_id, command } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    agent.history.push("🔑 Authentication required — launching login flow...".into());
+                    agent.status = AgentStatus::Stopped;
+                    agent.prompt_tx = None;
+                }
+                self.auth_pending = Some((agent_id, command));
             }
         }
     }
@@ -302,7 +314,7 @@ impl App {
     }
 
     /// Start the ACP connection for an agent if not already connected.
-    fn ensure_agent_connected(&mut self, agent_id: AgentId) {
+    pub fn ensure_agent_connected(&mut self, agent_id: AgentId) {
         let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) else {
             return;
         };
@@ -338,10 +350,9 @@ impl App {
             if current != agent_id {
                 return;
             }
-            if let Some(agent) = self.agents.iter().find(|a| a.id == agent_id) {
-                let line_count = agent.history.len() + agent.pending_response.lines().count();
-                *scroll = line_count.saturating_sub(1);
-            }
+            // Sentinel: usize::MAX means "follow bottom". The render function
+            // computes the actual offset based on viewport height.
+            *scroll = usize::MAX;
         }
     }
 
