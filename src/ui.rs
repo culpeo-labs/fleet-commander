@@ -13,6 +13,7 @@ use syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet};
 
 use crate::agent::Agent;
 use crate::app::{App, Screen, SessionFocus, SidePane};
+use crate::markdown;
 
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
@@ -238,11 +239,26 @@ fn render_conversation(
             } else {
                 for entry in &a.history {
                     let entry_style = classify_entry_style(entry);
-                    for line in entry.lines() {
-                        result.push(Line::from(Span::styled(
-                            line.to_string(),
-                            entry_style,
-                        )));
+                    if entry_style == Style::default()
+                        && (markdown::looks_like_markdown(entry)
+                            || markdown::looks_like_json(entry))
+                    {
+                        // Render as markdown (handles code blocks, JSON, etc.)
+                        let md_lines = if markdown::looks_like_json(entry) {
+                            // Wrap JSON in a code block for highlighting.
+                            let wrapped = format!("```json\n{entry}\n```");
+                            markdown::render_markdown(&wrapped)
+                        } else {
+                            markdown::render_markdown(entry)
+                        };
+                        result.extend(md_lines);
+                    } else {
+                        for line in entry.lines() {
+                            result.push(Line::from(Span::styled(
+                                line.to_string(),
+                                entry_style,
+                            )));
+                        }
                     }
                 }
                 // Show streaming response in progress — split by lines.

@@ -23,6 +23,7 @@ mod container;
 mod event;
 mod init;
 mod keybind;
+mod markdown;
 mod mcp_server;
 mod terminal;
 mod ui;
