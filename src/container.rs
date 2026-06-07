@@ -14,11 +14,15 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use devcontainer_lib::devcontainer::config::DevcontainerConfig;
+use devcontainer_lib::devcontainer::merge::merge_layer;
 use devcontainer_lib::devcontainer::variables::{substitute_variables, substitute_variables_with_user};
+use devcontainer_lib::parse_jsonc;
 use devcontainer_lib::runtime::{
     self, BindMount, ContainerRuntime, ContainerState, PortMapping, WorkspaceMount,
 };
 use devcontainer_lib::util::{container_name, workspace_labels, workspace_folder_name};
+
+use crate::init;
 
 /// Configuration for running an agent inside a dev container.
 #[derive(Debug, Clone)]
@@ -37,6 +41,23 @@ pub struct ContainerInfo {
     pub remote_user: String,
 }
 
+/// Load a devcontainer.json file, merging the fleet-commander base layer if present.
+fn load_merged_config(config_path: &Path) -> Result<DevcontainerConfig, ContainerError> {
+    let raw = std::fs::read_to_string(config_path)
+        .map_err(|e| ContainerError::Parse(format!("Failed to read {}: {e}", config_path.display())))?;
+    let mut project_json: serde_json::Value =
+        parse_jsonc(&raw).map_err(|e| ContainerError::Parse(e.to_string()))?;
+
+    if let Some(base_path) = init::base_layer_path()
+        && let Ok(base_raw) = std::fs::read_to_string(&base_path)
+        && let Ok(base_json) = parse_jsonc::<serde_json::Value>(&base_raw)
+    {
+        merge_layer(&mut project_json, &base_json);
+    }
+
+    serde_json::from_value(project_json).map_err(|e| ContainerError::Parse(e.to_string()))
+}
+
 /// Start a dev container for the given workspace.
 ///
 /// Loads the project's devcontainer.json, merges the base credential layer,
@@ -47,7 +68,7 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
         .await
         .map_err(|e| ContainerError::Start(e.to_string()))?;
 
-    // Load devcontainer config.
+    // Load devcontainer config, merging base layer if present.
     let config_path = workspace.join(".devcontainer/devcontainer.json");
     if !config_path.is_file() {
         return Err(ContainerError::Parse(format!(
@@ -55,8 +76,7 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
             workspace.display()
         )));
     }
-    let dc_config = DevcontainerConfig::from_path(&config_path)
-        .map_err(|e| ContainerError::Parse(e.to_string()))?;
+    let dc_config = load_merged_config(&config_path)?;
 
     // Check if a container already exists for this workspace.
     let labels_list = workspace_labels(workspace, Some(&config_path));

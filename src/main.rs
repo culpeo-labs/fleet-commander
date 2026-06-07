@@ -1,4 +1,5 @@
 use anyhow::Result;
+use clap::Parser;
 use crossterm::{
     event::{Event, EventStream, KeyEventKind},
     execute,
@@ -10,13 +11,16 @@ use std::{io, path::PathBuf};
 use tokio::sync::mpsc;
 
 mod agent;
+mod agent_kind;
 mod agent_runtime;
 mod app;
 mod change_source;
+mod cli;
 mod completion;
 mod config;
 mod container;
 mod event;
+mod init;
 mod keybind;
 mod mcp_server;
 mod ui;
@@ -29,6 +33,21 @@ use crate::event::AppEvent;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = cli::Cli::parse();
+
+    match cli.command {
+        Some(cli::Command::Init { path }) => {
+            init::run(&path)?;
+            return Ok(());
+        }
+        None => {}
+    }
+
+    // Default: launch TUI.
+    run_tui().await
+}
+
+async fn run_tui() -> Result<()> {
     let config = load_config_or_default();
     install_panic_hook();
     let mut terminal = setup_terminal()?;
