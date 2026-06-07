@@ -41,6 +41,8 @@ pub struct Agent {
     pub workspace_folder: Option<PathBuf>,
     /// Accumulates streaming deltas for the current assistant turn.
     pub pending_response: String,
+    /// Accumulates thought chunks until the thought stream ends.
+    pub pending_thought: String,
     /// Channel for sending prompts to the persistent ACP connection.
     /// `None` until the connection is established.
     pub prompt_tx: Option<mpsc::UnboundedSender<String>>,
@@ -56,6 +58,7 @@ impl Agent {
             acp_command: String::new(),
             workspace_folder: None,
             pending_response: String::new(),
+            pending_thought: String::new(),
             prompt_tx: None,
         }
     }

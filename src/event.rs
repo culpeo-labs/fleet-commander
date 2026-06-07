@@ -42,6 +42,11 @@ pub enum AppEvent {
         agent_id: AgentId,
         text: String,
     },
+    /// Streaming thought chunk from the ACP agent.
+    ThoughtDelta {
+        agent_id: AgentId,
+        text: String,
+    },
     /// The ACP agent finished its response (prompt completed).
     AssistantDone {
         agent_id: AgentId,

@@ -138,13 +138,22 @@ impl App {
             }
             AppEvent::AssistantDelta { agent_id, text } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    // Flush any pending thought before assistant text starts.
+                    flush_pending_thought(agent);
                     agent.status = AgentStatus::Running;
                     agent.pending_response.push_str(&text);
                 }
                 self.auto_scroll_for(&agent_id);
             }
+            AppEvent::ThoughtDelta { agent_id, text } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    agent.pending_thought.push_str(&text);
+                }
+                self.auto_scroll_for(&agent_id);
+            }
             AppEvent::AssistantDone { agent_id } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    flush_pending_thought(agent);
                     if !agent.pending_response.is_empty() {
                         let response = std::mem::take(&mut agent.pending_response);
                         agent.history.push(response);
@@ -478,6 +487,14 @@ impl App {
         }
 
         self.screen = Screen::AgentList { selected: 0 };
+    }
+}
+
+/// Flush accumulated thought text into history as a single collapsed entry.
+fn flush_pending_thought(agent: &mut Agent) {
+    if !agent.pending_thought.is_empty() {
+        let thought = std::mem::take(&mut agent.pending_thought);
+        agent.history.push(format!("[thought] {}", thought.trim()));
     }
 }
 

@@ -261,6 +261,14 @@ fn render_conversation(
                         }
                     }
                 }
+                // Show streaming thought in progress (collapsed single line).
+                if !a.pending_thought.is_empty() {
+                    let preview: String = a.pending_thought.chars().take(80).collect();
+                    result.push(Line::from(Span::styled(
+                        format!("💭 {preview}…"),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
                 // Show streaming response in progress — split by lines.
                 if !a.pending_response.is_empty() {
                     for line in a.pending_response.lines() {

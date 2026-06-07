@@ -385,9 +385,9 @@ fn forward_session_update(
         }
         SessionUpdate::AgentThoughtChunk(chunk) => {
             if let ContentBlock::Text(text) = &chunk.content {
-                let _ = tx.send(AppEvent::AgentOutput {
+                let _ = tx.send(AppEvent::ThoughtDelta {
                     agent_id: agent_id.to_string(),
-                    line: format!("[thought] {}", text.text),
+                    text: text.text.clone(),
                 });
             }
         }

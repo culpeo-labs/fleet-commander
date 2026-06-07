@@ -28,7 +28,6 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
     let mut code_block_buf = String::new();
     let mut list_depth: usize = 0;
     let mut list_item_started = false;
-    let mut in_heading = false;
     let mut blockquote_depth: usize = 0;
 
     for event in parser {
@@ -48,7 +47,6 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
                             .fg(Color::Magenta)
                             .add_modifier(Modifier::BOLD),
                     );
-                    in_heading = true;
                 }
                 Tag::Emphasis => {
                     style_stack.push(current_style(&style_stack).add_modifier(Modifier::ITALIC));
@@ -105,7 +103,6 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
             Event::End(tag_end) => match tag_end {
                 TagEnd::Heading(_) => {
                     style_stack.pop();
-                    in_heading = false;
                     flush_line(&mut current_spans, &mut lines);
                 }
                 TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
