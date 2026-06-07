@@ -188,11 +188,12 @@ async fn run_auth_command(
 
 /// Spawn a persistent ACP connection for an agent.
 ///
-/// If the agent has a workspace folder, starts the dev container first.
+/// If the agent has a workspace folder, starts the dev container first,
+/// then wraps the ACP command with `docker exec` to run inside it.
 /// Returns an `mpsc::UnboundedSender<String>` for sending prompts.
 pub fn start_agent(
     agent_id: AgentId,
-    effective_command: String,
+    acp_command: String,
     workspace_folder: Option<PathBuf>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> mpsc::UnboundedSender<String> {
@@ -200,7 +201,7 @@ pub fn start_agent(
 
     tokio::spawn(async move {
         // If workspace_folder is set, start the dev container first.
-        let session_cwd = if let Some(ref ws) = workspace_folder {
+        let (effective_command, session_cwd) = if let Some(ref ws) = workspace_folder {
             let _ = event_tx.send(AppEvent::AgentOutput {
                 agent_id: agent_id.clone(),
                 line: format!("Starting container for {}...", ws.display()),
@@ -218,7 +219,17 @@ pub fn start_agent(
                             info.remote_user, info.remote_workspace_folder
                         ),
                     });
-                    PathBuf::from(info.remote_workspace_folder)
+
+                    // Wrap ACP command with docker exec to run inside the container.
+                    let exec_cmd = format!(
+                        "docker exec -i -u {} -w {} {} {}",
+                        info.remote_user,
+                        info.remote_workspace_folder,
+                        info.container_id,
+                        acp_command,
+                    );
+
+                    (exec_cmd, PathBuf::from(info.remote_workspace_folder))
                 }
                 Err(err) => {
                     let _ = event_tx.send(AppEvent::SessionError {
@@ -233,7 +244,8 @@ pub fn start_agent(
                 }
             }
         } else {
-            std::env::current_dir().unwrap_or_else(|_| "/".into())
+            let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+            (acp_command, cwd)
         };
 
         if let Err(err) = run_persistent_connection(

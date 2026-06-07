@@ -71,13 +71,14 @@ impl Agent {
         self
     }
 
-    /// The effective command to run — wraps with `devcontainer exec` if
-    /// a workspace folder is configured.
+    /// The effective command to run.
+    ///
+    /// When no workspace is set, returns the raw ACP command.
+    /// When a workspace is set, the container is started separately by
+    /// `agent_runtime` and this just returns the raw ACP command — the
+    /// runtime handles exec via the container ID.
     pub fn effective_acp_command(&self) -> String {
-        match &self.workspace_folder {
-            Some(ws) => crate::container::build_exec_command(ws, &self.acp_command),
-            None => self.acp_command.clone(),
-        }
+        self.acp_command.clone()
     }
 }
 
@@ -93,15 +94,9 @@ mod tests {
 
     #[test]
     fn effective_command_with_workspace() {
-        unsafe {
-            std::env::remove_var("GITHUB_TOKEN");
-            std::env::remove_var("GH_TOKEN");
-        }
         let agent = Agent::new("test", "Test")
             .with_acp_command("copilot --acp --stdio")
             .with_workspace("/home/user/my-repo");
-        let cmd = agent.effective_acp_command();
-        assert!(cmd.starts_with("devcontainer exec --workspace-folder /home/user/my-repo"));
-        assert!(cmd.ends_with("copilot --acp --stdio"));
+        assert_eq!(agent.effective_acp_command(), "copilot --acp --stdio");
     }
 }
