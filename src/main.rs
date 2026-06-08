@@ -105,10 +105,12 @@ async fn run_tui() -> Result<()> {
 
     let result = run(&mut terminal, &mut app, &mut rx).await;
 
-    // Gracefully stop agent tasks and their containers before exiting.
+    // Teardown TUI first so shutdown messages go to the normal terminal.
+    teardown_terminal(&mut terminal)?;
+
+    // Gracefully stop agent tasks and their containers.
     shutdown_agents(&mut app).await;
 
-    teardown_terminal(&mut terminal)?;
     result
 }
 
@@ -135,14 +137,21 @@ async fn shutdown_agents(app: &mut App) {
         return;
     }
 
-    info!(count = workspaces.len(), "Stopping containers");
+    let count = workspaces.len();
+    eprintln!("Stopping {count} container(s)…");
+    info!(count, "Stopping containers");
     let futures: Vec<_> = workspaces
         .into_iter()
         .map(|ws| async move {
+            let name = ws.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
             if let Err(e) = container::stop_workspace_container(&ws).await {
                 warn!(workspace = %ws.display(), error = %e, "Failed to stop container");
+                eprintln!("  ⚠ {name}: failed to stop ({e})");
             } else {
                 info!(workspace = %ws.display(), "Container stopped");
+                eprintln!("  ✓ {name}: stopped");
             }
         })
         .collect();

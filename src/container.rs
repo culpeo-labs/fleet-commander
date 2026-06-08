@@ -342,10 +342,18 @@ async fn resolve_image(
         )
         .await;
     let _ = std::fs::remove_dir_all(&staging_dir);
-    result.map_err(|e| ContainerError::Start(format!("Feature image build failed: {e}")))?;
-    info!(tag = %final_tag, "Feature image ready");
 
-    Ok(final_tag)
+    match result {
+        Ok(()) => {
+            info!(tag = %final_tag, "Feature image ready");
+            Ok(final_tag)
+        }
+        Err(e) => {
+            warn!(error = %e, "Feature layer build failed, falling back to base image");
+            on_progress("⚠ Feature build failed, using base image…");
+            Ok(base_image)
+        }
+    }
 }
 
 /// Resolve the effective remote user from config or image metadata.

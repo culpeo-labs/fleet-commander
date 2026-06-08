@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tracing::{info, debug};
 
 use crate::agent::Agent;
 
@@ -71,13 +72,21 @@ pub fn save(entries: &[WorkspaceEntry]) -> Result<(), String> {
 /// Load runtime state for a workspace from its data directory.
 pub fn load_state(workspace: &std::path::Path) -> WorkspaceState {
     let Some(data_dir) = crate::init::workspace_data_dir(workspace) else {
+        debug!(workspace = %workspace.display(), "No data dir for workspace");
         return WorkspaceState::default();
     };
     let state_path = data_dir.join("state.yaml");
     let Ok(contents) = std::fs::read_to_string(&state_path) else {
+        debug!(path = %state_path.display(), "No state file found");
         return WorkspaceState::default();
     };
-    serde_yaml::from_str(&contents).unwrap_or_default()
+    let state: WorkspaceState = serde_yaml::from_str(&contents).unwrap_or_default();
+    info!(
+        workspace = %workspace.display(),
+        session_id = ?state.session_id,
+        "Loaded workspace state"
+    );
+    state
 }
 
 /// Save runtime state for a workspace to its data directory.
@@ -87,6 +96,11 @@ pub fn save_state(workspace: &std::path::Path, state: &WorkspaceState) -> Result
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("Failed to create data dir: {e}"))?;
     let state_path = data_dir.join("state.yaml");
+    info!(
+        path = %state_path.display(),
+        session_id = ?state.session_id,
+        "Saving workspace state"
+    );
     let yaml = serde_yaml::to_string(state).map_err(|e| format!("Failed to serialize: {e}"))?;
     std::fs::write(&state_path, yaml)
         .map_err(|e| format!("Failed to write {}: {e}", state_path.display()))?;

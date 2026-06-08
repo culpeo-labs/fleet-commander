@@ -361,6 +361,13 @@ async fn connect_and_run(
                 let caps = &init_resp.agent_capabilities.session_capabilities;
                 let can_resume = caps.resume.is_some();
                 let can_list = caps.list.is_some();
+                info!(
+                    agent_id = %aid,
+                    can_resume,
+                    can_list,
+                    previous_session_id = ?previous_session_id,
+                    "Session capabilities"
+                );
 
                 // Try to resume an existing session.
                 let session_id = if let Some(ref prev_id) = previous_session_id {
