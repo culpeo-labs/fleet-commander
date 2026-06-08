@@ -424,6 +424,31 @@ fn parse_mount_string(s: &str) -> Option<BindMount> {
     })
 }
 
+/// Stop (but don't remove) any running container for the given workspace.
+///
+/// Used during graceful shutdown so containers don't keep running after
+/// Fleet Commander exits.
+pub async fn stop_workspace_container(workspace: &Path) -> Result<(), ContainerError> {
+    let rt = runtime::detect_runtime(None)
+        .await
+        .map_err(|e| ContainerError::Start(e.to_string()))?;
+
+    let config_path = workspace.join(".devcontainer/devcontainer.json");
+    let labels_list = workspace_labels(workspace, Some(&config_path));
+    let filters: Vec<String> = labels_list.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let existing = rt.list_containers(&filters).await
+        .map_err(|e| ContainerError::Start(e.to_string()))?;
+
+    for container in &existing {
+        if container.state == ContainerState::Running {
+            info!(id = %container.id, "Stopping container");
+            let _ = rt.stop_container(&container.id).await;
+        }
+    }
+
+    Ok(())
+}
+
 /// Stop and remove any existing container for the given workspace.
 ///
 /// Used by the `:rebuild` command to force a fresh container start.

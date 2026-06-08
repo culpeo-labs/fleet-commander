@@ -13,9 +13,9 @@ use std::str::FromStr;
 
 use agent_client_protocol::schema::{
     AuthenticateRequest, ContentBlock, InitializeRequest, ListSessionsRequest, NewSessionRequest,
-    PromptRequest, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome,
-    SessionNotification, SessionUpdate, TextContent,
+    PermissionOptionKind, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, TextContent,
 };
 use agent_client_protocol::{AcpAgent, Agent as AcpAgentRole, ConnectionTo, LineDirection};
 use tokio::sync::mpsc;
@@ -252,27 +252,63 @@ async fn connect_and_run(
                 let aid = aid.clone();
                 let tx = tx.clone();
                 async move |request: RequestPermissionRequest, responder, _connection| {
-                    let _ = tx.send(AppEvent::AgentOutput {
+                    let tool_title = request
+                        .tool_call
+                        .fields
+                        .title
+                        .as_deref()
+                        .unwrap_or("unknown")
+                        .to_string();
+
+                    // Build option list for the UI.
+                    let options: Vec<(String, String, String)> = request
+                        .options
+                        .iter()
+                        .map(|opt| {
+                            let kind_label = match opt.kind {
+                                PermissionOptionKind::AllowOnce => "allow once",
+                                PermissionOptionKind::AllowAlways => "allow always",
+                                PermissionOptionKind::RejectOnce => "reject once",
+                                PermissionOptionKind::RejectAlways => "reject always",
+                                _ => "unknown",
+                            };
+                            (opt.option_id.0.to_string(), opt.name.clone(), kind_label.to_string())
+                        })
+                        .collect();
+
+                    // Create a oneshot channel for the user's response.
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    let reply = std::sync::Arc::new(std::sync::Mutex::new(Some(reply_tx)));
+
+                    let _ = tx.send(AppEvent::PermissionRequest {
                         agent_id: aid.clone(),
-                        line: format!(
-                            "[permission] auto-approved: {}",
-                            request
-                                .tool_call
-                                .fields
-                                .title
-                                .as_deref()
-                                .unwrap_or("unknown")
-                        ),
+                        tool_name: tool_title.clone(),
+                        options,
+                        reply,
                     });
-                    let option_id = request.options.first().map(|opt| opt.option_id.clone());
-                    if let Some(id) = option_id {
-                        responder.respond(RequestPermissionResponse::new(
-                            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)),
-                        ))
-                    } else {
-                        responder.respond(RequestPermissionResponse::new(
-                            RequestPermissionOutcome::Cancelled,
-                        ))
+
+                    // Wait for the user to respond.
+                    match reply_rx.await {
+                        Ok(Some(option_id)) => {
+                            let _ = tx.send(AppEvent::AgentOutput {
+                                agent_id: aid.clone(),
+                                line: format!("[permission] approved: {tool_title}"),
+                            });
+                            responder.respond(RequestPermissionResponse::new(
+                                RequestPermissionOutcome::Selected(
+                                    SelectedPermissionOutcome::new(option_id),
+                                ),
+                            ))
+                        }
+                        _ => {
+                            let _ = tx.send(AppEvent::AgentOutput {
+                                agent_id: aid.clone(),
+                                line: format!("[permission] denied: {tool_title}"),
+                            });
+                            responder.respond(RequestPermissionResponse::new(
+                                RequestPermissionOutcome::Cancelled,
+                            ))
+                        }
                     }
                 }
             },

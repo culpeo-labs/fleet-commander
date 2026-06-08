@@ -2,10 +2,16 @@
 //! to nudge the UI (input, agent output, file changes) flows through this
 //! enum into the main `select!` loop.
 
+use std::sync::{Arc, Mutex};
+
 use crossterm::event::KeyEvent;
 
 use crate::agent::AgentId;
 use crate::change_source::ChangeEvent;
+
+/// A oneshot reply channel for permission responses, wrapped so AppEvent
+/// can derive Clone (the sender is taken once when the user responds).
+pub type PermissionReply = Arc<Mutex<Option<tokio::sync::oneshot::Sender<Option<String>>>>>;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -77,5 +83,14 @@ pub enum AppEvent {
     /// Request to reconnect an agent (e.g. after container rebuild).
     ReconnectAgent {
         agent_id: AgentId,
+    },
+    /// The agent is requesting tool-use permission from the user.
+    /// Send `Some(option_id)` to approve or `None` to cancel via the reply channel.
+    PermissionRequest {
+        agent_id: AgentId,
+        tool_name: String,
+        /// Human-readable option labels: Vec<(option_id, display_name, kind)>.
+        options: Vec<(String, String, String)>,
+        reply: PermissionReply,
     },
 }

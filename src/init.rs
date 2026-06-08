@@ -248,7 +248,7 @@ fn workspace_layer_dir(workspace: &Path) -> Result<PathBuf> {
 }
 
 /// Stable slug for a workspace path (last component, or hash if ambiguous).
-fn workspace_slug(workspace: &Path) -> String {
+pub fn workspace_slug(workspace: &Path) -> String {
     workspace
         .file_name()
         .and_then(|n| n.to_str())
@@ -268,6 +268,15 @@ fn fxhash(path: &Path) -> u64 {
 pub fn base_layer_path_for(workspace: &Path) -> Option<PathBuf> {
     let path = workspace_layer_dir(workspace).ok()?.join("devcontainer.json");
     if path.is_file() { Some(path) } else { None }
+}
+
+/// Per-workspace data directory for persisting runtime state (sessions, tokens).
+///
+/// Located at `~/.local/share/fleet-commander/<slug>/`.
+pub fn workspace_data_dir(workspace: &Path) -> Option<PathBuf> {
+    let slug = workspace_slug(workspace);
+    let dir = dirs::data_dir()?.join("fleet-commander").join(slug);
+    Some(dir)
 }
 
 /// Legacy: global base layer path (kept for backward compat during transition).

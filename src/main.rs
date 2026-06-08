@@ -105,8 +105,48 @@ async fn run_tui() -> Result<()> {
 
     let result = run(&mut terminal, &mut app, &mut rx).await;
 
+    // Gracefully stop agent tasks and their containers before exiting.
+    shutdown_agents(&mut app).await;
+
     teardown_terminal(&mut terminal)?;
     result
+}
+
+/// Gracefully shut down all agents: abort background tasks and stop containers.
+async fn shutdown_agents(app: &mut App) {
+    info!("Shutting down agents");
+
+    // Abort all running agent tasks first.
+    for agent in &mut app.agents {
+        if let Some(handle) = agent.task_handle.take() {
+            handle.abort();
+        }
+        agent.prompt_tx = None;
+    }
+
+    // Stop containers for workspace agents (in parallel).
+    let workspaces: Vec<PathBuf> = app
+        .agents
+        .iter()
+        .filter_map(|a| a.workspace_folder.clone())
+        .collect();
+
+    if workspaces.is_empty() {
+        return;
+    }
+
+    info!(count = workspaces.len(), "Stopping containers");
+    let futures: Vec<_> = workspaces
+        .into_iter()
+        .map(|ws| async move {
+            if let Err(e) = container::stop_workspace_container(&ws).await {
+                warn!(workspace = %ws.display(), error = %e, "Failed to stop container");
+            } else {
+                info!(workspace = %ws.display(), "Container stopped");
+            }
+        })
+        .collect();
+    futures_util::future::join_all(futures).await;
 }
 
 fn load_config_or_default() -> Config {

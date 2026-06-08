@@ -18,6 +18,13 @@ pub struct WorkspaceEntry {
     /// ACP command to launch (default: `copilot --acp --stdio`).
     #[serde(default = "default_acp_command")]
     pub acp_command: String,
+}
+
+/// Per-workspace runtime state, stored in the data directory alongside
+/// the container's persistent data. This file survives container rebuilds
+/// and app restarts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceState {
     /// Last-used ACP session ID — used to resume on reconnect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -61,6 +68,31 @@ pub fn save(entries: &[WorkspaceEntry]) -> Result<(), String> {
     save_to(&path, entries)
 }
 
+/// Load runtime state for a workspace from its data directory.
+pub fn load_state(workspace: &std::path::Path) -> WorkspaceState {
+    let Some(data_dir) = crate::init::workspace_data_dir(workspace) else {
+        return WorkspaceState::default();
+    };
+    let state_path = data_dir.join("state.yaml");
+    let Ok(contents) = std::fs::read_to_string(&state_path) else {
+        return WorkspaceState::default();
+    };
+    serde_yaml::from_str(&contents).unwrap_or_default()
+}
+
+/// Save runtime state for a workspace to its data directory.
+pub fn save_state(workspace: &std::path::Path, state: &WorkspaceState) -> Result<(), String> {
+    let data_dir = crate::init::workspace_data_dir(workspace)
+        .ok_or("Could not determine data directory")?;
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("Failed to create data dir: {e}"))?;
+    let state_path = data_dir.join("state.yaml");
+    let yaml = serde_yaml::to_string(state).map_err(|e| format!("Failed to serialize: {e}"))?;
+    std::fs::write(&state_path, yaml)
+        .map_err(|e| format!("Failed to write {}: {e}", state_path.display()))?;
+    Ok(())
+}
+
 fn save_to(path: &Path, entries: &[WorkspaceEntry]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {e}"))?;
@@ -84,10 +116,12 @@ pub fn to_agents(entries: &[WorkspaceEntry]) -> Vec<Agent> {
                 .and_then(|n| n.to_str())
                 .unwrap_or("workspace");
             let agent_id = format!("copilot-{dir_name}");
+            // Load session_id from per-workspace data dir (not from workspaces.yaml).
+            let state = load_state(&ws.path);
             let mut agent = Agent::new(&agent_id, format!("Copilot ({dir_name})"))
                 .with_acp_command(&ws.acp_command)
                 .with_workspace(&ws.path);
-            agent.session_id = ws.session_id.clone();
+            agent.session_id = state.session_id;
             agent
         })
         .collect()
@@ -101,7 +135,6 @@ pub fn from_agents(agents: &[Agent]) -> Vec<WorkspaceEntry> {
             a.workspace_folder.as_ref().map(|ws| WorkspaceEntry {
                 path: ws.clone(),
                 acp_command: a.acp_command.clone(),
-                session_id: a.session_id.clone(),
             })
         })
         .collect()
@@ -120,12 +153,10 @@ mod tests {
             WorkspaceEntry {
                 path: PathBuf::from("/home/user/repo-a"),
                 acp_command: "copilot --acp --stdio".into(),
-                session_id: None,
             },
             WorkspaceEntry {
                 path: PathBuf::from("/projects/repo-b"),
                 acp_command: "claude-agent-acp".into(),
-                session_id: Some("sess_123".into()),
             },
         ];
 
@@ -141,7 +172,6 @@ mod tests {
         let entries = vec![WorkspaceEntry {
             path: PathBuf::from("/home/user/my-cool-repo"),
             acp_command: "copilot --acp --stdio".into(),
-            session_id: None,
         }];
         let agents = to_agents(&entries);
         assert_eq!(agents.len(), 1);

@@ -90,6 +90,18 @@ pub struct App {
     /// Set when an agent needs interactive auth — the main loop suspends the
     /// TUI and runs this command with inherited stdio.
     pub auth_pending: Option<(AgentId, Vec<String>)>,
+    /// Pending tool permission request awaiting user response.
+    /// Contains (tool_name, options: Vec<(id, label, kind)>, reply_channel).
+    pub permission_pending: Option<PendingPermission>,
+}
+
+/// A tool permission request waiting for the user's y/n decision.
+#[allow(dead_code)]
+pub struct PendingPermission {
+    pub agent_id: AgentId,
+    pub tool_name: String,
+    pub options: Vec<(String, String, String)>,
+    pub reply: crate::event::PermissionReply,
 }
 
 impl App {
@@ -106,6 +118,7 @@ impl App {
             completer: PathCompleter::default(),
             tx,
             auth_pending: None,
+            permission_pending: None,
         }
     }
 
@@ -190,11 +203,16 @@ impl App {
             AppEvent::AgentConnected { agent_id, session_id } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.status = AgentStatus::Idle;
-                    agent.session_id = session_id;
+                    agent.session_id = session_id.clone();
                     agent.history.push("ACP session connected.".into());
+                    // Persist session_id to per-workspace data dir.
+                    if let Some(ws) = &agent.workspace_folder {
+                        let state = workspace::WorkspaceState { session_id };
+                        if let Err(e) = workspace::save_state(ws, &state) {
+                            warn!(error = %e, "Failed to save workspace state");
+                        }
+                    }
                 }
-                // Persist session_id so it survives restarts.
-                let _ = workspace::save(&workspace::from_agents(&self.agents));
             }
             AppEvent::AuthRequired { agent_id, command } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
@@ -208,12 +226,58 @@ impl App {
                 info!(agent_id = %agent_id, "Reconnecting agent after rebuild");
                 self.ensure_agent_connected(agent_id);
             }
+            AppEvent::PermissionRequest {
+                agent_id,
+                tool_name,
+                options,
+                reply,
+            } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    agent.history.push(format!("🔐 Permission requested: {tool_name}"));
+                }
+                self.permission_pending = Some(PendingPermission {
+                    agent_id,
+                    tool_name,
+                    options,
+                    reply,
+                });
+            }
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
         // Clear status message on any keypress.
         self.status_message = None;
+
+        // Permission prompt — intercept y/n/Esc before anything else.
+        if self.permission_pending.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let perm = self.permission_pending.take().unwrap();
+                    // Pick the first "allow" option.
+                    let allow_id = perm
+                        .options
+                        .iter()
+                        .find(|(_, _, kind)| kind.starts_with("allow"))
+                        .map(|(id, _, _)| id.clone());
+                    if let Ok(mut guard) = perm.reply.lock() {
+                        if let Some(tx) = guard.take() {
+                            let _ = tx.send(allow_id);
+                        }
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    let perm = self.permission_pending.take().unwrap();
+                    if let Ok(mut guard) = perm.reply.lock() {
+                        if let Some(tx) = guard.take() {
+                            let _ = tx.send(None);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
 
         // Command mode (`:` prompt) — intercept all keys.
         if self.command_mode {

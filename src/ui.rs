@@ -72,6 +72,23 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         ))
         .style(Style::default().bg(Color::DarkGray));
         frame.render_widget(bar, bar_area);
+    } else if let Some(perm) = &app.permission_pending {
+        let bar_area = Rect {
+            x: area.x,
+            y: area.y + area.height.saturating_sub(1),
+            width: area.width,
+            height: 1,
+        };
+        let text = format!("🔐 Allow {}? (y)es / (n)o", perm.tool_name);
+        let bar = Paragraph::new(Span::styled(
+            text,
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(Color::Magenta));
+        frame.render_widget(bar, bar_area);
     }
 }
 
