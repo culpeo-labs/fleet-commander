@@ -18,6 +18,9 @@ pub struct WorkspaceEntry {
     /// ACP command to launch (default: `copilot --acp --stdio`).
     #[serde(default = "default_acp_command")]
     pub acp_command: String,
+    /// Last-used ACP session ID — used to resume on reconnect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 fn default_acp_command() -> String {
@@ -81,9 +84,11 @@ pub fn to_agents(entries: &[WorkspaceEntry]) -> Vec<Agent> {
                 .and_then(|n| n.to_str())
                 .unwrap_or("workspace");
             let agent_id = format!("copilot-{dir_name}");
-            Agent::new(&agent_id, format!("Copilot ({dir_name})"))
+            let mut agent = Agent::new(&agent_id, format!("Copilot ({dir_name})"))
                 .with_acp_command(&ws.acp_command)
-                .with_workspace(&ws.path)
+                .with_workspace(&ws.path);
+            agent.session_id = ws.session_id.clone();
+            agent
         })
         .collect()
 }
@@ -96,6 +101,7 @@ pub fn from_agents(agents: &[Agent]) -> Vec<WorkspaceEntry> {
             a.workspace_folder.as_ref().map(|ws| WorkspaceEntry {
                 path: ws.clone(),
                 acp_command: a.acp_command.clone(),
+                session_id: a.session_id.clone(),
             })
         })
         .collect()
@@ -114,10 +120,12 @@ mod tests {
             WorkspaceEntry {
                 path: PathBuf::from("/home/user/repo-a"),
                 acp_command: "copilot --acp --stdio".into(),
+                session_id: None,
             },
             WorkspaceEntry {
                 path: PathBuf::from("/projects/repo-b"),
                 acp_command: "claude-agent-acp".into(),
+                session_id: Some("sess_123".into()),
             },
         ];
 
@@ -133,6 +141,7 @@ mod tests {
         let entries = vec![WorkspaceEntry {
             path: PathBuf::from("/home/user/my-cool-repo"),
             acp_command: "copilot --acp --stdio".into(),
+            session_id: None,
         }];
         let agents = to_agents(&entries);
         assert_eq!(agents.len(), 1);

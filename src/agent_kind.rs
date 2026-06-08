@@ -42,6 +42,32 @@ impl AgentKind {
             AgentKind::Copilot => HashMap::new(),
         }
     }
+
+    /// Bind mount strings for the base devcontainer layer.
+    ///
+    /// These use devcontainer variable substitution (`${localEnv:HOME}`,
+    /// `${remoteEnv:HOME}`) so they resolve correctly at build/run time.
+    /// The host-side path uses a fleet-commander data directory to persist
+    /// agent state (sessions, auth tokens) across container rebuilds.
+    pub fn container_mounts(self) -> Vec<String> {
+        match self {
+            AgentKind::Copilot => vec![
+                "source=${localEnv:HOME}/.local/share/fleet-commander/copilot-data,target=${remoteEnv:HOME}/.copilot,type=bind".to_string(),
+            ],
+        }
+    }
+
+    /// Commands to run after the container starts (postStartCommand).
+    ///
+    /// Used to fix ownership of mounted directories that may have been
+    /// created by Docker as root.
+    pub fn post_start_command(self) -> Option<String> {
+        match self {
+            AgentKind::Copilot => Some(
+                "mkdir -p ~/.copilot && test -w ~/.copilot || sudo chown -R $(id -u):$(id -g) ~/.copilot".to_string()
+            ),
+        }
+    }
 }
 
 impl std::fmt::Display for AgentKind {

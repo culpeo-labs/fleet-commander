@@ -46,6 +46,8 @@ pub struct Agent {
     /// Channel for sending prompts to the persistent ACP connection.
     /// `None` until the connection is established.
     pub prompt_tx: Option<mpsc::UnboundedSender<String>>,
+    /// ACP session ID — persisted across reconnections for session resume.
+    pub session_id: Option<String>,
 }
 
 impl Agent {
@@ -60,6 +62,7 @@ impl Agent {
             pending_response: String::new(),
             pending_thought: String::new(),
             prompt_tx: None,
+            session_id: None,
         }
     }
 

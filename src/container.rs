@@ -52,7 +52,16 @@ fn load_merged_config(config_path: &Path) -> Result<DevcontainerConfig, Containe
     let mut project_json: serde_json::Value =
         parse_jsonc(&raw).map_err(|e| ContainerError::Parse(e.to_string()))?;
 
-    if let Some(base_path) = init::base_layer_path()
+    // Try per-workspace layer first, then fall back to global legacy layer.
+    let workspace = config_path
+        .parent()
+        .and_then(|p| p.parent()) // .devcontainer/ -> project root
+        .unwrap_or(Path::new("/"));
+
+    let base_path = init::base_layer_path_for(workspace)
+        .or_else(|| init::base_layer_path());
+
+    if let Some(base_path) = base_path
         && let Ok(base_raw) = std::fs::read_to_string(&base_path)
         && let Ok(base_json) = parse_jsonc::<serde_json::Value>(&base_raw)
     {

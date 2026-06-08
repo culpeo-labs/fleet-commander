@@ -65,6 +65,8 @@ pub enum AppEvent {
     /// ACP agent connected and session created.
     AgentConnected {
         agent_id: AgentId,
+        /// The ACP session ID (for resume on reconnect).
+        session_id: Option<String>,
     },
     /// The agent needs interactive authentication (e.g. `copilot login`).
     /// The main loop should suspend the TUI and run the command interactively.

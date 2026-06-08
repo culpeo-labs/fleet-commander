@@ -12,10 +12,10 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use agent_client_protocol::schema::{
-    AuthenticateRequest, ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest,
-    ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
-    TextContent,
+    AuthenticateRequest, ContentBlock, InitializeRequest, ListSessionsRequest, NewSessionRequest,
+    PromptRequest, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome,
+    SessionNotification, SessionUpdate, TextContent,
 };
 use agent_client_protocol::{AcpAgent, Agent as AcpAgentRole, ConnectionTo, LineDirection};
 use tokio::sync::mpsc;
@@ -29,10 +29,14 @@ use crate::event::AppEvent;
 /// If the agent has a workspace folder, starts the dev container first,
 /// then wraps the ACP command with `docker exec` to run inside it.
 /// Returns an `mpsc::UnboundedSender<String>` for sending prompts.
+///
+/// `previous_session_id` allows resuming an existing ACP session instead
+/// of creating a new one (if the agent supports it).
 pub fn start_agent(
     agent_id: AgentId,
     acp_command: String,
     workspace_folder: Option<PathBuf>,
+    previous_session_id: Option<String>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> mpsc::UnboundedSender<String> {
     let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<String>();
@@ -110,6 +114,7 @@ pub fn start_agent(
             &effective_command,
             session_cwd,
             container_info.as_ref(),
+            previous_session_id,
             prompt_rx,
             event_tx.clone(),
         )
@@ -166,12 +171,13 @@ async fn run_persistent_connection(
     acp_command: &str,
     session_cwd: PathBuf,
     container_info: Option<&container::ContainerInfo>,
+    previous_session_id: Option<String>,
     prompt_rx: mpsc::UnboundedReceiver<String>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let prompt_rx = std::sync::Arc::new(tokio::sync::Mutex::new(prompt_rx));
 
-    connect_and_run(agent_id, acp_command, session_cwd, container_info, prompt_rx, event_tx).await
+    connect_and_run(agent_id, acp_command, session_cwd, container_info, previous_session_id, prompt_rx, event_tx).await
 }
 
 /// Connect to an ACP agent and run the prompt loop.
@@ -180,11 +186,15 @@ async fn run_persistent_connection(
 /// ACP protocol. If session creation fails with "Authentication required",
 /// sends an `AuthRequired` event so the main loop can run an interactive
 /// login flow.
+///
+/// When `previous_session_id` is set and the agent supports session resume,
+/// attempts to resume that session instead of creating a new one.
 async fn connect_and_run(
     agent_id: AgentId,
     acp_command: &str,
     session_cwd: PathBuf,
     container_info: Option<&container::ContainerInfo>,
+    previous_session_id: Option<String>,
     prompt_rx: std::sync::Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<String>>>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -298,35 +308,83 @@ async fn connect_and_run(
                     }
                 }
 
-                // Create a session with the appropriate working directory.
-                let session_result = connection
-                    .send_request(NewSessionRequest::new(session_cwd))
-                    .block_task()
-                    .await;
+                let caps = &init_resp.agent_capabilities.session_capabilities;
+                let can_resume = caps.resume.is_some();
+                let can_list = caps.list.is_some();
 
-                let session_id = match session_result {
-                    Ok(resp) => resp.session_id,
-                    Err(err) => {
-                        let msg = format!("{err}");
-                        if msg.contains("Authentication required") || msg.contains("auth") {
-                            // Build the interactive auth command.
-                            let auth_cmd = build_auth_command(ci_for_auth.as_ref());
-                            let _ = tx.send(AppEvent::AuthRequired {
-                                agent_id: aid.clone(),
-                                command: auth_cmd,
-                            });
-                        } else {
-                            let _ = tx.send(AppEvent::SessionError {
-                                agent_id: aid.clone(),
-                                message: format!("Session creation failed: {err}"),
-                            });
+                // Try to resume an existing session.
+                let session_id = if let Some(ref prev_id) = previous_session_id {
+                    if can_resume {
+                        let _ = tx.send(AppEvent::AgentOutput {
+                            agent_id: aid.clone(),
+                            line: format!("Resuming session {prev_id}…"),
+                        });
+                        match connection
+                            .send_request(ResumeSessionRequest::new(
+                                prev_id.clone(),
+                                session_cwd.clone(),
+                            ))
+                            .block_task()
+                            .await
+                        {
+                            Ok(_) => Some(prev_id.clone()),
+                            Err(err) => {
+                                let _ = tx.send(AppEvent::AgentOutput {
+                                    agent_id: aid.clone(),
+                                    line: format!("Resume failed ({err}), creating new session…"),
+                                });
+                                None
+                            }
                         }
-                        return Ok(());
+                    } else {
+                        None
+                    }
+                } else if can_list && can_resume {
+                    // No previous session_id stored — try listing sessions for this cwd.
+                    try_find_and_resume(
+                        &connection,
+                        &session_cwd,
+                        &aid,
+                        &tx,
+                    )
+                    .await
+                } else {
+                    None
+                };
+
+                // If resume didn't work, create a new session.
+                let session_id: String = if let Some(id) = session_id {
+                    id
+                } else {
+                    let session_result = connection
+                        .send_request(NewSessionRequest::new(session_cwd))
+                        .block_task()
+                        .await;
+
+                    match session_result {
+                        Ok(resp) => resp.session_id.to_string(),
+                        Err(err) => {
+                            let msg = format!("{err}");
+                            if msg.contains("Authentication required") || msg.contains("auth") {
+                                let auth_cmd = build_auth_command(ci_for_auth.as_ref());
+                                let _ = tx.send(AppEvent::AuthRequired {
+                                    agent_id: aid.clone(),
+                                    command: auth_cmd,
+                                });
+                            } else {
+                                let _ = tx.send(AppEvent::SessionError {
+                                    agent_id: aid.clone(),
+                                    message: format!("Session creation failed: {err}"),
+                                });
+                            }
+                            return Ok(());
+                        }
                     }
                 };
 
                 let _ = tx.send(AppEvent::AgentConnected {
                     agent_id: aid.clone(),
+                    session_id: Some(session_id.clone()),
                 });
 
                 // Prompt loop — wait for messages from the TUI and forward to agent.
@@ -366,6 +424,61 @@ async fn connect_and_run(
         .await?;
 
     Ok(())
+}
+
+/// Try to find an existing session for `cwd` via `session/list` and resume it.
+///
+/// Returns `Some(session_id)` on success, `None` if no matching session
+/// found or if resume fails.
+async fn try_find_and_resume(
+    connection: &ConnectionTo<AcpAgentRole>,
+    session_cwd: &PathBuf,
+    agent_id: &str,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) -> Option<String> {
+    let list_result = connection
+        .send_request(ListSessionsRequest::new().cwd(session_cwd.clone()))
+        .block_task()
+        .await;
+
+    let sessions = match list_result {
+        Ok(resp) => resp.sessions,
+        Err(_) => return None,
+    };
+
+    // Pick the most recently updated session.
+    let best = sessions.into_iter().max_by(|a, b| {
+        a.updated_at
+            .as_deref()
+            .unwrap_or("")
+            .cmp(b.updated_at.as_deref().unwrap_or(""))
+    })?;
+
+    let _ = tx.send(AppEvent::AgentOutput {
+        agent_id: agent_id.to_string(),
+        line: format!(
+            "Found existing session {} — resuming…",
+            best.title.as_deref().unwrap_or(&best.session_id.0),
+        ),
+    });
+
+    match connection
+        .send_request(ResumeSessionRequest::new(
+            best.session_id.clone(),
+            session_cwd.clone(),
+        ))
+        .block_task()
+        .await
+    {
+        Ok(_) => Some(best.session_id.to_string()),
+        Err(err) => {
+            let _ = tx.send(AppEvent::AgentOutput {
+                agent_id: agent_id.to_string(),
+                line: format!("Resume failed ({err}), creating new session…"),
+            });
+            None
+        }
+    }
 }
 
 /// Map an ACP `SessionUpdate` to `AppEvent`s and send them.

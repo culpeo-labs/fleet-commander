@@ -16,11 +16,13 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 use crate::agent::{Agent, AgentId, AgentStatus};
+use crate::agent_kind::AgentKind;
 use crate::agent_runtime;
 use crate::change_source::ChangeEvent;
 use crate::completion::{PathCompleter, split_command_and_path};
 use crate::config::{Action, Config};
 use crate::event::AppEvent;
+use crate::init;
 use crate::workspace;
 
 #[derive(Debug, Clone)]
@@ -182,11 +184,14 @@ impl App {
                     agent.history.push(label);
                 }
             }
-            AppEvent::AgentConnected { agent_id } => {
+            AppEvent::AgentConnected { agent_id, session_id } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.status = AgentStatus::Idle;
+                    agent.session_id = session_id;
                     agent.history.push("ACP session connected.".into());
                 }
+                // Persist session_id so it survives restarts.
+                let _ = workspace::save(&workspace::from_agents(&self.agents));
             }
             AppEvent::AuthRequired { agent_id, command } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
@@ -337,6 +342,7 @@ impl App {
             agent.id.clone(),
             agent.effective_acp_command(),
             agent.workspace_folder.clone(),
+            agent.session_id.clone(),
             self.tx.clone(),
         );
         agent.prompt_tx = Some(prompt_tx);
@@ -453,6 +459,11 @@ impl App {
             .with_acp_command("copilot --acp --stdio")
             .with_workspace(&workspace);
         self.agents.push(agent);
+
+        // Generate per-workspace base layer (mounts, env, etc.).
+        if let Err(err) = init::generate_workspace_layer(&workspace, AgentKind::Copilot) {
+            self.status_message = Some(format!("Layer warning: {err}"));
+        }
 
         // Persist to workspaces.yaml.
         if let Err(err) = workspace::save(&workspace::from_agents(&self.agents)) {
@@ -835,6 +846,7 @@ mod tests {
         let mut app = app_with_agents();
         app.handle(AppEvent::AgentConnected {
             agent_id: "a1".into(),
+            session_id: Some("sess_test".into()),
         });
         let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
         assert_eq!(a1.status, AgentStatus::Idle);
