@@ -12,10 +12,11 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use agent_client_protocol::schema::{
-    AuthenticateRequest, ContentBlock, InitializeRequest, ListSessionsRequest, NewSessionRequest,
-    PermissionOptionKind, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, TextContent,
+    AuthenticateRequest, ContentBlock, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
+    NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResumeSessionRequest, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
+    TextContent,
 };
 use agent_client_protocol::{AcpAgent, Agent as AcpAgentRole, ConnectionTo, LineDirection};
 use tokio::sync::mpsc;
@@ -361,15 +362,19 @@ async fn connect_and_run(
                 let caps = &init_resp.agent_capabilities.session_capabilities;
                 let can_resume = caps.resume.is_some();
                 let can_list = caps.list.is_some();
+                let can_load = init_resp.agent_capabilities.load_session;
                 info!(
                     agent_id = %aid,
                     can_resume,
+                    can_load,
                     can_list,
                     previous_session_id = ?previous_session_id,
                     "Session capabilities"
                 );
 
-                // Try to resume an existing session.
+                // Try to resume an existing session. Prefer `session/resume` when
+                // advertised; fall back to `session/load` for agents (like
+                // Copilot CLI) that only support the older mechanism.
                 let session_id = if let Some(ref prev_id) = previous_session_id {
                     if can_resume {
                         let _ = tx.send(AppEvent::AgentOutput {
@@ -393,16 +398,43 @@ async fn connect_and_run(
                                 None
                             }
                         }
+                    } else if can_load {
+                        let _ = tx.send(AppEvent::AgentOutput {
+                            agent_id: aid.clone(),
+                            line: format!("Loading session {prev_id}…"),
+                        });
+                        match connection
+                            .send_request(LoadSessionRequest::new(
+                                prev_id.clone(),
+                                session_cwd.clone(),
+                            ))
+                            .block_task()
+                            .await
+                        {
+                            Ok(_) => {
+                                info!(agent_id = %aid, session_id = %prev_id, "Session loaded");
+                                Some(prev_id.clone())
+                            }
+                            Err(err) => {
+                                let _ = tx.send(AppEvent::AgentOutput {
+                                    agent_id: aid.clone(),
+                                    line: format!("Load failed ({err}), creating new session…"),
+                                });
+                                None
+                            }
+                        }
                     } else {
                         None
                     }
-                } else if can_list && can_resume {
+                } else if can_list && (can_resume || can_load) {
                     // No previous session_id stored — try listing sessions for this cwd.
                     try_find_and_resume(
                         &connection,
                         &session_cwd,
                         &aid,
                         &tx,
+                        can_resume,
+                        can_load,
                     )
                     .await
                 } else {
@@ -489,13 +521,16 @@ async fn connect_and_run(
 
 /// Try to find an existing session for `cwd` via `session/list` and resume it.
 ///
-/// Returns `Some(session_id)` on success, `None` if no matching session
-/// found or if resume fails.
+/// Uses `session/resume` when the agent supports it, otherwise falls back to
+/// `session/load`. Returns `Some(session_id)` on success, `None` if no
+/// matching session is found or the rehydration call fails.
 async fn try_find_and_resume(
     connection: &ConnectionTo<AcpAgentRole>,
     session_cwd: &PathBuf,
     agent_id: &str,
     tx: &mpsc::UnboundedSender<AppEvent>,
+    can_resume: bool,
+    can_load: bool,
 ) -> Option<String> {
     let list_result = connection
         .send_request(ListSessionsRequest::new().cwd(session_cwd.clone()))
@@ -523,15 +558,30 @@ async fn try_find_and_resume(
         ),
     });
 
-    match connection
-        .send_request(ResumeSessionRequest::new(
-            best.session_id.clone(),
-            session_cwd.clone(),
-        ))
-        .block_task()
-        .await
-    {
-        Ok(_) => Some(best.session_id.to_string()),
+    let result = if can_resume {
+        connection
+            .send_request(ResumeSessionRequest::new(
+                best.session_id.clone(),
+                session_cwd.clone(),
+            ))
+            .block_task()
+            .await
+            .map(|_| ())
+    } else if can_load {
+        connection
+            .send_request(LoadSessionRequest::new(
+                best.session_id.clone(),
+                session_cwd.clone(),
+            ))
+            .block_task()
+            .await
+            .map(|_| ())
+    } else {
+        return None;
+    };
+
+    match result {
+        Ok(()) => Some(best.session_id.to_string()),
         Err(err) => {
             let _ = tx.send(AppEvent::AgentOutput {
                 agent_id: agent_id.to_string(),
