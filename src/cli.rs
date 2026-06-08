@@ -9,6 +9,18 @@ use clap::{Parser, Subcommand};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
+
+    /// Append every ACP wire message (both directions) to the given file,
+    /// one line per message prefixed with `>>` (sent) or `<<` (received).
+    /// Useful for debugging protocol issues.
+    #[arg(long, global = true, value_name = "FILE")]
+    pub acp_log: Option<PathBuf>,
+
+    /// Only log wire messages for agents whose id contains this substring.
+    /// Useful when running multiple agents and you want to follow a single
+    /// one. No effect unless `--acp-log` is also set.
+    #[arg(long, global = true, value_name = "PATTERN", requires = "acp_log")]
+    pub acp_log_filter: Option<String>,
 }
 
 #[derive(Subcommand)]

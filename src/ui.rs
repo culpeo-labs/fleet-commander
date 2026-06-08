@@ -334,8 +334,18 @@ fn classify_entry_style(entry: &str) -> Style {
             .add_modifier(Modifier::BOLD)
     } else if entry.starts_with("[error]") {
         Style::default().fg(Color::Red)
+    } else if entry.starts_with('⏳') {
+        Style::default().fg(Color::Yellow)
+    } else if entry.starts_with('✓') {
+        Style::default().fg(Color::Green)
+    } else if entry.starts_with('✗') {
+        Style::default().fg(Color::Red)
     } else if entry.starts_with("[tool") {
         Style::default().fg(Color::Yellow)
+    } else if entry.starts_with('💭') {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC)
     } else if entry.starts_with("[thought]") || entry.starts_with("[permission]") {
         Style::default().fg(Color::DarkGray)
     } else {

@@ -12,7 +12,9 @@
 //! mutate a hidden buffer.
 
 use crossterm::event::{KeyCode, KeyEvent};
+use std::fs::File;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -23,7 +25,7 @@ use crate::change_source::ChangeEvent;
 use crate::completion::{PathCompleter, split_command_and_path};
 use crate::config::{Action, Config};
 use crate::container;
-use crate::event::AppEvent;
+use crate::event::{AppEvent, ToolCallStatusKind};
 use crate::init;
 use crate::workspace;
 
@@ -93,6 +95,12 @@ pub struct App {
     /// Pending tool permission request awaiting user response.
     /// Contains (tool_name, options: Vec<(id, label, kind)>, reply_channel).
     pub permission_pending: Option<PendingPermission>,
+    /// Shared handle to the ACP wire-log file when `--acp-log` was passed.
+    /// `None` disables logging.
+    pub acp_log: Option<Arc<Mutex<File>>>,
+    /// Optional substring filter applied to agent id when deciding whether
+    /// to enable ACP logging for a given agent.
+    pub acp_log_filter: Option<String>,
 }
 
 /// A tool permission request waiting for the user's y/n decision.
@@ -105,7 +113,18 @@ pub struct PendingPermission {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new(config: Config, agents: Vec<Agent>, tx: mpsc::UnboundedSender<AppEvent>) -> Self {
+        Self::with_acp_log(config, agents, tx, None, None)
+    }
+
+    pub fn with_acp_log(
+        config: Config,
+        agents: Vec<Agent>,
+        tx: mpsc::UnboundedSender<AppEvent>,
+        acp_log: Option<Arc<Mutex<File>>>,
+        acp_log_filter: Option<String>,
+    ) -> Self {
         Self {
             config,
             agents,
@@ -119,6 +138,8 @@ impl App {
             tx,
             auth_pending: None,
             permission_pending: None,
+            acp_log,
+            acp_log_filter,
         }
     }
 
@@ -200,17 +221,14 @@ impl App {
             }
             AppEvent::ToolCallUpdate {
                 agent_id,
-                tool_name,
+                tool_call_id,
+                title,
                 status,
             } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-                    let label = if tool_name.is_empty() {
-                        format!("[tool] {status}")
-                    } else {
-                        format!("[tool: {tool_name}] {status}")
-                    };
-                    agent.history.push(label);
+                    upsert_tool_call(agent, &tool_call_id, title, status);
                 }
+                self.auto_scroll_for(&agent_id);
             }
             AppEvent::AgentConnected { agent_id, session_id } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
@@ -433,12 +451,18 @@ impl App {
         if agent.acp_command.is_empty() {
             return; // No command configured.
         }
+        let log_for_agent = match (&self.acp_log, &self.acp_log_filter) {
+            (Some(log), Some(pattern)) if agent.id.contains(pattern) => Some(log.clone()),
+            (Some(log), None) => Some(log.clone()),
+            _ => None,
+        };
         let (prompt_tx, abort_handle) = agent_runtime::start_agent(
             agent.id.clone(),
             agent.effective_acp_command(),
             agent.workspace_folder.clone(),
             agent.session_id.clone(),
             self.tx.clone(),
+            log_for_agent,
         );
         agent.prompt_tx = Some(prompt_tx);
         agent.task_handle = Some(abort_handle);
@@ -667,11 +691,83 @@ impl App {
     }
 }
 
-/// Flush accumulated thought text into history as a single collapsed entry.
+/// Flush accumulated thought text into history as a single dimmed entry
+/// prefixed with `💭`. Lines render naturally instead of being collapsed
+/// into one paragraph.
 fn flush_pending_thought(agent: &mut Agent) {
     if !agent.pending_thought.is_empty() {
         let thought = std::mem::take(&mut agent.pending_thought);
-        agent.history.push(format!("[thought] {}", thought.trim()));
+        let trimmed = thought.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        agent.history.push(format!("💭 {trimmed}"));
+    }
+}
+
+/// Render a tool-call status as a leading marker. Pending/InProgress show a
+/// spinner, completed shows a check, failed shows a cross.
+fn tool_status_marker(status: ToolCallStatusKind) -> &'static str {
+    match status {
+        ToolCallStatusKind::Pending | ToolCallStatusKind::InProgress => "⏳",
+        ToolCallStatusKind::Completed => "✓",
+        ToolCallStatusKind::Failed => "✗",
+    }
+}
+
+/// Format a tool-call history entry. Title falls back to "(tool)" so the
+/// line is never empty.
+fn format_tool_entry(title: &str, status: ToolCallStatusKind) -> String {
+    let display_title = if title.is_empty() { "(tool)" } else { title };
+    format!("{} {display_title}", tool_status_marker(status))
+}
+
+/// Add or update the history entry for an in-flight tool call. New calls
+/// flush any pending thought/response so the entry lands in the right
+/// position; updates rewrite the entry in place so completion replaces the
+/// running line instead of stacking duplicates.
+fn upsert_tool_call(
+    agent: &mut Agent,
+    tool_call_id: &str,
+    title: Option<String>,
+    status: Option<ToolCallStatusKind>,
+) {
+    if let Some(&idx) = agent.tool_call_entries.get(tool_call_id) {
+        if idx >= agent.history.len() {
+            return;
+        }
+        let current = &agent.history[idx];
+        // Extract the existing title (everything after the marker + space).
+        let existing_title = current.splitn(2, ' ').nth(1).unwrap_or("").to_string();
+        let new_title = title.unwrap_or(existing_title);
+        // Existing marker → status. Rebuild from new status if provided,
+        // otherwise reuse the marker by classifying it back.
+        let new_status = status.unwrap_or_else(|| classify_marker(current));
+        agent.history[idx] = format_tool_entry(&new_title, new_status);
+    } else {
+        // First time we see this call — flush pending content so order is
+        // correct, then register a fresh entry.
+        flush_pending_user_message(agent);
+        flush_pending_thought(agent);
+        flush_pending_response(agent);
+        let entry_title = title.unwrap_or_else(|| "(tool)".to_string());
+        let entry_status = status.unwrap_or(ToolCallStatusKind::InProgress);
+        let entry = format_tool_entry(&entry_title, entry_status);
+        let idx = agent.history.len();
+        agent.history.push(entry);
+        agent.tool_call_entries.insert(tool_call_id.to_string(), idx);
+    }
+}
+
+/// Classify an existing tool-call entry back into a status from its leading
+/// marker character.
+fn classify_marker(entry: &str) -> ToolCallStatusKind {
+    if entry.starts_with('✓') {
+        ToolCallStatusKind::Completed
+    } else if entry.starts_with('✗') {
+        ToolCallStatusKind::Failed
+    } else {
+        ToolCallStatusKind::InProgress
     }
 }
 
@@ -1059,10 +1155,41 @@ mod tests {
         let mut app = app_with_agents();
         app.handle(AppEvent::ToolCallUpdate {
             agent_id: "a1".into(),
-            tool_name: "read_file".into(),
-            status: "started".into(),
+            tool_call_id: "call_1".into(),
+            title: Some("read_file".into()),
+            status: Some(ToolCallStatusKind::InProgress),
         });
         let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        assert!(a1.history.last().unwrap().contains("read_file"));
+        assert!(a1.history.last().unwrap().starts_with('⏳'));
+    }
+
+    #[test]
+    fn tool_call_completion_updates_existing_entry() {
+        let mut app = app_with_agents();
+        app.handle(AppEvent::ToolCallUpdate {
+            agent_id: "a1".into(),
+            tool_call_id: "call_1".into(),
+            title: Some("read_file".into()),
+            status: Some(ToolCallStatusKind::InProgress),
+        });
+        let len_before = app
+            .agents
+            .iter()
+            .find(|a| a.id == "a1")
+            .unwrap()
+            .history
+            .len();
+        app.handle(AppEvent::ToolCallUpdate {
+            agent_id: "a1".into(),
+            tool_call_id: "call_1".into(),
+            title: None,
+            status: Some(ToolCallStatusKind::Completed),
+        });
+        let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        // No duplicate appended — completion replaces the running entry.
+        assert_eq!(a1.history.len(), len_before);
+        assert!(a1.history.last().unwrap().starts_with('✓'));
         assert!(a1.history.last().unwrap().contains("read_file"));
     }
 }

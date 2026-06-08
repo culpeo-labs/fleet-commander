@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
 
     // Default: launch TUI.
     init_logging();
-    run_tui().await
+    run_tui(cli.acp_log, cli.acp_log_filter).await
 }
 
 /// Initialize file-based logging via `tracing`.
@@ -83,7 +83,10 @@ fn init_logging() {
     info!("Fleet Commander starting");
 }
 
-async fn run_tui() -> Result<()> {
+async fn run_tui(
+    acp_log_path: Option<PathBuf>,
+    acp_log_filter: Option<String>,
+) -> Result<()> {
     let config = load_config_or_default();
     install_panic_hook();
     let mut terminal = setup_terminal()?;
@@ -95,7 +98,12 @@ async fn run_tui() -> Result<()> {
     info!(count = saved.len(), "Loaded workspaces");
     let agents = workspace::to_agents(&saved);
 
-    let mut app = App::new(config, agents, tx.clone());
+    let acp_log = open_acp_log(acp_log_path.as_deref())?;
+    if let Some(ref pattern) = acp_log_filter {
+        info!(pattern = %pattern, "ACP log filter active");
+    }
+
+    let mut app = App::with_acp_log(config, agents, tx.clone(), acp_log, acp_log_filter);
 
     let mut input_task = spawn_input_task(tx.clone());
     let _change_handle = start_default_change_source(tx.clone())?;
@@ -170,6 +178,24 @@ fn load_config_or_default() -> Config {
             Config::default()
         }
     }
+}
+
+/// Open the ACP wire-log file in append mode if a path was supplied via
+/// `--acp-log`. Returns a shared, lockable handle so every agent task writes
+/// into the same file without interleaving lines.
+fn open_acp_log(path: Option<&std::path::Path>) -> Result<Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>> {
+    let Some(path) = path else { return Ok(None) };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    info!(path = %path.display(), "ACP wire log enabled");
+    Ok(Some(std::sync::Arc::new(std::sync::Mutex::new(file))))
 }
 
 fn install_panic_hook() {

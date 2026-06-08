@@ -10,13 +10,14 @@
 
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::{
     AuthenticateRequest, ContentBlock, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
     NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     ResumeSessionRequest, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
-    TextContent,
+    TextContent, ToolCallStatus,
 };
 use agent_client_protocol::{AcpAgent, Agent as AcpAgentRole, ConnectionTo, LineDirection};
 use tokio::sync::mpsc;
@@ -24,7 +25,11 @@ use tracing::{info, error};
 
 use crate::agent::AgentId;
 use crate::container::{self, ContainerConfig};
-use crate::event::AppEvent;
+use crate::event::{AppEvent, ToolCallStatusKind};
+
+/// Shared handle to the optional ACP wire-log file. Cloned cheaply across
+/// agent tasks so all of them write into the same file.
+pub type AcpLog = Arc<Mutex<std::fs::File>>;
 
 /// Spawn a persistent ACP connection for an agent.
 ///
@@ -40,6 +45,7 @@ pub fn start_agent(
     workspace_folder: Option<PathBuf>,
     previous_session_id: Option<String>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
+    acp_log: Option<AcpLog>,
 ) -> (mpsc::UnboundedSender<String>, tokio::task::AbortHandle) {
     let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<String>();
 
@@ -130,6 +136,7 @@ pub fn start_agent(
             previous_session_id,
             prompt_rx,
             event_tx.clone(),
+            acp_log.clone(),
         )
         .await
         {
@@ -187,10 +194,21 @@ async fn run_persistent_connection(
     previous_session_id: Option<String>,
     prompt_rx: mpsc::UnboundedReceiver<String>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
+    acp_log: Option<AcpLog>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let prompt_rx = std::sync::Arc::new(tokio::sync::Mutex::new(prompt_rx));
 
-    connect_and_run(agent_id, acp_command, session_cwd, container_info, previous_session_id, prompt_rx, event_tx).await
+    connect_and_run(
+        agent_id,
+        acp_command,
+        session_cwd,
+        container_info,
+        previous_session_id,
+        prompt_rx,
+        event_tx,
+        acp_log,
+    )
+    .await
 }
 
 /// Connect to an ACP agent and run the prompt loop.
@@ -210,20 +228,34 @@ async fn connect_and_run(
     previous_session_id: Option<String>,
     prompt_rx: std::sync::Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<String>>>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
+    acp_log: Option<AcpLog>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut agent = AcpAgent::from_str(acp_command)?;
     info!(agent_id = %agent_id, command = %acp_command, "Connecting to ACP agent");
 
     // Forward agent stderr to the TUI so the user sees device-code URLs,
-    // diagnostic messages, etc.
+    // diagnostic messages, etc. When --acp-log is set, also append every
+    // wire line (both directions) to the log file for protocol debugging.
     let debug_aid = agent_id.clone();
     let debug_tx = event_tx.clone();
+    let debug_log = acp_log.clone();
     agent = agent.with_debug(move |line, direction| {
         if direction == LineDirection::Stderr {
             let _ = debug_tx.send(AppEvent::AgentOutput {
                 agent_id: debug_aid.clone(),
                 line: format!("  {line}"),
             });
+        }
+        if let Some(ref log) = debug_log {
+            let prefix = match direction {
+                LineDirection::Stdin => ">>",
+                LineDirection::Stdout => "<<",
+                LineDirection::Stderr => "!!",
+            };
+            if let Ok(mut file) = log.lock() {
+                use std::io::Write;
+                let _ = writeln!(file, "[{debug_aid}] {prefix} {line}");
+            }
         }
     });
 
@@ -637,19 +669,32 @@ fn forward_session_update(
         SessionUpdate::ToolCall(tool_call) => {
             let _ = tx.send(AppEvent::ToolCallUpdate {
                 agent_id: agent_id.to_string(),
-                tool_name: tool_call.title.clone(),
-                status: "started".to_string(),
+                tool_call_id: tool_call.tool_call_id.0.to_string(),
+                title: Some(tool_call.title.clone()),
+                status: Some(map_tool_status(&tool_call.status)),
             });
         }
         SessionUpdate::ToolCallUpdate(update) => {
-            let status = format!("{:?}", update.fields.status);
             let _ = tx.send(AppEvent::ToolCallUpdate {
                 agent_id: agent_id.to_string(),
-                tool_name: String::new(),
-                status,
+                tool_call_id: update.tool_call_id.0.to_string(),
+                title: update.fields.title.clone(),
+                status: update.fields.status.as_ref().map(map_tool_status),
             });
         }
         _ => {}
+    }
+}
+
+/// Map the ACP tool-call status enum to our display-side enum so events stay
+/// free of ACP types.
+fn map_tool_status(status: &ToolCallStatus) -> ToolCallStatusKind {
+    match status {
+        ToolCallStatus::Pending => ToolCallStatusKind::Pending,
+        ToolCallStatus::InProgress => ToolCallStatusKind::InProgress,
+        ToolCallStatus::Completed => ToolCallStatusKind::Completed,
+        ToolCallStatus::Failed => ToolCallStatusKind::Failed,
+        _ => ToolCallStatusKind::InProgress,
     }
 }
 

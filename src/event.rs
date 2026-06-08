@@ -13,6 +13,16 @@ use crate::change_source::ChangeEvent;
 /// can derive Clone (the sender is taken once when the user responds).
 pub type PermissionReply = Arc<Mutex<Option<tokio::sync::oneshot::Sender<Option<String>>>>>;
 
+/// Execution status reported by the agent for a tool call. Mirrors the ACP
+/// `ToolCallStatus` enum but lives here so events stay free of ACP types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallStatusKind {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum AppEvent {
@@ -68,11 +78,18 @@ pub enum AppEvent {
         agent_id: AgentId,
         message: String,
     },
-    /// The ACP agent reported a tool call.
+    /// The ACP agent reported a tool call (initial registration or status
+    /// update). Identified by `tool_call_id`; the app upserts a single
+    /// history entry per id so completion replaces the running entry
+    /// in-place instead of appending duplicates.
     ToolCallUpdate {
         agent_id: AgentId,
-        tool_name: String,
-        status: String,
+        tool_call_id: String,
+        /// Set on initial registration; on later updates it's `Some` only
+        /// when the agent renames the call.
+        title: Option<String>,
+        /// `None` when the agent only updated content/locations etc.
+        status: Option<ToolCallStatusKind>,
     },
     /// ACP agent connected and session created.
     AgentConnected {
