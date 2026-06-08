@@ -83,7 +83,13 @@ fn load_merged_config(config_path: &Path) -> Result<DevcontainerConfig, Containe
 ///
 /// Loads the project's devcontainer.json, merges the base credential layer,
 /// then builds/creates/starts the container using the Docker API (bollard).
-pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, ContainerError> {
+///
+/// `on_progress` is called with human-readable status messages at each phase
+/// so the caller can update the UI.
+pub async fn start_container(
+    config: &ContainerConfig,
+    on_progress: impl Fn(&str),
+) -> Result<ContainerInfo, ContainerError> {
     let workspace = &config.workspace_folder;
     info!(workspace = %workspace.display(), "Starting container");
 
@@ -118,6 +124,7 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
         info!(id = %container.id, state = ?container.state, "Found existing container");
         match container.state {
             ContainerState::Running => {
+                on_progress("Container already running, reattaching…");
                 let remote_user = resolve_remote_user(rt.as_ref(), &container.image, &dc_config).await?;
                 let folder_name = workspace_folder_name(workspace);
                 info!(id = %container.id, "Reusing running container");
@@ -131,6 +138,7 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
                 });
             }
             ContainerState::Stopped => {
+                on_progress("Starting stopped container…");
                 info!(id = %container.id, "Starting stopped container");
                 rt.start_container(&container.id).await
                     .map_err(|e| ContainerError::Start(e.to_string()))?;
@@ -153,7 +161,7 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
 
     // No existing container — build image and create one.
     info!("No existing container — building image");
-    let image = resolve_image(rt.as_ref(), workspace, &dc_config, &config_path).await?;
+    let image = resolve_image(rt.as_ref(), workspace, &dc_config, &config_path, &on_progress).await?;
     let name = container_name(workspace);
     let folder_name = workspace_folder_name(workspace);
     info!(image = %image, name = %name, "Image ready");
@@ -206,12 +214,14 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
         security_opt: Vec::new(),
     };
 
+    on_progress("Creating container…");
     let container_id = rt.create_container(&container_config).await
         .map_err(|e| {
             error!(error = %e, "Failed to create container");
             ContainerError::Start(e.to_string())
         })?;
     info!(id = %container_id, "Container created");
+    on_progress("Starting container…");
     rt.start_container(&container_id).await
         .map_err(|e| {
             error!(id = %container_id, error = %e, "Failed to start container");
@@ -233,6 +243,7 @@ async fn resolve_image(
     workspace: &Path,
     config: &DevcontainerConfig,
     config_path: &Path,
+    on_progress: &impl Fn(&str),
 ) -> Result<String, ContainerError> {
     let folder_image = container_name(workspace);
     let features = resolve_features(config).unwrap_or_default();
@@ -245,12 +256,15 @@ async fn resolve_image(
         info!(image = %image, "Resolving base image");
         let cached = rt.image_exists(image).await.unwrap_or(false);
         if cached {
+            on_progress("Base image cached locally ✓");
             info!(image = %image, "Base image found locally, skipping pull");
         } else {
+            on_progress(&format!("Pulling image {image}…"));
             info!(image = %image, "Pulling base image");
             rt.pull_image(image)
                 .await
                 .map_err(|e| ContainerError::Start(format!("Failed to pull image: {e}")))?;
+            on_progress("Image pull complete ✓");
             info!(image = %image, "Base image pull complete");
         }
         image.clone()
@@ -261,6 +275,7 @@ async fn resolve_image(
             .join(build.context.as_deref().unwrap_or("."));
         let dockerfile_path = config_path.parent().unwrap().join(&build.dockerfile);
         info!(dockerfile = %dockerfile_path.display(), context = %context_dir.display(), "Building base image");
+        on_progress("Building image from Dockerfile…");
         let dockerfile_content = std::fs::read_to_string(&dockerfile_path)
             .map_err(|e| ContainerError::Parse(format!("Failed to read Dockerfile: {e}")))?;
         let base_tag = if has_features {
@@ -292,6 +307,7 @@ async fn resolve_image(
 
     // 2. Download and stage features.
     info!(count = features.len(), "Downloading features");
+    on_progress(&format!("Downloading {} feature(s)…", features.len()));
     let mut features = features;
     download_features(&mut features, devcontainer_dir.as_deref())
         .await
@@ -314,6 +330,7 @@ async fn resolve_image(
     );
     let final_tag = format!("{folder_image}-features");
     info!(tag = %final_tag, "Building feature layer image");
+    on_progress("Building feature layer…");
     let result = rt
         .build_image(
             &dockerfile,

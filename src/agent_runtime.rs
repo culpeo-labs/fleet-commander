@@ -55,7 +55,14 @@ pub fn start_agent(
             let config = ContainerConfig {
                 workspace_folder: ws.clone(),
             };
-            match container::start_container(&config).await {
+            let progress_tx = event_tx.clone();
+            let progress_aid = agent_id.clone();
+            match container::start_container(&config, |msg| {
+                let _ = progress_tx.send(AppEvent::AgentOutput {
+                    agent_id: progress_aid.clone(),
+                    line: format!("  ⏳ {msg}"),
+                });
+            }).await {
                 Ok(info) => {
                     info!(
                         agent_id = %agent_id,
