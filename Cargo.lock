@@ -928,7 +928,7 @@ dependencies = [
 [[package]]
 name = "devcontainer"
 version = "0.1.12"
-source = "git+https://github.com/glecaros/dev.git#8d94e8773361be77e04067b3032787b8dd876db0"
+source = "git+https://github.com/glecaros/dev.git?branch=staging#39d124f901d461e68e510116ad3456a65097edf2"
 dependencies = [
  "anyhow",
  "bollard",

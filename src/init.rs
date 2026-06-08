@@ -215,14 +215,8 @@ pub fn generate_workspace_layer(workspace: &Path, agent_kind: AgentKind) -> Resu
         base.insert("postStartCommand".to_string(), serde_json::Value::String(cmd));
     }
 
-    // Add postCreateCommand for agent binary installation.
-    // Runs once on container creation — the binary persists across restarts.
-    if let Some(cmd) = agent_kind.post_create_command() {
-        base.insert("postCreateCommand".to_string(), serde_json::Value::String(cmd));
-    }
-
-    // Add required features so the agent binary is available regardless of
-    // the project's own feature list.
+    // Add required features (e.g. copilot-cli) so the agent binary is
+    // available regardless of the project's own feature list.
     let features = agent_kind.required_features();
     if !features.is_empty() {
         let mut feature_map = serde_json::Map::new();
@@ -354,10 +348,6 @@ mod tests {
 
         let post_start = agent_kind.post_start_command();
         assert!(post_start.is_some(), "Copilot should have postStartCommand");
-
-        let post_create = agent_kind.post_create_command();
-        assert!(post_create.is_some(), "Copilot should have postCreateCommand");
-        assert!(post_create.unwrap().contains("copilot"), "postCreateCommand should install copilot");
 
         // Verify slug generation.
         let slug = workspace_slug(&workspace);
