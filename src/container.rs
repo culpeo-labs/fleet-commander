@@ -18,6 +18,7 @@ use devcontainer_lib::devcontainer::features::{
     download_features, generate_feature_dockerfile_with_opts, order_features, resolve_features,
     stage_feature_context,
 };
+use devcontainer_lib::devcontainer::lifecycle::run_lifecycle_hooks;
 use devcontainer_lib::devcontainer::merge::merge_layer;
 use devcontainer_lib::devcontainer::variables::{substitute_variables, substitute_variables_with_user};
 use devcontainer_lib::parse_jsonc;
@@ -143,14 +144,26 @@ pub async fn start_container(
                 rt.start_container(&container.id).await
                     .map_err(|e| ContainerError::Start(e.to_string()))?;
                 let remote_user = resolve_remote_user(rt.as_ref(), &container.image, &dc_config).await?;
+                let user_str = remote_user.unwrap_or_else(|| "root".to_string());
                 let folder_name = workspace_folder_name(workspace);
+
+                // Run postStartCommand on restart (per devcontainer spec,
+                // postStartCommand runs on every start, not just creation).
+                run_post_start_command(
+                    rt.as_ref(),
+                    &container.id,
+                    &dc_config,
+                    &user_str,
+                    &on_progress,
+                ).await;
+
                 return Ok(ContainerInfo {
                     container_id: container.id.clone(),
                     workspace_folder: workspace.clone(),
                     remote_workspace_folder: dc_config.workspace_folder
                         .clone()
                         .unwrap_or_else(|| format!("/workspaces/{folder_name}")),
-                    remote_user: remote_user.unwrap_or_else(|| "root".to_string()),
+                    remote_user: user_str,
                 });
             }
             ContainerState::NotFound => {
@@ -229,12 +242,81 @@ pub async fn start_container(
         })?;
     info!(id = %container_id, "Container started");
 
+    // Run lifecycle hooks (postCreateCommand, postStartCommand, etc.).
+    // These execute inside the running container as the remote user.
+    let user_str = remote_user.clone().unwrap_or_else(|| "root".to_string());
+    on_progress("Running lifecycle hooks…");
+    info!(id = %container_id, user = %user_str, "Running lifecycle hooks");
+    if let Err(e) = run_lifecycle_hooks(
+        rt.as_ref(),
+        &container_id,
+        &dc_config,
+        Some(user_str.as_str()),
+        None,
+    ).await {
+        warn!(error = %e, "Lifecycle hook failed");
+        on_progress(&format!("⚠ Lifecycle hook failed: {e}"));
+    }
+
     Ok(ContainerInfo {
         container_id,
         workspace_folder: workspace.clone(),
         remote_workspace_folder: remote_workspace,
-        remote_user: remote_user.unwrap_or_else(|| "root".to_string()),
+        remote_user: user_str,
     })
+}
+
+/// Run only the postStartCommand from the devcontainer config.
+///
+/// Used when restarting a stopped container — postCreateCommand should NOT
+/// re-run, but postStartCommand runs on every start per the spec.
+async fn run_post_start_command(
+    rt: &dyn ContainerRuntime,
+    container_id: &str,
+    config: &DevcontainerConfig,
+    user: &str,
+    on_progress: &impl Fn(&str),
+) {
+    use devcontainer_lib::devcontainer::config::LifecycleCommand;
+
+    let cmd = match &config.post_start_command {
+        Some(cmd) => cmd,
+        None => return,
+    };
+
+    on_progress("Running postStartCommand…");
+    info!(id = %container_id, "Running postStartCommand on restart");
+
+    let commands = match cmd {
+        LifecycleCommand::Single(c) => vec![c.as_str()],
+        LifecycleCommand::Multiple(cs) => cs.iter().map(|c| c.as_str()).collect(),
+        LifecycleCommand::Parallel(map) => map.values().map(|c| c.as_str()).collect(),
+    };
+
+    for command in commands {
+        let args = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            command.to_string(),
+        ];
+        match rt.exec(container_id, &args, Some(user)).await {
+            Ok(result) if result.exit_code != 0 => {
+                warn!(
+                    exit_code = result.exit_code,
+                    stderr = %result.stderr,
+                    "postStartCommand failed"
+                );
+                on_progress(&format!("⚠ postStartCommand failed (exit {})", result.exit_code));
+            }
+            Err(e) => {
+                warn!(error = %e, "postStartCommand exec failed");
+                on_progress(&format!("⚠ postStartCommand failed: {e}"));
+            }
+            Ok(_) => {
+                info!("postStartCommand completed successfully");
+            }
+        }
+    }
 }
 
 /// Resolve the container image — pull/build base, then layer features if present.
@@ -330,6 +412,7 @@ async fn resolve_image(
     );
     let final_tag = format!("{folder_image}-features");
     info!(tag = %final_tag, "Building feature layer image");
+    debug!(dockerfile = %dockerfile, "Feature layer Dockerfile");
     on_progress("Building feature layer…");
     let result = rt
         .build_image(

@@ -69,15 +69,36 @@ impl AgentKind {
         }
     }
 
+    /// Command to run once after container creation (postCreateCommand).
+    ///
+    /// Used to install the agent binary. This runs only on first creation,
+    /// not on subsequent starts, so the binary persists across restarts.
+    pub fn post_create_command(self) -> Option<String> {
+        match self {
+            AgentKind::Copilot => {
+                // Install copilot CLI from GitHub releases as a static binary.
+                // Detects architecture (x64/arm64) and downloads the matching tarball.
+                // Falls back gracefully if curl/tar aren't available.
+                Some(concat!(
+                    "set -e && ",
+                    "ARCH=$(uname -m) && ",
+                    "case \"$ARCH\" in x86_64) ARCH=x64;; aarch64) ARCH=arm64;; esac && ",
+                    "curl -fsSL \"https://github.com/github/copilot-cli/releases/latest/download/copilot-linux-${ARCH}.tar.gz\" | ",
+                    "sudo tar xz -C /usr/local/bin copilot && ",
+                    "echo 'GitHub Copilot CLI installed:' && copilot --version"
+                ).to_string())
+            }
+        }
+    }
+
     /// Devcontainer features required by this agent.
     ///
     /// These are merged into the base layer so the agent binary is available
     /// inside the container regardless of the project's own feature list.
     pub fn required_features(self) -> Vec<(&'static str, serde_json::Value)> {
         match self {
-            AgentKind::Copilot => vec![
-                ("ghcr.io/devcontainers/features/copilot-cli:1", serde_json::json!({})),
-            ],
+            // No features needed — copilot is installed via postCreateCommand.
+            AgentKind::Copilot => vec![],
         }
     }
 }
