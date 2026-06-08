@@ -53,6 +53,12 @@ pub enum AppEvent {
         agent_id: AgentId,
         text: String,
     },
+    /// Streaming text chunk for a historical user message (replayed during
+    /// `session/load` or `session/resume`).
+    UserMessageDelta {
+        agent_id: AgentId,
+        text: String,
+    },
     /// The ACP agent finished its response (prompt completed).
     AssistantDone {
         agent_id: AgentId,

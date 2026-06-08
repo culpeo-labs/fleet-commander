@@ -156,7 +156,9 @@ impl App {
             }
             AppEvent::AssistantDelta { agent_id, text } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-                    // Flush any pending thought before assistant text starts.
+                    // A new assistant chunk closes any pending replayed user
+                    // message and the prior thought stream.
+                    flush_pending_user_message(agent);
                     flush_pending_thought(agent);
                     agent.status = AgentStatus::Running;
                     agent.pending_response.push_str(&text);
@@ -165,17 +167,27 @@ impl App {
             }
             AppEvent::ThoughtDelta { agent_id, text } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    flush_pending_user_message(agent);
                     agent.pending_thought.push_str(&text);
+                }
+                self.auto_scroll_for(&agent_id);
+            }
+            AppEvent::UserMessageDelta { agent_id, text } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    // A new user message marks the end of the prior turn —
+                    // flush so the assistant response (if any) gets pushed to
+                    // history and rendered as markdown.
+                    flush_pending_thought(agent);
+                    flush_pending_response(agent);
+                    agent.pending_user_message.push_str(&text);
                 }
                 self.auto_scroll_for(&agent_id);
             }
             AppEvent::AssistantDone { agent_id } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    flush_pending_user_message(agent);
                     flush_pending_thought(agent);
-                    if !agent.pending_response.is_empty() {
-                        let response = std::mem::take(&mut agent.pending_response);
-                        agent.history.push(response);
-                    }
+                    flush_pending_response(agent);
                     agent.status = AgentStatus::Idle;
                 }
                 self.auto_scroll_for(&agent_id);
@@ -648,6 +660,27 @@ fn flush_pending_thought(agent: &mut Agent) {
     if !agent.pending_thought.is_empty() {
         let thought = std::mem::take(&mut agent.pending_thought);
         agent.history.push(format!("[thought] {}", thought.trim()));
+    }
+}
+
+/// Flush accumulated assistant response into history so it gets rendered
+/// with full markdown formatting (rather than as plain streaming text).
+fn flush_pending_response(agent: &mut Agent) {
+    if !agent.pending_response.is_empty() {
+        let response = std::mem::take(&mut agent.pending_response);
+        agent.history.push(response);
+    }
+}
+
+/// Flush accumulated user-message chunks (replayed during session/load) into
+/// history with the `> ` prefix used for regular user messages so they get
+/// the same cyan-bold styling.
+fn flush_pending_user_message(agent: &mut Agent) {
+    if !agent.pending_user_message.is_empty() {
+        let message = std::mem::take(&mut agent.pending_user_message);
+        for line in message.lines() {
+            agent.history.push(format!("> {line}"));
+        }
     }
 }
 

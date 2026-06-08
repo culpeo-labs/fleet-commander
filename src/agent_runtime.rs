@@ -441,8 +441,19 @@ async fn connect_and_run(
                     None
                 };
 
-                // If resume didn't work, create a new session.
-                let session_id: String = if let Some(id) = session_id {
+                // Rename to make the next step's intent explicit: this is the
+                // id from the resume/load path, if any.
+                let resumed_session_id = session_id;
+
+                // If resume didn't work, create a new session. If it did, flush
+                // any replayed chunks (UserMessageChunk / AgentMessageChunk
+                // notifications sent during load/resume) into history so they
+                // get markdown rendering — the agent never sends an explicit
+                // turn-end signal for replayed history.
+                let session_id: String = if let Some(id) = resumed_session_id {
+                    let _ = tx.send(AppEvent::AssistantDone {
+                        agent_id: aid.clone(),
+                    });
                     id
                 } else {
                     let session_result = connection
@@ -602,6 +613,14 @@ fn forward_session_update(
         SessionUpdate::AgentMessageChunk(chunk) => {
             if let ContentBlock::Text(text) = &chunk.content {
                 let _ = tx.send(AppEvent::AssistantDelta {
+                    agent_id: agent_id.to_string(),
+                    text: text.text.clone(),
+                });
+            }
+        }
+        SessionUpdate::UserMessageChunk(chunk) => {
+            if let ContentBlock::Text(text) = &chunk.content {
+                let _ = tx.send(AppEvent::UserMessageDelta {
                     agent_id: agent_id.to_string(),
                     text: text.text.clone(),
                 });

@@ -44,6 +44,8 @@ pub struct Agent {
     pub pending_response: String,
     /// Accumulates thought chunks until the thought stream ends.
     pub pending_thought: String,
+    /// Accumulates user-message chunks replayed during session load.
+    pub pending_user_message: String,
     /// Channel for sending prompts to the persistent ACP connection.
     /// `None` until the connection is established.
     pub prompt_tx: Option<mpsc::UnboundedSender<String>>,
@@ -65,6 +67,7 @@ impl Agent {
             workspace_folder: None,
             pending_response: String::new(),
             pending_thought: String::new(),
+            pending_user_message: String::new(),
             prompt_tx: None,
             task_handle: None,
             session_id: None,
