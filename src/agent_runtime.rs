@@ -19,6 +19,7 @@ use agent_client_protocol::schema::{
 };
 use agent_client_protocol::{AcpAgent, Agent as AcpAgentRole, ConnectionTo, LineDirection};
 use tokio::sync::mpsc;
+use tracing::{info, error};
 
 use crate::agent::AgentId;
 use crate::container::{self, ContainerConfig};
@@ -42,6 +43,7 @@ pub fn start_agent(
     let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<String>();
 
     tokio::spawn(async move {
+        info!(agent_id = %agent_id, command = %acp_command, workspace = ?workspace_folder, "Starting agent");
         // Resolve a host GitHub token for headless auth.
         // The copilot CLI in --acp mode expects to already be authenticated;
         // passing COPILOT_GITHUB_TOKEN lets it work without a keychain or
@@ -60,6 +62,13 @@ pub fn start_agent(
             };
             match container::start_container(&config).await {
                 Ok(info) => {
+                    info!(
+                        agent_id = %agent_id,
+                        container_id = %info.container_id,
+                        remote_user = %info.remote_user,
+                        remote_workspace = %info.remote_workspace_folder,
+                        "Container ready"
+                    );
                     let _ = event_tx.send(AppEvent::AgentOutput {
                         agent_id: agent_id.clone(),
                         line: format!(
@@ -86,6 +95,7 @@ pub fn start_agent(
                     (exec_cmd, cwd, Some(info))
                 }
                 Err(err) => {
+                    error!(agent_id = %agent_id, error = %err, "Container failed to start");
                     let _ = event_tx.send(AppEvent::SessionError {
                         agent_id: agent_id.clone(),
                         message: format!("Container failed: {err}"),
@@ -199,6 +209,7 @@ async fn connect_and_run(
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut agent = AcpAgent::from_str(acp_command)?;
+    info!(agent_id = %agent_id, command = %acp_command, "Connecting to ACP agent");
 
     // Forward agent stderr to the TUI so the user sees device-code URLs,
     // diagnostic messages, etc.
@@ -277,6 +288,7 @@ async fn connect_and_run(
 
                 // Authenticate if the agent requires it.
                 if !init_resp.auth_methods.is_empty() {
+                    info!(agent_id = %aid, methods = init_resp.auth_methods.len(), "Authentication required");
                     let method = &init_resp.auth_methods[0];
                     let _ = tx.send(AppEvent::AgentOutput {
                         agent_id: aid.clone(),
@@ -362,7 +374,11 @@ async fn connect_and_run(
                         .await;
 
                     match session_result {
-                        Ok(resp) => resp.session_id.to_string(),
+                        Ok(resp) => {
+                            let id = resp.session_id.to_string();
+                            info!(agent_id = %aid, session_id = %id, "New session created");
+                            id
+                        }
                         Err(err) => {
                             let msg = format!("{err}");
                             if msg.contains("Authentication required") || msg.contains("auth") {

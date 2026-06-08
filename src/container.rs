@@ -25,6 +25,7 @@ use devcontainer_lib::runtime::{
     self, BindMount, ContainerRuntime, ContainerState, PortMapping, WorkspaceMount,
 };
 use devcontainer_lib::util::{container_name, workspace_labels, workspace_folder_name};
+use tracing::{info, warn, error, debug};
 
 use crate::init;
 
@@ -47,6 +48,7 @@ pub struct ContainerInfo {
 
 /// Load a devcontainer.json file, merging the fleet-commander base layer if present.
 fn load_merged_config(config_path: &Path) -> Result<DevcontainerConfig, ContainerError> {
+    debug!(path = %config_path.display(), "Loading devcontainer config");
     let raw = std::fs::read_to_string(config_path)
         .map_err(|e| ContainerError::Parse(format!("Failed to read {}: {e}", config_path.display())))?;
     let mut project_json: serde_json::Value =
@@ -60,6 +62,12 @@ fn load_merged_config(config_path: &Path) -> Result<DevcontainerConfig, Containe
 
     let base_path = init::base_layer_path_for(workspace)
         .or_else(|| init::base_layer_path());
+
+    if let Some(ref base_path) = base_path {
+        debug!(layer = %base_path.display(), "Merging base layer");
+    } else {
+        debug!("No base layer found");
+    }
 
     if let Some(base_path) = base_path
         && let Ok(base_raw) = std::fs::read_to_string(&base_path)
@@ -77,13 +85,19 @@ fn load_merged_config(config_path: &Path) -> Result<DevcontainerConfig, Containe
 /// then builds/creates/starts the container using the Docker API (bollard).
 pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, ContainerError> {
     let workspace = &config.workspace_folder;
+    info!(workspace = %workspace.display(), "Starting container");
+
     let rt = runtime::detect_runtime(None)
         .await
-        .map_err(|e| ContainerError::Start(e.to_string()))?;
+        .map_err(|e| {
+            error!(error = %e, "Failed to detect container runtime");
+            ContainerError::Start(e.to_string())
+        })?;
 
     // Load devcontainer config, merging base layer if present.
     let config_path = workspace.join(".devcontainer/devcontainer.json");
     if !config_path.is_file() {
+        error!(path = %config_path.display(), "No devcontainer.json found");
         return Err(ContainerError::Parse(format!(
             "No .devcontainer/devcontainer.json found in {}",
             workspace.display()
@@ -94,14 +108,19 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
     // Check if a container already exists for this workspace.
     let labels_list = workspace_labels(workspace, Some(&config_path));
     let filters: Vec<String> = labels_list.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    debug!(filters = ?filters, "Searching for existing containers");
     let existing = rt.list_containers(&filters).await
         .map_err(|e| ContainerError::Start(e.to_string()))?;
 
+    info!(count = existing.len(), "Found existing containers");
+
     if let Some(container) = existing.first() {
+        info!(id = %container.id, state = ?container.state, "Found existing container");
         match container.state {
             ContainerState::Running => {
                 let remote_user = resolve_remote_user(rt.as_ref(), &container.image, &dc_config).await?;
                 let folder_name = workspace_folder_name(workspace);
+                info!(id = %container.id, "Reusing running container");
                 return Ok(ContainerInfo {
                     container_id: container.id.clone(),
                     workspace_folder: workspace.clone(),
@@ -112,6 +131,7 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
                 });
             }
             ContainerState::Stopped => {
+                info!(id = %container.id, "Starting stopped container");
                 rt.start_container(&container.id).await
                     .map_err(|e| ContainerError::Start(e.to_string()))?;
                 let remote_user = resolve_remote_user(rt.as_ref(), &container.image, &dc_config).await?;
@@ -125,19 +145,35 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
                     remote_user: remote_user.unwrap_or_else(|| "root".to_string()),
                 });
             }
-            ContainerState::NotFound => {}
+            ContainerState::NotFound => {
+                debug!("Container state is NotFound, proceeding to build");
+            }
         }
     }
 
     // No existing container — build image and create one.
+    info!("No existing container — building image");
     let image = resolve_image(rt.as_ref(), workspace, &dc_config, &config_path).await?;
     let name = container_name(workspace);
     let folder_name = workspace_folder_name(workspace);
+    info!(image = %image, name = %name, "Image ready");
 
     let remote_user = resolve_remote_user(rt.as_ref(), &image, &dc_config).await?;
+    debug!(remote_user = ?remote_user, "Resolved remote user");
 
     // Merge base credential layer into env/mounts.
     let (env, mounts) = build_env_and_mounts(workspace, &dc_config, remote_user.as_deref());
+    debug!(env_count = env.len(), mount_count = mounts.len(), "Built env and mounts");
+    for mount in &mounts {
+        debug!(source = %mount.source.display(), target = %mount.target, "Mount");
+        // Ensure bind mount source directories exist on the host.
+        if !mount.source.exists() {
+            info!(path = %mount.source.display(), "Creating bind mount source directory");
+            if let Err(e) = std::fs::create_dir_all(&mount.source) {
+                warn!(path = %mount.source.display(), error = %e, "Failed to create mount source dir");
+            }
+        }
+    }
 
     let mut labels = HashMap::new();
     for (k, v) in &labels_list {
@@ -171,9 +207,17 @@ pub async fn start_container(config: &ContainerConfig) -> Result<ContainerInfo, 
     };
 
     let container_id = rt.create_container(&container_config).await
-        .map_err(|e| ContainerError::Start(e.to_string()))?;
+        .map_err(|e| {
+            error!(error = %e, "Failed to create container");
+            ContainerError::Start(e.to_string())
+        })?;
+    info!(id = %container_id, "Container created");
     rt.start_container(&container_id).await
-        .map_err(|e| ContainerError::Start(e.to_string()))?;
+        .map_err(|e| {
+            error!(id = %container_id, error = %e, "Failed to start container");
+            ContainerError::Start(e.to_string())
+        })?;
+    info!(id = %container_id, "Container started");
 
     Ok(ContainerInfo {
         container_id,
@@ -194,9 +238,11 @@ async fn resolve_image(
     let features = resolve_features(config).unwrap_or_default();
     let has_features = !features.is_empty();
     let devcontainer_dir = config_path.parent().map(|p| p.to_path_buf());
+    debug!(has_features, feature_count = features.len(), "Resolving image");
 
     // 1. Pull or build the base image.
     let base_image = if let Some(ref image) = config.image {
+        info!(image = %image, "Pulling base image");
         rt.pull_image(image)
             .await
             .map_err(|e| ContainerError::Start(format!("Failed to pull image: {e}")))?;
@@ -207,6 +253,7 @@ async fn resolve_image(
             .unwrap()
             .join(build.context.as_deref().unwrap_or("."));
         let dockerfile_path = config_path.parent().unwrap().join(&build.dockerfile);
+        info!(dockerfile = %dockerfile_path.display(), context = %context_dir.display(), "Building base image");
         let dockerfile_content = std::fs::read_to_string(&dockerfile_path)
             .map_err(|e| ContainerError::Parse(format!("Failed to read Dockerfile: {e}")))?;
         let base_tag = if has_features {
@@ -347,6 +394,32 @@ fn parse_mount_string(s: &str) -> Option<BindMount> {
         target: target?,
         readonly,
     })
+}
+
+/// Stop and remove any existing container for the given workspace.
+///
+/// Used by the `:rebuild` command to force a fresh container start.
+pub async fn remove_workspace_container(workspace: &Path) -> Result<(), ContainerError> {
+    info!(workspace = %workspace.display(), "Removing container");
+    let rt = runtime::detect_runtime(None)
+        .await
+        .map_err(|e| ContainerError::Start(e.to_string()))?;
+
+    let config_path = workspace.join(".devcontainer/devcontainer.json");
+    let labels_list = workspace_labels(workspace, Some(&config_path));
+    let filters: Vec<String> = labels_list.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let existing = rt.list_containers(&filters).await
+        .map_err(|e| ContainerError::Start(e.to_string()))?;
+
+    for container in &existing {
+        info!(id = %container.id, state = ?container.state, "Removing container");
+        if container.state == ContainerState::Running {
+            let _ = rt.stop_container(&container.id).await;
+        }
+        let _ = rt.remove_container(&container.id).await;
+    }
+
+    Ok(())
 }
 
 /// Resolve a GitHub auth token from the host environment.

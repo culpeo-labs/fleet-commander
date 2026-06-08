@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, path::PathBuf, process::Stdio};
 use tokio::sync::mpsc;
+use tracing::{info, warn, error};
 
 mod agent;
 mod agent_kind;
@@ -47,7 +48,39 @@ async fn main() -> Result<()> {
     }
 
     // Default: launch TUI.
+    init_logging();
     run_tui().await
+}
+
+/// Initialize file-based logging via `tracing`.
+///
+/// Logs go to `~/.local/share/fleet-commander/fleet-commander.log`.
+/// The TUI owns stdout, so we never log there.
+fn init_logging() {
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+    let log_dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("fleet-commander");
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    let file_appender = tracing_appender::rolling::never(&log_dir, "fleet-commander.log");
+
+    tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_writer(file_appender)
+                .with_ansi(false)
+                .with_target(true)
+                .with_thread_ids(false),
+        )
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    info!("Fleet Commander starting");
 }
 
 async fn run_tui() -> Result<()> {
@@ -59,6 +92,7 @@ async fn run_tui() -> Result<()> {
 
     // Load persisted workspaces — no more hardcoded mock agents.
     let saved = workspace::load();
+    info!(count = saved.len(), "Loaded workspaces");
     let agents = workspace::to_agents(&saved);
 
     let mut app = App::new(config, agents, tx.clone());
@@ -78,9 +112,12 @@ async fn run_tui() -> Result<()> {
 fn load_config_or_default() -> Config {
     let path = PathBuf::from("config/default.toml");
     match Config::load(&path) {
-        Ok(cfg) => cfg,
+        Ok(cfg) => {
+            info!(path = %path.display(), "Loaded config");
+            cfg
+        }
         Err(err) => {
-            eprintln!("warning: falling back to default config: {err:#}");
+            warn!(path = %path.display(), error = %err, "Falling back to default config");
             Config::default()
         }
     }
@@ -188,15 +225,18 @@ fn run_auth_terminal(
 
     match status {
         Ok(s) if s.success() => {
+            info!("Auth command completed successfully");
             eprintln!("\n✓ Auth command completed successfully. Resuming...\n");
         }
         Ok(s) => {
+            let code = s.code().unwrap_or(-1);
+            warn!(exit_code = code, "Auth command exited with non-zero code");
             eprintln!(
-                "\n⚠ Auth command exited with code {}. Resuming...\n",
-                s.code().unwrap_or(-1)
+                "\n⚠ Auth command exited with code {code}. Resuming...\n",
             );
         }
         Err(e) => {
+            error!(error = %e, "Failed to run auth command");
             eprintln!("\n✗ Failed to run auth command: {e}. Resuming...\n");
         }
     }

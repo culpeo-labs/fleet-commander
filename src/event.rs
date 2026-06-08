@@ -74,4 +74,8 @@ pub enum AppEvent {
         agent_id: AgentId,
         command: Vec<String>,
     },
+    /// Request to reconnect an agent (e.g. after container rebuild).
+    ReconnectAgent {
+        agent_id: AgentId,
+    },
 }

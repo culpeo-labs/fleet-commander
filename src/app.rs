@@ -14,6 +14,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
+use tracing::{info, warn};
 
 use crate::agent::{Agent, AgentId, AgentStatus};
 use crate::agent_kind::AgentKind;
@@ -21,6 +22,7 @@ use crate::agent_runtime;
 use crate::change_source::ChangeEvent;
 use crate::completion::{PathCompleter, split_command_and_path};
 use crate::config::{Action, Config};
+use crate::container;
 use crate::event::AppEvent;
 use crate::init;
 use crate::workspace;
@@ -200,6 +202,10 @@ impl App {
                     agent.prompt_tx = None;
                 }
                 self.auth_pending = Some((agent_id, command));
+            }
+            AppEvent::ReconnectAgent { agent_id } => {
+                info!(agent_id = %agent_id, "Reconnecting agent after rebuild");
+                self.ensure_agent_connected(agent_id);
             }
         }
     }
@@ -424,6 +430,9 @@ impl App {
             "close" => {
                 self.close_current_workspace();
             }
+            "rebuild" => {
+                self.rebuild_current_container();
+            }
             "q" | "quit" => {
                 self.should_quit = true;
             }
@@ -498,6 +507,69 @@ impl App {
         }
 
         self.screen = Screen::AgentList { selected: 0 };
+    }
+
+    /// Rebuild the container for the currently viewed workspace agent.
+    ///
+    /// Stops and removes the existing container, regenerates the base layer,
+    /// clears session_id (a rebuild invalidates the session), then reconnects.
+    fn rebuild_current_container(&mut self) {
+        let agent_id = match &self.screen {
+            Screen::AgentSession { agent_id, .. } => agent_id.clone(),
+            _ => {
+                self.status_message = Some("No workspace open — use :rebuild from a session".into());
+                return;
+            }
+        };
+
+        let agent = match self.agents.iter_mut().find(|a| a.id == agent_id) {
+            Some(a) => a,
+            None => return,
+        };
+
+        let workspace = match &agent.workspace_folder {
+            Some(ws) => ws.clone(),
+            None => {
+                self.status_message = Some("Agent has no workspace — :rebuild needs a container agent".into());
+                return;
+            }
+        };
+
+        info!(agent_id = %agent_id, workspace = %workspace.display(), "Rebuilding container");
+
+        // Drop existing connection.
+        agent.prompt_tx = None;
+        agent.status = AgentStatus::Stopped;
+        agent.session_id = None;
+        agent.history.push("🔄 Rebuilding container...".into());
+
+        // Regenerate base layer with latest mount config.
+        if let Err(err) = init::generate_workspace_layer(&workspace, AgentKind::Copilot) {
+            warn!(error = %err, "Failed to regenerate workspace layer");
+            self.status_message = Some(format!("Layer warning: {err}"));
+        }
+
+        // Stop + remove the container asynchronously, then reconnect.
+        let tx = self.tx.clone();
+        let aid = agent_id;
+        tokio::spawn(async move {
+            if let Err(err) = container::remove_workspace_container(&workspace).await {
+                let _ = tx.send(AppEvent::AgentOutput {
+                    agent_id: aid.clone(),
+                    line: format!("[warn] Failed to remove container: {err}"),
+                });
+            }
+            let _ = tx.send(AppEvent::AgentOutput {
+                agent_id: aid.clone(),
+                line: "Container removed. Reconnecting...".into(),
+            });
+            let _ = tx.send(AppEvent::ReconnectAgent { agent_id: aid });
+        });
+
+        // Persist the cleared session_id.
+        if let Err(err) = workspace::save(&workspace::from_agents(&self.agents)) {
+            self.status_message = Some(format!("Warning: {err}"));
+        }
     }
 }
 
