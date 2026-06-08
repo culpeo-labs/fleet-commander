@@ -215,6 +215,17 @@ pub fn generate_workspace_layer(workspace: &Path, agent_kind: AgentKind) -> Resu
         base.insert("postStartCommand".to_string(), serde_json::Value::String(cmd));
     }
 
+    // Add required features (e.g. copilot-cli) so the agent binary is
+    // available regardless of the project's own feature list.
+    let features = agent_kind.required_features();
+    if !features.is_empty() {
+        let mut feature_map = serde_json::Map::new();
+        for (id, opts) in features {
+            feature_map.insert(id.to_string(), opts);
+        }
+        base.insert("features".to_string(), serde_json::Value::Object(feature_map));
+    }
+
     let json = serde_json::to_string_pretty(&base)?;
     std::fs::write(&layer_path, &json)?;
 

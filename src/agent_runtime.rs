@@ -52,11 +52,6 @@ pub fn start_agent(
 
         // If workspace_folder is set, start the dev container first.
         let (effective_command, session_cwd, container_info) = if let Some(ref ws) = workspace_folder {
-            let _ = event_tx.send(AppEvent::AgentOutput {
-                agent_id: agent_id.clone(),
-                line: format!("Starting container for {}...", ws.display()),
-            });
-
             let config = ContainerConfig {
                 workspace_folder: ws.clone(),
             };

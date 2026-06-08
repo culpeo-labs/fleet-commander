@@ -68,6 +68,18 @@ impl AgentKind {
             ),
         }
     }
+
+    /// Devcontainer features required by this agent.
+    ///
+    /// These are merged into the base layer so the agent binary is available
+    /// inside the container regardless of the project's own feature list.
+    pub fn required_features(self) -> Vec<(&'static str, serde_json::Value)> {
+        match self {
+            AgentKind::Copilot => vec![
+                ("ghcr.io/devcontainers/features/copilot-cli:1", serde_json::json!({})),
+            ],
+        }
+    }
 }
 
 impl std::fmt::Display for AgentKind {
