@@ -231,6 +231,10 @@ impl App {
                     agent.history.push("🔑 Authentication required — launching login flow...".into());
                     agent.status = AgentStatus::Stopped;
                     agent.prompt_tx = None;
+                    // The runtime task already returned after sending this
+                    // event; clear its handle so ensure_agent_connected can
+                    // spawn a fresh task after login completes.
+                    agent.task_handle = None;
                 }
                 self.auth_pending = Some((agent_id, command));
             }
@@ -415,6 +419,14 @@ impl App {
         let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) else {
             return;
         };
+        // A task that already finished should not block a reconnect. This
+        // can happen when the previous run exited cleanly (e.g. AuthRequired)
+        // without the cleanup path clearing the handle.
+        if let Some(handle) = &agent.task_handle {
+            if handle.is_finished() {
+                agent.task_handle = None;
+            }
+        }
         if agent.prompt_tx.is_some() || agent.task_handle.is_some() {
             return; // Already connected or connecting.
         }
