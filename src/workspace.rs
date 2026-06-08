@@ -201,4 +201,47 @@ mod tests {
         let entries = load_from(Path::new("/nonexistent/workspaces.yaml"));
         assert!(entries.is_empty());
     }
+
+    #[test]
+    fn workspace_state_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.yaml");
+
+        let state = WorkspaceState {
+            session_id: Some("sess_abc123".into()),
+        };
+        let yaml = serde_yaml::to_string(&state).unwrap();
+        std::fs::write(&state_path, &yaml).unwrap();
+
+        let loaded: WorkspaceState =
+            serde_yaml::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert_eq!(loaded.session_id, Some("sess_abc123".into()));
+    }
+
+    #[test]
+    fn workspace_state_defaults_when_missing() {
+        let state = WorkspaceState::default();
+        assert_eq!(state.session_id, None);
+    }
+
+    #[test]
+    fn workspace_state_skips_none_in_yaml() {
+        let state = WorkspaceState { session_id: None };
+        let yaml = serde_yaml::to_string(&state).unwrap();
+        assert!(!yaml.contains("session_id"));
+    }
+
+    #[test]
+    fn from_agents_does_not_include_session_id() {
+        let mut agent = Agent::new("ws", "WS")
+            .with_acp_command("copilot --acp --stdio")
+            .with_workspace("/repo");
+        agent.session_id = Some("sess_xyz".into());
+
+        let entries = from_agents(&[agent]);
+        assert_eq!(entries.len(), 1);
+        // WorkspaceEntry no longer has session_id — it's in state.yaml
+        let yaml = serde_yaml::to_string(&entries[0]).unwrap();
+        assert!(!yaml.contains("session_id"));
+    }
 }
