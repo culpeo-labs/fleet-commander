@@ -123,6 +123,7 @@ impl App {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.status = AgentStatus::Stopped;
                     agent.prompt_tx = None;
+                    agent.task_handle = None;
                 }
             }
             AppEvent::McpShowDiff {
@@ -338,13 +339,13 @@ impl App {
         let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) else {
             return;
         };
-        if agent.prompt_tx.is_some() {
-            return; // Already connected.
+        if agent.prompt_tx.is_some() || agent.task_handle.is_some() {
+            return; // Already connected or connecting.
         }
         if agent.acp_command.is_empty() {
             return; // No command configured.
         }
-        let prompt_tx = agent_runtime::start_agent(
+        let (prompt_tx, abort_handle) = agent_runtime::start_agent(
             agent.id.clone(),
             agent.effective_acp_command(),
             agent.workspace_folder.clone(),
@@ -352,6 +353,7 @@ impl App {
             self.tx.clone(),
         );
         agent.prompt_tx = Some(prompt_tx);
+        agent.task_handle = Some(abort_handle);
         agent.status = AgentStatus::Running;
         let label = match &agent.workspace_folder {
             Some(ws) => format!("Starting container ({})...", ws.display()),
@@ -537,6 +539,10 @@ impl App {
 
         info!(agent_id = %agent_id, workspace = %workspace.display(), "Rebuilding container");
 
+        // Abort the existing agent task so it doesn't compete with the new one.
+        if let Some(handle) = agent.task_handle.take() {
+            handle.abort();
+        }
         // Drop existing connection.
         agent.prompt_tx = None;
         agent.status = AgentStatus::Stopped;

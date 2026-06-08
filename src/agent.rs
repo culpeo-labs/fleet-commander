@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 
 pub type AgentId = String;
 
@@ -46,6 +47,9 @@ pub struct Agent {
     /// Channel for sending prompts to the persistent ACP connection.
     /// `None` until the connection is established.
     pub prompt_tx: Option<mpsc::UnboundedSender<String>>,
+    /// Handle to abort the agent's background task (container start + ACP loop).
+    /// Used by `:rebuild` to cancel the old task before starting a new one.
+    pub task_handle: Option<AbortHandle>,
     /// ACP session ID — persisted across reconnections for session resume.
     pub session_id: Option<String>,
 }
@@ -62,6 +66,7 @@ impl Agent {
             pending_response: String::new(),
             pending_thought: String::new(),
             prompt_tx: None,
+            task_handle: None,
             session_id: None,
         }
     }

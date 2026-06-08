@@ -246,6 +246,7 @@ async fn resolve_image(
         rt.pull_image(image)
             .await
             .map_err(|e| ContainerError::Start(format!("Failed to pull image: {e}")))?;
+        info!(image = %image, "Base image pull complete");
         image.clone()
     } else if let Some(ref build) = config.build {
         let context_dir = config_path
@@ -279,10 +280,12 @@ async fn resolve_image(
     };
 
     if !has_features {
+        info!(image = %base_image, "No features, using base image directly");
         return Ok(base_image);
     }
 
     // 2. Download and stage features.
+    info!(count = features.len(), "Downloading features");
     let mut features = features;
     download_features(&mut features, devcontainer_dir.as_deref())
         .await
@@ -304,6 +307,7 @@ async fn resolve_image(
         config,
     );
     let final_tag = format!("{folder_image}-features");
+    info!(tag = %final_tag, "Building feature layer image");
     let result = rt
         .build_image(
             &dockerfile,
@@ -316,6 +320,7 @@ async fn resolve_image(
         .await;
     let _ = std::fs::remove_dir_all(&staging_dir);
     result.map_err(|e| ContainerError::Start(format!("Feature image build failed: {e}")))?;
+    info!(tag = %final_tag, "Feature image ready");
 
     Ok(final_tag)
 }

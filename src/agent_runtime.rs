@@ -39,10 +39,10 @@ pub fn start_agent(
     workspace_folder: Option<PathBuf>,
     previous_session_id: Option<String>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
-) -> mpsc::UnboundedSender<String> {
+) -> (mpsc::UnboundedSender<String>, tokio::task::AbortHandle) {
     let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<String>();
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         info!(agent_id = %agent_id, command = %acp_command, workspace = ?workspace_folder, "Starting agent");
         // Resolve a host GitHub token for headless auth.
         // The copilot CLI in --acp mode expects to already be authenticated;
@@ -142,7 +142,7 @@ pub fn start_agent(
         });
     });
 
-    prompt_tx
+    (prompt_tx, handle.abort_handle())
 }
 
 /// Send a prompt through an existing agent connection.
