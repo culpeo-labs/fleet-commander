@@ -242,11 +242,17 @@ async fn resolve_image(
 
     // 1. Pull or build the base image.
     let base_image = if let Some(ref image) = config.image {
-        info!(image = %image, "Pulling base image");
-        rt.pull_image(image)
-            .await
-            .map_err(|e| ContainerError::Start(format!("Failed to pull image: {e}")))?;
-        info!(image = %image, "Base image pull complete");
+        info!(image = %image, "Resolving base image");
+        let cached = rt.image_exists(image).await.unwrap_or(false);
+        if cached {
+            info!(image = %image, "Base image found locally, skipping pull");
+        } else {
+            info!(image = %image, "Pulling base image");
+            rt.pull_image(image)
+                .await
+                .map_err(|e| ContainerError::Start(format!("Failed to pull image: {e}")))?;
+            info!(image = %image, "Base image pull complete");
+        }
         image.clone()
     } else if let Some(ref build) = config.build {
         let context_dir = config_path
