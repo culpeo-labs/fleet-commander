@@ -97,13 +97,13 @@ async fn run_tui() -> Result<()> {
 
     let mut app = App::new(config, agents, tx.clone());
 
-    let _input_task = spawn_input_task(tx.clone());
+    let mut input_task = spawn_input_task(tx.clone());
     let _change_handle = start_default_change_source(tx.clone())?;
 
     let mcp_addr = "127.0.0.1:6100";
     let _mcp_handle = mcp_server::start_mcp_server(mcp_addr, tx.clone()).await?;
 
-    let result = run(&mut terminal, &mut app, &mut rx).await;
+    let result = run(&mut terminal, &mut app, &mut rx, &mut input_task, &tx).await;
 
     // Teardown TUI first so shutdown messages go to the normal terminal.
     teardown_terminal(&mut terminal)?;
@@ -229,6 +229,8 @@ async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+    input_task: &mut tokio::task::JoinHandle<()>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
 ) -> Result<()> {
     terminal.draw(|f| ui::render(f, app))?;
     while let Some(event) = rx.recv().await {
@@ -238,7 +240,7 @@ async fn run(
         }
         // If auth is needed, suspend the TUI and run the login command interactively.
         if let Some((agent_id, command)) = app.auth_pending.take() {
-            run_auth_terminal(terminal, &command)?;
+            run_auth_terminal(terminal, &command, input_task, tx, rx).await?;
             // After auth completes, reconnect the agent.
             app.ensure_agent_connected(agent_id);
         }
@@ -249,13 +251,26 @@ async fn run(
 
 /// Suspend the TUI and run an auth command with full interactive I/O.
 ///
-/// Leaves the alternate screen, disables raw mode, spawns the command with
-/// inherited stdin/stdout/stderr so the user can complete the login flow,
-/// then restores the TUI.
-fn run_auth_terminal(
+/// Leaves the alternate screen, disables raw mode, aborts the crossterm
+/// `EventStream` so it stops consuming stdin (otherwise the spawned child
+/// would compete with the TUI for keystrokes and terminal response bytes —
+/// causing errors like "The cursor position could not be read within a
+/// normal duration"), spawns the command with inherited stdin/stdout/stderr
+/// so the user can complete the login flow, then restores the TUI and
+/// respawns the input task.
+async fn run_auth_terminal(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     command: &[String],
+    input_task: &mut tokio::task::JoinHandle<()>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+    rx: &mut mpsc::UnboundedReceiver<AppEvent>,
 ) -> Result<()> {
+    // Stop the input task so its `EventStream` releases stdin. Wait for the
+    // task to fully finish so the underlying crossterm reader thread is no
+    // longer polling stdin before we hand it to the child process.
+    input_task.abort();
+    let _ = (&mut *input_task).await;
+
     // Leave TUI mode so the user gets a normal terminal.
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)?;
@@ -291,12 +306,20 @@ fn run_auth_terminal(
     }
 
     // Brief pause so the user can see the status.
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // Restore TUI mode.
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen, cursor::Hide)?;
     terminal.clear()?;
+
+    // Drain any stray input events that may have arrived during the auth
+    // flow (e.g. terminal response bytes the child didn't consume) so they
+    // don't get interpreted as keystrokes in the TUI.
+    while rx.try_recv().is_ok() {}
+
+    // Respawn the input task so the TUI receives keystrokes again.
+    *input_task = spawn_input_task(tx.clone());
 
     Ok(())
 }
