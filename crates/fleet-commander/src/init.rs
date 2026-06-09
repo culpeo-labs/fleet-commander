@@ -80,8 +80,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         println!("  ✓ {name}");
     }
 
-    workspace::save(&workspace::from_agents(&agents))
-        .map_err(|e| anyhow::anyhow!(e))?;
+    workspace::save(&workspace::from_agents(&agents)).map_err(|e| anyhow::anyhow!(e))?;
     println!();
     println!("Workspace initialized with {} project(s).", selected.len());
     println!("Run `fleet-commander` to launch the TUI.");
@@ -123,7 +122,9 @@ fn scan_projects(root: &Path) -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir()
-                && !path.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'))
+                && !path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with('.'))
                 && path.join(".devcontainer/devcontainer.json").is_file()
             {
                 projects.push(path);
@@ -137,7 +138,10 @@ fn scan_projects(root: &Path) -> Vec<PathBuf> {
 
 /// Ask the user to confirm each discovered project.
 fn confirm_projects(projects: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    println!("Found {} project(s) with devcontainer configs:", projects.len());
+    println!(
+        "Found {} project(s) with devcontainer configs:",
+        projects.len()
+    );
     println!();
 
     let mut selected = Vec::new();
@@ -214,7 +218,10 @@ pub fn generate_workspace_layer(workspace: &Path, agent_kind: AgentKind) -> Resu
 
     // Add postStartCommand for ownership fixups.
     if let Some(cmd) = agent_kind.post_start_command() {
-        base.insert("postStartCommand".to_string(), serde_json::Value::String(cmd));
+        base.insert(
+            "postStartCommand".to_string(),
+            serde_json::Value::String(cmd),
+        );
     }
 
     // Add required features (e.g. copilot-cli) so the agent binary is
@@ -225,7 +232,10 @@ pub fn generate_workspace_layer(workspace: &Path, agent_kind: AgentKind) -> Resu
         for (id, opts) in features {
             feature_map.insert(id.to_string(), opts);
         }
-        base.insert("features".to_string(), serde_json::Value::Object(feature_map));
+        base.insert(
+            "features".to_string(),
+            serde_json::Value::Object(feature_map),
+        );
     }
 
     let json = serde_json::to_string_pretty(&base)?;

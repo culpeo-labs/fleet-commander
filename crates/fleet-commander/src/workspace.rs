@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 use crate::agent::Agent;
 
@@ -93,8 +93,7 @@ pub fn load_state(workspace: &std::path::Path) -> WorkspaceState {
 pub fn save_state(workspace: &std::path::Path, state: &WorkspaceState) -> Result<(), String> {
     let data_dir = fleet_commander_core::base_layer::workspace_data_dir(workspace)
         .ok_or("Could not determine data directory")?;
-    std::fs::create_dir_all(&data_dir)
-        .map_err(|e| format!("Failed to create data dir: {e}"))?;
+    std::fs::create_dir_all(&data_dir).map_err(|e| format!("Failed to create data dir: {e}"))?;
     let state_path = data_dir.join("state.yaml");
     info!(
         path = %state_path.display(),

@@ -60,7 +60,10 @@ pub enum ToolCallStatusKind {
 
 impl ToolCallStatusKind {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, ToolCallStatusKind::Completed | ToolCallStatusKind::Failed)
+        matches!(
+            self,
+            ToolCallStatusKind::Completed | ToolCallStatusKind::Failed
+        )
     }
 }
 
@@ -108,20 +111,14 @@ pub enum SessionEvent {
     },
     /// A new tool call has been registered. Status updates flow through
     /// `call.status`; rename events through `call.title`.
-    ToolCall {
-        agent_id: AgentId,
-        call: ToolCall,
-    },
+    ToolCall { agent_id: AgentId, call: ToolCall },
     /// A new assistant message has begun streaming.
     AssistantMessage {
         agent_id: AgentId,
         message: AssistantMessage,
     },
     /// A new "agent thought" has begun streaming.
-    Thought {
-        agent_id: AgentId,
-        thought: Thought,
-    },
+    Thought { agent_id: AgentId, thought: Thought },
     /// A replayed user message has begun streaming (only during session
     /// load/resume — live user input is sent by the consumer via
     /// [`crate::agent_runtime::send_message`] and not echoed back as an
@@ -132,10 +129,7 @@ pub enum SessionEvent {
     },
     /// Runtime status/log line: container progress, stderr, etc. Not part
     /// of the model's conversation.
-    Output {
-        agent_id: AgentId,
-        line: String,
-    },
+    Output { agent_id: AgentId, line: String },
     /// The agent needs interactive authentication (e.g. `copilot login`).
     /// The consumer should suspend its UI and run the command interactively.
     AuthRequired {
@@ -152,10 +146,7 @@ pub enum SessionEvent {
         reply: PermissionReply,
     },
     /// A session-level error from the runtime.
-    Error {
-        agent_id: AgentId,
-        message: String,
-    },
+    Error { agent_id: AgentId, message: String },
     /// The agent process exited.
     Exited {
         agent_id: AgentId,

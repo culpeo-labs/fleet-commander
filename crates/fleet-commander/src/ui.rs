@@ -637,10 +637,7 @@ mod tests {
         )
     }
 
-    fn thought(
-        initial: &str,
-        status: MessageStatus,
-    ) -> HistoryEntry {
+    fn thought(initial: &str, status: MessageStatus) -> HistoryEntry {
         let (_text_tx, text_rx) = watch::channel(initial.to_string());
         let (_status_tx, status_rx) = watch::channel(status);
         // Leak the senders so the receivers keep yielding the initial value
@@ -831,8 +828,7 @@ mod tests {
 
     #[test]
     fn failed_tool_call_uses_cross_marker() {
-        let (entry, _title_tx, _status_tx) =
-            tool("call_2", "shell", ToolCallStatusKind::Failed);
+        let (entry, _title_tx, _status_tx) = tool("call_2", "shell", ToolCallStatusKind::Failed);
         // Keep the senders alive for the duration of the render.
         Box::leak(Box::new((_title_tx, _status_tx)));
         let app = app_in_session_with(vec![entry]);
@@ -842,8 +838,7 @@ mod tests {
 
     #[test]
     fn empty_tool_title_falls_back_to_placeholder() {
-        let (entry, _title_tx, _status_tx) =
-            tool("call_3", "", ToolCallStatusKind::InProgress);
+        let (entry, _title_tx, _status_tx) = tool("call_3", "", ToolCallStatusKind::InProgress);
         Box::leak(Box::new((_title_tx, _status_tx)));
         let app = app_in_session_with(vec![entry]);
         let text = render_to_string(&app, 60, 12);
@@ -856,8 +851,7 @@ mod tests {
             assistant("", MessageStatus::Streaming);
         assistant_text.send("All done.".to_string()).unwrap();
         assistant_status.send(MessageStatus::Completed).unwrap();
-        let (tool_entry, _tt, _ts) =
-            tool("t1", "list_files", ToolCallStatusKind::Completed);
+        let (tool_entry, _tt, _ts) = tool("t1", "list_files", ToolCallStatusKind::Completed);
         Box::leak(Box::new((_tt, _ts)));
 
         let app = app_in_session_with(vec![
@@ -888,10 +882,7 @@ mod tests {
 
     /// Render with an explicit `scroll` value (instead of `usize::MAX`).
     fn render_with_scroll(app: &mut App, scroll: usize, cols: u16, rows: u16) -> String {
-        if let Screen::AgentSession {
-            scroll: s, ..
-        } = &mut app.screen
-        {
+        if let Screen::AgentSession { scroll: s, .. } = &mut app.screen {
             *s = scroll;
         }
         render_to_string(app, cols, rows)
@@ -904,7 +895,10 @@ mod tests {
         // usize::MAX => follow bottom.
         let text = render_with_scroll(&mut app, usize::MAX, 60, 16);
         // The latest entries should be visible.
-        assert!(text.contains("line 49"), "expected last entry, got:\n{text}");
+        assert!(
+            text.contains("line 49"),
+            "expected last entry, got:\n{text}"
+        );
         assert!(text.contains("line 48"));
         // The earliest must have scrolled out of view.
         assert!(
@@ -917,7 +911,10 @@ mod tests {
     fn scroll_at_zero_shows_oldest_entries() {
         let mut app = app_in_session_with(many_info_entries(50));
         let text = render_with_scroll(&mut app, 0, 60, 16);
-        assert!(text.contains("line 0"), "expected first entry, got:\n{text}");
+        assert!(
+            text.contains("line 0"),
+            "expected first entry, got:\n{text}"
+        );
         assert!(text.contains("line 1"));
         // Last lines are clearly off-screen for a 50-entry buffer with a
         // viewport of ~10 lines.

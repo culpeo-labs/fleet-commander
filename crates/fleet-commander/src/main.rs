@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, path::PathBuf, process::Stdio};
 use tokio::sync::mpsc;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use fleet_commander_core::container;
 use fleet_commander_core::session::SessionEvent;
@@ -75,19 +75,13 @@ fn init_logging() {
                 .with_target(true)
                 .with_thread_ids(false),
         )
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
     info!("Fleet Commander starting");
 }
 
-async fn run_tui(
-    acp_log_path: Option<PathBuf>,
-    acp_log_filter: Option<String>,
-) -> Result<()> {
+async fn run_tui(acp_log_path: Option<PathBuf>, acp_log_filter: Option<String>) -> Result<()> {
     let config = load_config_or_default();
     install_panic_hook();
     let mut terminal = setup_terminal()?;
@@ -106,7 +100,14 @@ async fn run_tui(
         info!(pattern = %pattern, "ACP log filter active");
     }
 
-    let mut app = App::with_acp_log(config, agents, tx.clone(), runtime_tx, acp_log, acp_log_filter);
+    let mut app = App::with_acp_log(
+        config,
+        agents,
+        tx.clone(),
+        runtime_tx,
+        acp_log,
+        acp_log_filter,
+    );
 
     let mut input_task = spawn_input_task(tx.clone());
     let _change_handle = start_default_change_source(tx.clone())?;
@@ -154,9 +155,7 @@ async fn shutdown_agents(app: &mut App) {
     let futures: Vec<_> = workspaces
         .into_iter()
         .map(|ws| async move {
-            let name = ws.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown");
+            let name = ws.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
             if let Err(e) = container::stop_workspace_container(&ws).await {
                 warn!(workspace = %ws.display(), error = %e, "Failed to stop container");
                 eprintln!("  ⚠ {name}: failed to stop ({e})");
@@ -186,12 +185,14 @@ fn load_config_or_default() -> Config {
 /// Open the ACP wire-log file in append mode if a path was supplied via
 /// `--acp-log`. Returns a shared, lockable handle so every agent task writes
 /// into the same file without interleaving lines.
-fn open_acp_log(path: Option<&std::path::Path>) -> Result<Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>> {
+fn open_acp_log(
+    path: Option<&std::path::Path>,
+) -> Result<Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>> {
     let Some(path) = path else { return Ok(None) };
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -340,9 +341,7 @@ async fn run_auth_terminal(
         Ok(s) => {
             let code = s.code().unwrap_or(-1);
             warn!(exit_code = code, "Auth command exited with non-zero code");
-            eprintln!(
-                "\n⚠ Auth command exited with code {code}. Resuming...\n",
-            );
+            eprintln!("\n⚠ Auth command exited with code {code}. Resuming...\n",);
         }
         Err(e) => {
             error!(error = %e, "Failed to run auth command");

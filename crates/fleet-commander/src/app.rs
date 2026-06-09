@@ -286,12 +286,7 @@ impl App {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.history.push(HistoryEntry::Tool(call.clone()));
                 }
-                spawn_tool_tracker(
-                    agent_id.clone(),
-                    call.title,
-                    call.status,
-                    self.tx.clone(),
-                );
+                spawn_tool_tracker(agent_id.clone(), call.title, call.status, self.tx.clone());
             }
         }
     }
@@ -311,18 +306,18 @@ impl App {
                         .iter()
                         .find(|(_, _, kind)| kind.starts_with("allow"))
                         .map(|(id, _, _)| id.clone());
-                    if let Ok(mut guard) = perm.reply.lock() {
-                        if let Some(tx) = guard.take() {
-                            let _ = tx.send(allow_id);
-                        }
+                    if let Ok(mut guard) = perm.reply.lock()
+                        && let Some(tx) = guard.take()
+                    {
+                        let _ = tx.send(allow_id);
                     }
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     let perm = self.permission_pending.take().unwrap();
-                    if let Ok(mut guard) = perm.reply.lock() {
-                        if let Some(tx) = guard.take() {
-                            let _ = tx.send(None);
-                        }
+                    if let Ok(mut guard) = perm.reply.lock()
+                        && let Some(tx) = guard.take()
+                    {
+                        let _ = tx.send(None);
                     }
                 }
                 _ => {}
@@ -459,10 +454,10 @@ impl App {
         // A task that already finished should not block a reconnect. This
         // can happen when the previous run exited cleanly (e.g. AuthRequired)
         // without the cleanup path clearing the handle.
-        if let Some(handle) = &agent.task_handle {
-            if handle.is_finished() {
-                agent.task_handle = None;
-            }
+        if let Some(handle) = &agent.task_handle
+            && handle.is_finished()
+        {
+            agent.task_handle = None;
         }
         if agent.prompt_tx.is_some() || agent.task_handle.is_some() {
             return; // Already connected or connecting.
@@ -657,7 +652,8 @@ impl App {
         let agent_id = match &self.screen {
             Screen::AgentSession { agent_id, .. } => agent_id.clone(),
             _ => {
-                self.status_message = Some("No workspace open — use :rebuild from a session".into());
+                self.status_message =
+                    Some("No workspace open — use :rebuild from a session".into());
                 return;
             }
         };
@@ -670,7 +666,8 @@ impl App {
         let workspace = match &agent.workspace_folder {
             Some(ws) => ws.clone(),
             None => {
-                self.status_message = Some("Agent has no workspace — :rebuild needs a container agent".into());
+                self.status_message =
+                    Some("Agent has no workspace — :rebuild needs a container agent".into());
                 return;
             }
         };
@@ -743,7 +740,9 @@ fn spawn_text_tracker(
                     }
                 }
             }
-            let _ = tx.send(AppEvent::Repaint { agent_id: agent_id.clone() });
+            let _ = tx.send(AppEvent::Repaint {
+                agent_id: agent_id.clone(),
+            });
             if status.borrow().is_terminal() {
                 break;
             }
@@ -775,7 +774,9 @@ fn spawn_tool_tracker(
                     }
                 }
             }
-            let _ = tx.send(AppEvent::Repaint { agent_id: agent_id.clone() });
+            let _ = tx.send(AppEvent::Repaint {
+                agent_id: agent_id.clone(),
+            });
             if status.borrow().is_terminal() {
                 break;
             }

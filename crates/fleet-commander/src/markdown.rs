@@ -142,10 +142,8 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
                     for (i, part) in parts.iter().enumerate() {
                         if blockquote_depth > 0 && (i > 0 || current_spans.is_empty()) {
                             let prefix = "│ ".repeat(blockquote_depth);
-                            current_spans.push(Span::styled(
-                                prefix,
-                                Style::default().fg(Color::DarkGray),
-                            ));
+                            current_spans
+                                .push(Span::styled(prefix, Style::default().fg(Color::DarkGray)));
                         }
                         if !part.is_empty() {
                             current_spans.push(Span::styled(part.to_string(), style));
@@ -183,16 +181,16 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
     flush_line(&mut current_spans, &mut lines);
 
     // Remove trailing empty lines.
-    while lines.last().is_some_and(|l| l.spans.is_empty() || l.to_string().is_empty()) {
+    while lines
+        .last()
+        .is_some_and(|l| l.spans.is_empty() || l.to_string().is_empty())
+    {
         lines.pop();
     }
 
     // If rendering produced nothing meaningful, treat as plain text.
     if lines.is_empty() && !text.is_empty() {
-        return text
-            .lines()
-            .map(|l| Line::from(l.to_string()))
-            .collect();
+        return text.lines().map(|l| Line::from(l.to_string())).collect();
     }
 
     lines
@@ -235,10 +233,8 @@ fn render_code_block(lang: &str, code: &str, lines: &mut Vec<Line<'static>>) {
     let mut highlighter = HighlightLines::new(syntax, theme);
 
     for line in code.lines() {
-        let mut spans: Vec<Span<'static>> = vec![Span::styled(
-            "│ ",
-            Style::default().fg(Color::DarkGray),
-        )];
+        let mut spans: Vec<Span<'static>> =
+            vec![Span::styled("│ ", Style::default().fg(Color::DarkGray))];
         let ranges = highlighter
             .highlight_line(line, &SYNTAX_SET)
             .unwrap_or_default();
@@ -290,14 +286,22 @@ mod tests {
     fn plain_text_passthrough() {
         let lines = render_markdown("Hello world");
         assert!(!lines.is_empty());
-        let text: String = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        let text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("Hello world"));
     }
 
     #[test]
     fn heading_renders_with_marker() {
         let lines = render_markdown("# Title\n\nBody text");
-        let text: String = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        let text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("# Title"));
         assert!(text.contains("Body text"));
     }
@@ -306,7 +310,11 @@ mod tests {
     fn code_block_renders_with_border() {
         let input = "```rust\nfn main() {}\n```";
         let lines = render_markdown(input);
-        let text: String = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        let text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("rust"));
         assert!(text.contains("fn main()"));
         assert!(text.contains("│"));
@@ -315,7 +323,11 @@ mod tests {
     #[test]
     fn list_renders_bullets() {
         let lines = render_markdown("- one\n- two\n- three");
-        let text: String = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        let text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("•"));
         assert!(text.contains("one"));
         assert!(text.contains("three"));
@@ -324,7 +336,11 @@ mod tests {
     #[test]
     fn inline_code_renders() {
         let lines = render_markdown("Use `foo()` here");
-        let text: String = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        let text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("`foo()`"));
     }
 

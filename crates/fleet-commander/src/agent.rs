@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
-pub use fleet_commander_core::session::{AgentId, AssistantMessage, Thought, ToolCall, UserMessage};
+pub use fleet_commander_core::session::{
+    AgentId, AssistantMessage, Thought, ToolCall, UserMessage,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentStatus {
