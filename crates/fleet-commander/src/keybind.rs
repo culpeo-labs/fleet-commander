@@ -19,7 +19,7 @@ pub struct Binding {
 }
 
 impl Binding {
-    #[allow(dead_code)] // helpful constructor for tests and future callers.
+    #[cfg(test)]
     pub fn new(code: KeyCode, mods: KeyModifiers) -> Self {
         Self { code, mods }
     }

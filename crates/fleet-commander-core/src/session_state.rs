@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use tokio::sync::{mpsc, watch};
 
 use crate::session::{
-    AgentId, AssistantMessage, MessageStatus, SessionEvent, Thought, ToolCall,
-    ToolCallStatusKind, UserMessage,
+    AgentId, AssistantMessage, MessageStatus, SessionEvent, Thought, ToolCall, ToolCallStatusKind,
+    UserMessage,
 };
 
 struct AssistantSenders {
@@ -56,10 +56,7 @@ pub(crate) struct SessionStateMachine {
 }
 
 impl SessionStateMachine {
-    pub fn new(
-        agent_id: AgentId,
-        event_tx: mpsc::UnboundedSender<SessionEvent>,
-    ) -> Self {
+    pub fn new(agent_id: AgentId, event_tx: mpsc::UnboundedSender<SessionEvent>) -> Self {
         Self {
             agent_id,
             event_tx,
@@ -286,7 +283,9 @@ mod tests {
         let (mut sm, mut rx) = fixture();
         sm.assistant_chunk("answer");
         let assistant_event = rx.recv().await.unwrap();
-        let SessionEvent::AssistantMessage { message: assistant, .. } = assistant_event
+        let SessionEvent::AssistantMessage {
+            message: assistant, ..
+        } = assistant_event
         else {
             panic!()
         };
@@ -301,7 +300,9 @@ mod tests {
         let (mut sm, mut rx) = fixture();
         sm.assistant_chunk("the answer is ");
         let assistant_event = rx.recv().await.unwrap();
-        let SessionEvent::AssistantMessage { message: assistant, .. } = assistant_event
+        let SessionEvent::AssistantMessage {
+            message: assistant, ..
+        } = assistant_event
         else {
             panic!()
         };

@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
-pub use fleet_commander_core::session::{AgentId, AssistantMessage, Thought, ToolCall, UserMessage};
+pub use fleet_commander_core::session::{
+    AgentId, AssistantMessage, Thought, ToolCall, UserMessage,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -37,7 +39,6 @@ impl AgentStatus {
 /// the other variants carry live handles whose state updates in place
 /// through `watch` channels.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum HistoryEntry {
     /// Informational line authored by the TUI (e.g. "ACP session connected").
     Info(String),
@@ -106,7 +107,6 @@ impl Agent {
         self
     }
 
-    #[allow(dead_code)] // Used when configuring agents with dev containers.
     pub fn with_workspace(mut self, path: impl Into<PathBuf>) -> Self {
         self.workspace_folder = Some(path.into());
         self

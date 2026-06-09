@@ -8,7 +8,7 @@
 //! via `devcontainer up`, and the ACP command is wrapped with
 //! `devcontainer exec`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
@@ -21,7 +21,7 @@ use agent_client_protocol::schema::{
 };
 use agent_client_protocol::{AcpAgent, Agent as AcpAgentRole, ConnectionTo, LineDirection};
 use tokio::sync::mpsc;
-use tracing::{info, error};
+use tracing::{error, info};
 
 use crate::container::{self, ContainerConfig};
 use crate::session::{AgentId, SessionEvent, ToolCallStatusKind};
@@ -58,75 +58,79 @@ pub fn start_agent(
         let host_token = container::resolve_host_github_token();
 
         // If workspace_folder is set, start the dev container first.
-        let (effective_command, session_cwd, container_info) = if let Some(ref ws) = workspace_folder {
-            let config = ContainerConfig {
-                workspace_folder: ws.clone(),
-            };
-            let progress_tx = event_tx.clone();
-            let progress_aid = agent_id.clone();
-            match container::start_container(&config, |msg| {
-                let _ = progress_tx.send(SessionEvent::Output {
-                    agent_id: progress_aid.clone(),
-                    line: format!("  ⏳ {msg}"),
-                });
-            }).await {
-                Ok(info) => {
-                    info!(
-                        agent_id = %agent_id,
-                        container_id = %info.container_id,
-                        remote_user = %info.remote_user,
-                        remote_workspace = %info.remote_workspace_folder,
-                        "Container ready"
-                    );
-                    let _ = event_tx.send(SessionEvent::Output {
-                        agent_id: agent_id.clone(),
-                        line: format!(
-                            "Container ready (user: {}, workspace: {})",
-                            info.remote_user, info.remote_workspace_folder
-                        ),
+        let (effective_command, session_cwd, container_info) =
+            if let Some(ref ws) = workspace_folder {
+                let config = ContainerConfig {
+                    workspace_folder: ws.clone(),
+                };
+                let progress_tx = event_tx.clone();
+                let progress_aid = agent_id.clone();
+                match container::start_container(&config, |msg| {
+                    let _ = progress_tx.send(SessionEvent::Output {
+                        agent_id: progress_aid.clone(),
+                        line: format!("  ⏳ {msg}"),
                     });
+                })
+                .await
+                {
+                    Ok(info) => {
+                        info!(
+                            agent_id = %agent_id,
+                            container_id = %info.container_id,
+                            remote_user = %info.remote_user,
+                            remote_workspace = %info.remote_workspace_folder,
+                            "Container ready"
+                        );
+                        let _ = event_tx.send(SessionEvent::Output {
+                            agent_id: agent_id.clone(),
+                            line: format!(
+                                "Container ready (user: {}, workspace: {})",
+                                info.remote_user, info.remote_workspace_folder
+                            ),
+                        });
 
-                    // Wrap ACP command with docker exec to run inside the container.
-                    // Pass the host token via -e so the copilot CLI authenticates
-                    // without needing a keychain inside the container.
-                    let token_flag = host_token.as_ref()
-                        .map(|t| format!(" -e COPILOT_GITHUB_TOKEN={t}"))
-                        .unwrap_or_default();
-                    let exec_cmd = format!(
-                        "docker exec -i{token_flag} -u {} -w {} {} {}",
-                        info.remote_user,
-                        info.remote_workspace_folder,
-                        info.container_id,
-                        acp_command,
-                    );
+                        // Wrap ACP command with docker exec to run inside the container.
+                        // Pass the host token via -e so the copilot CLI authenticates
+                        // without needing a keychain inside the container.
+                        let token_flag = host_token
+                            .as_ref()
+                            .map(|t| format!(" -e COPILOT_GITHUB_TOKEN={t}"))
+                            .unwrap_or_default();
+                        let exec_cmd = format!(
+                            "docker exec -i{token_flag} -u {} -w {} {} {}",
+                            info.remote_user,
+                            info.remote_workspace_folder,
+                            info.container_id,
+                            acp_command,
+                        );
 
-                    let cwd = PathBuf::from(&info.remote_workspace_folder);
-                    (exec_cmd, cwd, Some(info))
+                        let cwd = PathBuf::from(&info.remote_workspace_folder);
+                        (exec_cmd, cwd, Some(info))
+                    }
+                    Err(err) => {
+                        error!(agent_id = %agent_id, error = %err, "Container failed to start");
+                        let _ = event_tx.send(SessionEvent::Error {
+                            agent_id: agent_id.clone(),
+                            message: format!("Container failed: {err}"),
+                        });
+                        let _ = event_tx.send(SessionEvent::Exited {
+                            agent_id,
+                            code: None,
+                        });
+                        return;
+                    }
                 }
-                Err(err) => {
-                    error!(agent_id = %agent_id, error = %err, "Container failed to start");
-                    let _ = event_tx.send(SessionEvent::Error {
-                        agent_id: agent_id.clone(),
-                        message: format!("Container failed: {err}"),
-                    });
-                    let _ = event_tx.send(SessionEvent::Exited {
-                        agent_id,
-                        code: None,
-                    });
-                    return;
-                }
-            }
-        } else {
-            // Running on the host — prepend the token as an env var in the
-            // ACP command string (the ACP crate parses NAME=value prefixes).
-            let cmd = if let Some(ref token) = host_token {
-                format!("COPILOT_GITHUB_TOKEN={token} {acp_command}")
             } else {
-                acp_command
+                // Running on the host — prepend the token as an env var in the
+                // ACP command string (the ACP crate parses NAME=value prefixes).
+                let cmd = if let Some(ref token) = host_token {
+                    format!("COPILOT_GITHUB_TOKEN={token} {acp_command}")
+                } else {
+                    acp_command
+                };
+                let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+                (cmd, cwd, None)
             };
-            let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
-            (cmd, cwd, None)
-        };
 
         if let Err(err) = run_persistent_connection(
             agent_id.clone(),
@@ -185,6 +189,7 @@ pub fn send_message(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_persistent_connection(
     agent_id: AgentId,
     acp_command: &str,
@@ -219,6 +224,7 @@ async fn run_persistent_connection(
 ///
 /// When `previous_session_id` is set and the agent supports session resume,
 /// attempts to resume that session instead of creating a new one.
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_run(
     agent_id: AgentId,
     acp_command: &str,
@@ -260,12 +266,19 @@ async fn connect_and_run(
 
     // Clone container_info fields we need into the closure (can't move a reference).
     let ci_for_auth: Option<(String, String, String)> = container_info.map(|ci| {
-        (ci.container_id.clone(), ci.remote_user.clone(), ci.remote_workspace_folder.clone())
+        (
+            ci.container_id.clone(),
+            ci.remote_user.clone(),
+            ci.remote_workspace_folder.clone(),
+        )
     });
 
     let aid = agent_id.clone();
     let tx = event_tx.clone();
-    let state = Arc::new(Mutex::new(SessionStateMachine::new(aid.clone(), tx.clone())));
+    let state = Arc::new(Mutex::new(SessionStateMachine::new(
+        aid.clone(),
+        tx.clone(),
+    )));
 
     agent_client_protocol::Client
         .builder()
@@ -568,14 +581,14 @@ async fn connect_and_run(
 /// matching session is found or the rehydration call fails.
 async fn try_find_and_resume(
     connection: &ConnectionTo<AcpAgentRole>,
-    session_cwd: &PathBuf,
+    session_cwd: &Path,
     agent_id: &str,
     tx: &mpsc::UnboundedSender<SessionEvent>,
     can_resume: bool,
     can_load: bool,
 ) -> Option<String> {
     let list_result = connection
-        .send_request(ListSessionsRequest::new().cwd(session_cwd.clone()))
+        .send_request(ListSessionsRequest::new().cwd(session_cwd.to_path_buf()))
         .block_task()
         .await;
 
@@ -604,7 +617,7 @@ async fn try_find_and_resume(
         connection
             .send_request(ResumeSessionRequest::new(
                 best.session_id.clone(),
-                session_cwd.clone(),
+                session_cwd.to_path_buf(),
             ))
             .block_task()
             .await
@@ -613,7 +626,7 @@ async fn try_find_and_resume(
         connection
             .send_request(LoadSessionRequest::new(
                 best.session_id.clone(),
-                session_cwd.clone(),
+                session_cwd.to_path_buf(),
             ))
             .block_task()
             .await
@@ -689,9 +702,7 @@ fn map_tool_status(status: &ToolCallStatus) -> ToolCallStatusKind {
 /// For container agents, wraps with `docker exec -it` so login runs inside
 /// the container where copilot stores its credentials. For host agents,
 /// runs `copilot login` directly.
-fn build_auth_command(
-    container_info: Option<&(String, String, String)>,
-) -> Vec<String> {
+fn build_auth_command(container_info: Option<&(String, String, String)>) -> Vec<String> {
     if let Some((container_id, remote_user, remote_workdir)) = container_info {
         vec![
             "docker".into(),

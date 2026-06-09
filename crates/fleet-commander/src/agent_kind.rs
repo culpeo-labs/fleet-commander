@@ -75,9 +75,10 @@ impl AgentKind {
     /// inside the container regardless of the project's own feature list.
     pub fn required_features(self) -> Vec<(&'static str, serde_json::Value)> {
         match self {
-            AgentKind::Copilot => vec![
-                ("ghcr.io/devcontainers/features/copilot-cli:1", serde_json::json!({})),
-            ],
+            AgentKind::Copilot => vec![(
+                "ghcr.io/devcontainers/features/copilot-cli:1",
+                serde_json::json!({}),
+            )],
         }
     }
 }

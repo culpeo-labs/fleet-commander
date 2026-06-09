@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "fleet-commander", about = "Orchestrate AI coding agents via ACP")]
+#[command(
+    name = "fleet-commander",
+    about = "Orchestrate AI coding agents via ACP"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,

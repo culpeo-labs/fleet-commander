@@ -20,13 +20,15 @@ use devcontainer_lib::devcontainer::features::{
 };
 use devcontainer_lib::devcontainer::lifecycle::run_lifecycle_hooks;
 use devcontainer_lib::devcontainer::merge::merge_layer;
-use devcontainer_lib::devcontainer::variables::{substitute_variables, substitute_variables_with_user};
+use devcontainer_lib::devcontainer::variables::{
+    substitute_variables, substitute_variables_with_user,
+};
 use devcontainer_lib::parse_jsonc;
 use devcontainer_lib::runtime::{
     self, BindMount, ContainerRuntime, ContainerState, PortMapping, WorkspaceMount,
 };
-use devcontainer_lib::util::{container_name, workspace_labels, workspace_folder_name};
-use tracing::{info, warn, error, debug};
+use devcontainer_lib::util::{container_name, workspace_folder_name, workspace_labels};
+use tracing::{debug, error, info, warn};
 
 use crate::base_layer;
 
@@ -39,7 +41,6 @@ pub struct ContainerConfig {
 
 /// Result of starting a container.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct ContainerInfo {
     pub container_id: String,
     pub workspace_folder: PathBuf,
@@ -50,8 +51,9 @@ pub struct ContainerInfo {
 /// Load a devcontainer.json file, merging the fleet-commander base layer if present.
 fn load_merged_config(config_path: &Path) -> Result<DevcontainerConfig, ContainerError> {
     debug!(path = %config_path.display(), "Loading devcontainer config");
-    let raw = std::fs::read_to_string(config_path)
-        .map_err(|e| ContainerError::Parse(format!("Failed to read {}: {e}", config_path.display())))?;
+    let raw = std::fs::read_to_string(config_path).map_err(|e| {
+        ContainerError::Parse(format!("Failed to read {}: {e}", config_path.display()))
+    })?;
     let mut project_json: serde_json::Value =
         parse_jsonc(&raw).map_err(|e| ContainerError::Parse(e.to_string()))?;
 
@@ -61,8 +63,7 @@ fn load_merged_config(config_path: &Path) -> Result<DevcontainerConfig, Containe
         .and_then(|p| p.parent()) // .devcontainer/ -> project root
         .unwrap_or(Path::new("/"));
 
-    let base_path = base_layer::base_layer_path_for(workspace)
-        .or_else(|| base_layer::base_layer_path());
+    let base_path = base_layer::base_layer_path_for(workspace).or_else(base_layer::base_layer_path);
 
     if let Some(ref base_path) = base_path {
         debug!(layer = %base_path.display(), "Merging base layer");
@@ -94,12 +95,10 @@ pub async fn start_container(
     let workspace = &config.workspace_folder;
     info!(workspace = %workspace.display(), "Starting container");
 
-    let rt = runtime::detect_runtime(None)
-        .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to detect container runtime");
-            ContainerError::Start(e.to_string())
-        })?;
+    let rt = runtime::detect_runtime(None).await.map_err(|e| {
+        error!(error = %e, "Failed to detect container runtime");
+        ContainerError::Start(e.to_string())
+    })?;
 
     // Load devcontainer config, merging base layer if present.
     let config_path = workspace.join(".devcontainer/devcontainer.json");
@@ -114,9 +113,14 @@ pub async fn start_container(
 
     // Check if a container already exists for this workspace.
     let labels_list = workspace_labels(workspace, Some(&config_path));
-    let filters: Vec<String> = labels_list.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let filters: Vec<String> = labels_list
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
     debug!(filters = ?filters, "Searching for existing containers");
-    let existing = rt.list_containers(&filters).await
+    let existing = rt
+        .list_containers(&filters)
+        .await
         .map_err(|e| ContainerError::Start(e.to_string()))?;
 
     info!(count = existing.len(), "Found existing containers");
@@ -126,13 +130,15 @@ pub async fn start_container(
         match container.state {
             ContainerState::Running => {
                 on_progress("Container already running, reattaching…");
-                let remote_user = resolve_remote_user(rt.as_ref(), &container.image, &dc_config).await?;
+                let remote_user =
+                    resolve_remote_user(rt.as_ref(), &container.image, &dc_config).await?;
                 let folder_name = workspace_folder_name(workspace);
                 info!(id = %container.id, "Reusing running container");
                 return Ok(ContainerInfo {
                     container_id: container.id.clone(),
                     workspace_folder: workspace.clone(),
-                    remote_workspace_folder: dc_config.workspace_folder
+                    remote_workspace_folder: dc_config
+                        .workspace_folder
                         .clone()
                         .unwrap_or_else(|| format!("/workspaces/{folder_name}")),
                     remote_user: remote_user.unwrap_or_else(|| "root".to_string()),
@@ -141,9 +147,11 @@ pub async fn start_container(
             ContainerState::Stopped => {
                 on_progress("Starting stopped container…");
                 info!(id = %container.id, "Starting stopped container");
-                rt.start_container(&container.id).await
+                rt.start_container(&container.id)
+                    .await
                     .map_err(|e| ContainerError::Start(e.to_string()))?;
-                let remote_user = resolve_remote_user(rt.as_ref(), &container.image, &dc_config).await?;
+                let remote_user =
+                    resolve_remote_user(rt.as_ref(), &container.image, &dc_config).await?;
                 let user_str = remote_user.unwrap_or_else(|| "root".to_string());
                 let folder_name = workspace_folder_name(workspace);
 
@@ -155,12 +163,14 @@ pub async fn start_container(
                     &dc_config,
                     &user_str,
                     &on_progress,
-                ).await;
+                )
+                .await;
 
                 return Ok(ContainerInfo {
                     container_id: container.id.clone(),
                     workspace_folder: workspace.clone(),
-                    remote_workspace_folder: dc_config.workspace_folder
+                    remote_workspace_folder: dc_config
+                        .workspace_folder
                         .clone()
                         .unwrap_or_else(|| format!("/workspaces/{folder_name}")),
                     remote_user: user_str,
@@ -174,7 +184,14 @@ pub async fn start_container(
 
     // No existing container — build image and create one.
     info!("No existing container — building image");
-    let image = resolve_image(rt.as_ref(), workspace, &dc_config, &config_path, &on_progress).await?;
+    let image = resolve_image(
+        rt.as_ref(),
+        workspace,
+        &dc_config,
+        &config_path,
+        &on_progress,
+    )
+    .await?;
     let name = container_name(workspace);
     let folder_name = workspace_folder_name(workspace);
     info!(image = %image, name = %name, "Image ready");
@@ -184,7 +201,11 @@ pub async fn start_container(
 
     // Merge base credential layer into env/mounts.
     let (env, mounts) = build_env_and_mounts(workspace, &dc_config, remote_user.as_deref());
-    debug!(env_count = env.len(), mount_count = mounts.len(), "Built env and mounts");
+    debug!(
+        env_count = env.len(),
+        mount_count = mounts.len(),
+        "Built env and mounts"
+    );
     for mount in &mounts {
         debug!(source = %mount.source.display(), target = %mount.target, "Mount");
         // Ensure bind mount source directories exist on the host.
@@ -203,7 +224,8 @@ pub async fn start_container(
 
     let ports: Vec<PortMapping> = dc_config.forward_ports.clone().unwrap_or_default();
 
-    let remote_workspace = dc_config.workspace_folder
+    let remote_workspace = dc_config
+        .workspace_folder
         .clone()
         .unwrap_or_else(|| format!("/workspaces/{folder_name}"));
 
@@ -228,18 +250,16 @@ pub async fn start_container(
     };
 
     on_progress("Creating container…");
-    let container_id = rt.create_container(&container_config).await
-        .map_err(|e| {
-            error!(error = %e, "Failed to create container");
-            ContainerError::Start(e.to_string())
-        })?;
+    let container_id = rt.create_container(&container_config).await.map_err(|e| {
+        error!(error = %e, "Failed to create container");
+        ContainerError::Start(e.to_string())
+    })?;
     info!(id = %container_id, "Container created");
     on_progress("Starting container…");
-    rt.start_container(&container_id).await
-        .map_err(|e| {
-            error!(id = %container_id, error = %e, "Failed to start container");
-            ContainerError::Start(e.to_string())
-        })?;
+    rt.start_container(&container_id).await.map_err(|e| {
+        error!(id = %container_id, error = %e, "Failed to start container");
+        ContainerError::Start(e.to_string())
+    })?;
     info!(id = %container_id, "Container started");
 
     // Run lifecycle hooks (postCreateCommand, postStartCommand, etc.).
@@ -253,7 +273,9 @@ pub async fn start_container(
         &dc_config,
         Some(user_str.as_str()),
         None,
-    ).await {
+    )
+    .await
+    {
         warn!(error = %e, "Lifecycle hook failed");
         on_progress(&format!("⚠ Lifecycle hook failed: {e}"));
     }
@@ -294,11 +316,7 @@ async fn run_post_start_command(
     };
 
     for command in commands {
-        let args = vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            command.to_string(),
-        ];
+        let args = vec!["sh".to_string(), "-c".to_string(), command.to_string()];
         match rt.exec(container_id, &args, Some(user)).await {
             Ok(result) if result.exit_code != 0 => {
                 warn!(
@@ -306,7 +324,10 @@ async fn run_post_start_command(
                     stderr = %result.stderr,
                     "postStartCommand failed"
                 );
-                on_progress(&format!("⚠ postStartCommand failed (exit {})", result.exit_code));
+                on_progress(&format!(
+                    "⚠ postStartCommand failed (exit {})",
+                    result.exit_code
+                ));
             }
             Err(e) => {
                 warn!(error = %e, "postStartCommand exec failed");
@@ -331,7 +352,11 @@ async fn resolve_image(
     let features = resolve_features(config).unwrap_or_default();
     let has_features = !features.is_empty();
     let devcontainer_dir = config_path.parent().map(|p| p.to_path_buf());
-    debug!(has_features, feature_count = features.len(), "Resolving image");
+    debug!(
+        has_features,
+        feature_count = features.len(),
+        "Resolving image"
+    );
 
     // 1. Pull or build the base image.
     let base_image = if let Some(ref image) = config.image {
@@ -526,8 +551,13 @@ pub async fn stop_workspace_container(workspace: &Path) -> Result<(), ContainerE
 
     let config_path = workspace.join(".devcontainer/devcontainer.json");
     let labels_list = workspace_labels(workspace, Some(&config_path));
-    let filters: Vec<String> = labels_list.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let existing = rt.list_containers(&filters).await
+    let filters: Vec<String> = labels_list
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    let existing = rt
+        .list_containers(&filters)
+        .await
         .map_err(|e| ContainerError::Start(e.to_string()))?;
 
     for container in &existing {
@@ -551,8 +581,13 @@ pub async fn remove_workspace_container(workspace: &Path) -> Result<(), Containe
 
     let config_path = workspace.join(".devcontainer/devcontainer.json");
     let labels_list = workspace_labels(workspace, Some(&config_path));
-    let filters: Vec<String> = labels_list.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let existing = rt.list_containers(&filters).await
+    let filters: Vec<String> = labels_list
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    let existing = rt
+        .list_containers(&filters)
+        .await
         .map_err(|e| ContainerError::Start(e.to_string()))?;
 
     for container in &existing {
@@ -616,7 +651,8 @@ mod tests {
 
     #[test]
     fn parse_mount_string_basic() {
-        let m = parse_mount_string("source=/home/user/.ssh,target=/home/vscode/.ssh,type=bind").unwrap();
+        let m = parse_mount_string("source=/home/user/.ssh,target=/home/vscode/.ssh,type=bind")
+            .unwrap();
         assert_eq!(m.source, PathBuf::from("/home/user/.ssh"));
         assert_eq!(m.target, "/home/vscode/.ssh");
         assert!(!m.readonly);

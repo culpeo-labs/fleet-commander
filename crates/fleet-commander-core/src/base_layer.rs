@@ -51,12 +51,16 @@ pub fn workspace_data_dir(workspace: &Path) -> Option<PathBuf> {
 
 /// Path to the base devcontainer layer for a workspace, if it exists.
 pub fn base_layer_path_for(workspace: &Path) -> Option<PathBuf> {
-    let path = workspace_layer_dir(workspace).ok()?.join("devcontainer.json");
+    let path = workspace_layer_dir(workspace)
+        .ok()?
+        .join("devcontainer.json");
     if path.is_file() { Some(path) } else { None }
 }
 
 /// Legacy: global base layer path (kept for backward compat during transition).
 pub fn base_layer_path() -> Option<PathBuf> {
-    let path = fleet_commander_config_dir().ok()?.join("base-devcontainer.json");
+    let path = fleet_commander_config_dir()
+        .ok()?
+        .join("base-devcontainer.json");
     if path.is_file() { Some(path) } else { None }
 }

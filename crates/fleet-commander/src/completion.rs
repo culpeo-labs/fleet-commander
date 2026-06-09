@@ -52,18 +52,6 @@ impl PathCompleter {
         }
         self.candidates.get(self.index).map(String::as_str)
     }
-
-    /// Whether a completion session is active.
-    #[allow(dead_code)]
-    pub fn is_active(&self) -> bool {
-        !self.candidates.is_empty()
-    }
-
-    /// Number of candidates in the current session.
-    #[cfg(test)]
-    pub fn candidate_count(&self) -> usize {
-        self.candidates.len()
-    }
 }
 
 /// Build sorted completion candidates for `partial`.
@@ -238,10 +226,11 @@ mod tests {
 
     #[test]
     fn reset_clears_state() {
-        let mut c = PathCompleter::default();
-        c.candidates = vec!["a".into()];
-        c.index = 5;
-        c.trigger = "hello".into();
+        let mut c = PathCompleter {
+            candidates: vec!["a".into()],
+            index: 5,
+            trigger: "hello".into(),
+        };
         c.reset();
         assert!(c.candidates.is_empty());
         assert_eq!(c.index, 0);
