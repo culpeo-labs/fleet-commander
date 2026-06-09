@@ -30,7 +30,7 @@ tracing.workspace = true
 
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4", features = ["derive"] }
-dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 notify = "8.2.0"
 portable-pty = "0.9"
 ratatui = "0.30.1"
