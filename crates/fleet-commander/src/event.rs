@@ -21,7 +21,6 @@ use crate::change_source::ChangeEvent;
 pub use fleet_commander_core::session::PermissionReply;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum AppEvent {
     Input(KeyEvent),
     Change(ChangeEvent),
@@ -50,10 +49,9 @@ pub enum AppEvent {
     /// AuthRequired, Output, …) or the `*Started` introduction of a
     /// streamed entity whose handle then drives its own updates.
     Session(SessionEvent),
-    /// Nudge from a per-handle tracker task to redraw the given agent
-    /// because one of its handles' `watch` channels ticked. Carries no
-    /// state — the renderer reads the handle directly.
-    Repaint {
-        agent_id: AgentId,
-    },
+    /// Nudge from a per-handle tracker task to redraw because one of its
+    /// handles' `watch` channels ticked. Carries no state — the renderer
+    /// reads the handle directly. (The redraw itself is performed by the
+    /// main loop after `App::handle` returns.)
+    Repaint,
 }

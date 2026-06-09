@@ -102,7 +102,6 @@ pub struct UserMessage {
 /// the `*Started` variants; their content updates through the handle's
 /// `watch` channels.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum SessionEvent {
     /// The ACP session is open and ready to accept prompts.
     Connected {

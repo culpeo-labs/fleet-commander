@@ -51,7 +51,9 @@ pub struct NotifyParams {
 #[derive(Clone)]
 pub struct TuiMcpServer {
     tx: Arc<mpsc::UnboundedSender<AppEvent>>,
-    #[allow(dead_code)] // read by the rmcp tool_router macro infrastructure
+    /// Held so the `#[tool_router]` macro infrastructure can dispatch
+    /// incoming tool calls. Not read directly by our code.
+    #[allow(dead_code)]
     tool_router: ToolRouter<TuiMcpServer>,
 }
 

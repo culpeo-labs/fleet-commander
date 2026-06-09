@@ -27,7 +27,6 @@ mod init;
 mod keybind;
 mod markdown;
 mod mcp_server;
-mod terminal;
 mod ui;
 mod workspace;
 

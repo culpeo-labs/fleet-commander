@@ -52,12 +52,6 @@ impl PathCompleter {
         }
         self.candidates.get(self.index).map(String::as_str)
     }
-
-    /// Whether a completion session is active.
-    #[allow(dead_code)]
-    pub fn is_active(&self) -> bool {
-        !self.candidates.is_empty()
-    }
 }
 
 /// Build sorted completion candidates for `partial`.

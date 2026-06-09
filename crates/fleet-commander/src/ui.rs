@@ -433,17 +433,6 @@ fn render_side_pane(frame: &mut Frame<'_>, area: Rect, pane: &SidePane, focused:
             );
             frame.render_widget(paragraph, area);
         }
-        SidePane::Editor { path, buffer } => {
-            let title = format!(" Editor: {} ", path.display());
-            let lines = highlight_for_path(buffer, path);
-            let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .border_style(style),
-            );
-            frame.render_widget(paragraph, area);
-        }
     }
 }
 

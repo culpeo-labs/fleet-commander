@@ -53,24 +53,7 @@ pub enum SessionFocus {
 
 #[derive(Debug, Clone)]
 pub enum SidePane {
-    Diff {
-        path: PathBuf,
-        content: String,
-    },
-    #[allow(dead_code)] // Editor variant is a stub for now.
-    Editor {
-        path: PathBuf,
-        buffer: String,
-    },
-}
-
-impl SidePane {
-    #[allow(dead_code)] // exposed for future actions on the side pane.
-    pub fn path(&self) -> &PathBuf {
-        match self {
-            SidePane::Diff { path, .. } | SidePane::Editor { path, .. } => path,
-        }
-    }
+    Diff { path: PathBuf, content: String },
 }
 
 pub struct App {
@@ -108,9 +91,7 @@ pub struct App {
 }
 
 /// A tool permission request waiting for the user's y/n decision.
-#[allow(dead_code)]
 pub struct PendingPermission {
-    pub agent_id: AgentId,
     pub tool_name: String,
     pub options: Vec<(String, String, String)>,
     pub reply: crate::event::PermissionReply,
@@ -173,7 +154,7 @@ impl App {
                 info!(agent_id = %agent_id, "Reconnecting agent after rebuild");
                 self.ensure_agent_connected(agent_id);
             }
-            AppEvent::Repaint { agent_id: _ } => {
+            AppEvent::Repaint => {
                 // No-op: the redraw is performed by the main loop after this
                 // handler returns. Repaint events exist purely to wake the
                 // event loop when a tracked handle (tool call, streaming
@@ -242,7 +223,6 @@ impl App {
                     agent.info(format!("🔐 Permission requested: {tool_name}"));
                 }
                 self.permission_pending = Some(PendingPermission {
-                    agent_id,
                     tool_name,
                     options,
                     reply,
@@ -253,40 +233,25 @@ impl App {
                     agent.status = AgentStatus::Running;
                     agent.history.push(HistoryEntry::Assistant(message.clone()));
                 }
-                spawn_text_tracker(
-                    agent_id.clone(),
-                    message.text,
-                    message.status,
-                    self.tx.clone(),
-                );
+                spawn_text_tracker(message.text, message.status, self.tx.clone());
             }
             SessionEvent::Thought { agent_id, thought } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.history.push(HistoryEntry::Thought(thought.clone()));
                 }
-                spawn_text_tracker(
-                    agent_id.clone(),
-                    thought.text,
-                    thought.status,
-                    self.tx.clone(),
-                );
+                spawn_text_tracker(thought.text, thought.status, self.tx.clone());
             }
             SessionEvent::UserMessage { agent_id, message } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.history.push(HistoryEntry::User(message.clone()));
                 }
-                spawn_text_tracker(
-                    agent_id.clone(),
-                    message.text,
-                    message.status,
-                    self.tx.clone(),
-                );
+                spawn_text_tracker(message.text, message.status, self.tx.clone());
             }
             SessionEvent::ToolCall { agent_id, call } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.history.push(HistoryEntry::Tool(call.clone()));
                 }
-                spawn_tool_tracker(agent_id.clone(), call.title, call.status, self.tx.clone());
+                spawn_tool_tracker(call.title, call.status, self.tx.clone());
             }
         }
     }
@@ -719,7 +684,6 @@ impl App {
 /// changes; terminates when the status reaches a terminal state or either
 /// watch channel is closed.
 fn spawn_text_tracker(
-    agent_id: AgentId,
     mut text: tokio::sync::watch::Receiver<String>,
     mut status: tokio::sync::watch::Receiver<MessageStatus>,
     tx: mpsc::UnboundedSender<AppEvent>,
@@ -729,20 +693,18 @@ fn spawn_text_tracker(
             tokio::select! {
                 res = text.changed() => {
                     if res.is_err() {
-                        let _ = tx.send(AppEvent::Repaint { agent_id: agent_id.clone() });
+                        let _ = tx.send(AppEvent::Repaint);
                         break;
                     }
                 }
                 res = status.changed() => {
                     if res.is_err() {
-                        let _ = tx.send(AppEvent::Repaint { agent_id: agent_id.clone() });
+                        let _ = tx.send(AppEvent::Repaint);
                         break;
                     }
                 }
             }
-            let _ = tx.send(AppEvent::Repaint {
-                agent_id: agent_id.clone(),
-            });
+            let _ = tx.send(AppEvent::Repaint);
             if status.borrow().is_terminal() {
                 break;
             }
@@ -753,7 +715,6 @@ fn spawn_text_tracker(
 /// Spawn a tracker task for a tool-call handle. Like `spawn_text_tracker`
 /// but watches `title` + `status` instead.
 fn spawn_tool_tracker(
-    agent_id: AgentId,
     mut title: tokio::sync::watch::Receiver<String>,
     mut status: tokio::sync::watch::Receiver<ToolCallStatusKind>,
     tx: mpsc::UnboundedSender<AppEvent>,
@@ -763,20 +724,18 @@ fn spawn_tool_tracker(
             tokio::select! {
                 res = title.changed() => {
                     if res.is_err() {
-                        let _ = tx.send(AppEvent::Repaint { agent_id: agent_id.clone() });
+                        let _ = tx.send(AppEvent::Repaint);
                         break;
                     }
                 }
                 res = status.changed() => {
                     if res.is_err() {
-                        let _ = tx.send(AppEvent::Repaint { agent_id: agent_id.clone() });
+                        let _ = tx.send(AppEvent::Repaint);
                         break;
                     }
                 }
             }
-            let _ = tx.send(AppEvent::Repaint {
-                agent_id: agent_id.clone(),
-            });
+            let _ = tx.send(AppEvent::Repaint);
             if status.borrow().is_terminal() {
                 break;
             }
@@ -1279,9 +1238,7 @@ mod tests {
         // Repaint events exist to wake the event loop when a tracked
         // handle ticks; they must not disturb the user's scroll position.
         let mut app = app_in_session(3);
-        app.handle(AppEvent::Repaint {
-            agent_id: "a1".into(),
-        });
+        app.handle(AppEvent::Repaint);
         assert_eq!(current_scroll(&app), 3);
     }
 

@@ -41,7 +41,6 @@ pub struct ContainerConfig {
 
 /// Result of starting a container.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct ContainerInfo {
     pub container_id: String,
     pub workspace_folder: PathBuf,
