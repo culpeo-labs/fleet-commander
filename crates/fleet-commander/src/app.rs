@@ -168,14 +168,17 @@ impl App {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.info(message);
                 }
-                self.auto_scroll_for(&agent_id);
             }
             AppEvent::ReconnectAgent { agent_id } => {
                 info!(agent_id = %agent_id, "Reconnecting agent after rebuild");
                 self.ensure_agent_connected(agent_id);
             }
-            AppEvent::Repaint { agent_id } => {
-                self.auto_scroll_for(&agent_id);
+            AppEvent::Repaint { agent_id: _ } => {
+                // No-op: the redraw is performed by the main loop after this
+                // handler returns. Repaint events exist purely to wake the
+                // event loop when a tracked handle (tool call, streaming
+                // text, etc.) ticks. We deliberately do not snap scroll
+                // here — if the user is reading history, leave them alone.
             }
             AppEvent::Session(event) => self.handle_session_event(event),
         }
@@ -187,7 +190,6 @@ impl App {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.info(line);
                 }
-                self.auto_scroll_for(&agent_id);
             }
             SessionEvent::Exited { agent_id, .. } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
@@ -201,7 +203,6 @@ impl App {
                     agent.error(format!("[error] {message}"));
                     agent.status = AgentStatus::Error;
                 }
-                self.auto_scroll_for(&agent_id);
             }
             SessionEvent::Connected {
                 agent_id,
@@ -258,7 +259,6 @@ impl App {
                     message.status,
                     self.tx.clone(),
                 );
-                self.auto_scroll_for(&agent_id);
             }
             SessionEvent::Thought { agent_id, thought } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
@@ -270,7 +270,6 @@ impl App {
                     thought.status,
                     self.tx.clone(),
                 );
-                self.auto_scroll_for(&agent_id);
             }
             SessionEvent::UserMessage { agent_id, message } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
@@ -282,7 +281,6 @@ impl App {
                     message.status,
                     self.tx.clone(),
                 );
-                self.auto_scroll_for(&agent_id);
             }
             SessionEvent::ToolCall { agent_id, call } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
@@ -294,7 +292,6 @@ impl App {
                     call.status,
                     self.tx.clone(),
                 );
-                self.auto_scroll_for(&agent_id);
             }
         }
     }
@@ -497,6 +494,15 @@ impl App {
     }
 
     /// Scroll to the bottom when content arrives for the currently viewed agent.
+    /// Snap to the bottom of the conversation pane for the agent that the
+    /// user is currently viewing.
+    ///
+    /// Called by callers (e.g. side-pane updates) that need to force an
+    /// auto-scroll regardless of where the user has scrolled to. Routine
+    /// streaming updates do **not** call this — they leave `scroll` alone
+    /// so the user can read history without being yanked back to the bottom
+    /// every time a chunk arrives. The user can re-engage follow-bottom
+    /// with `Action::FollowBottom` (bound to `G` by default).
     fn auto_scroll_for(&mut self, agent_id: &str) {
         if let Screen::AgentSession {
             agent_id: current,
@@ -507,8 +513,6 @@ impl App {
             if current != agent_id {
                 return;
             }
-            // Sentinel: usize::MAX means "follow bottom". The render function
-            // computes the actual offset based on viewport height.
             *scroll = usize::MAX;
         }
     }
@@ -850,7 +854,23 @@ fn handle_session_action(
             None
         }
         Action::Up => {
-            *scroll = scroll.saturating_sub(1);
+            if *scroll == usize::MAX {
+                // Currently following the bottom — break out of follow mode
+                // by anchoring at whatever line is currently at the top of
+                // the viewport, then step up by one.
+                let top = agents
+                    .iter()
+                    .find(|a| &a.id == agent_id)
+                    .map(|a| a.last_effective_top.get())
+                    .unwrap_or(0);
+                *scroll = top.saturating_sub(1);
+            } else {
+                *scroll = scroll.saturating_sub(1);
+            }
+            None
+        }
+        Action::FollowBottom => {
+            *scroll = usize::MAX;
             None
         }
         _ => None,
@@ -1209,7 +1229,10 @@ mod tests {
     }
 
     #[test]
-    fn incoming_event_for_current_agent_follows_bottom() {
+    fn incoming_event_preserves_manual_scroll() {
+        // New "sticky scroll" behaviour: an incoming event must NOT yank the
+        // viewport back to the bottom. The user has scrolled to line 5;
+        // they stay there until they explicitly press `G`.
         let mut app = app_in_session(5);
         app.handle(AppEvent::Session(SessionEvent::Output {
             agent_id: "a1".into(),
@@ -1217,9 +1240,22 @@ mod tests {
         }));
         assert_eq!(
             current_scroll(&app),
-            usize::MAX,
-            "scroll should snap to bottom on new content"
+            5,
+            "manual scroll position must persist across incoming events"
         );
+    }
+
+    #[test]
+    fn incoming_event_preserves_follow_bottom_sentinel() {
+        // Conversely, if the user is already following the bottom
+        // (scroll == usize::MAX), the sentinel is preserved and the
+        // renderer will naturally show the newest content.
+        let mut app = app_in_session(usize::MAX);
+        app.handle(AppEvent::Session(SessionEvent::Output {
+            agent_id: "a1".into(),
+            line: "new line".into(),
+        }));
+        assert_eq!(current_scroll(&app), usize::MAX);
     }
 
     #[test]
@@ -1238,14 +1274,14 @@ mod tests {
     }
 
     #[test]
-    fn repaint_event_follows_bottom() {
-        // The Repaint event is what tracker tasks emit when a handle's
-        // watch channel ticks; it must keep the auto-follow behaviour.
+    fn repaint_event_preserves_scroll() {
+        // Repaint events exist to wake the event loop when a tracked
+        // handle ticks; they must not disturb the user's scroll position.
         let mut app = app_in_session(3);
         app.handle(AppEvent::Repaint {
             agent_id: "a1".into(),
         });
-        assert_eq!(current_scroll(&app), usize::MAX);
+        assert_eq!(current_scroll(&app), 3);
     }
 
     #[test]
@@ -1271,17 +1307,39 @@ mod tests {
     }
 
     #[test]
-    fn manual_scroll_is_overridden_by_next_event() {
-        // Current behavior: any incoming event re-pins to bottom even if
-        // the user had scrolled away. This is documented here as a
-        // regression test — change with intent.
+    fn manual_scroll_persists_across_events() {
+        // After the sticky-scroll refactor, once the user has scrolled
+        // away (`scroll` is finite), no streaming event should move them.
         let mut app = app_in_session(usize::MAX);
+        // Seed last_effective_top so the Up handler has a known anchor.
+        let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        a1.last_effective_top.set(7);
         app.handle(press(KeyCode::Char('k'))); // scroll up
-        assert_eq!(current_scroll(&app), usize::MAX.saturating_sub(1));
+        assert_eq!(
+            current_scroll(&app),
+            6,
+            "Up from follow-bottom must anchor at last_effective_top - 1"
+        );
         app.handle(AppEvent::Session(SessionEvent::Output {
             agent_id: "a1".into(),
             line: "interrupt".into(),
         }));
+        assert_eq!(
+            current_scroll(&app),
+            6,
+            "incoming event must not disturb manual scroll"
+        );
+    }
+
+    #[test]
+    fn follow_bottom_action_re_engages_follow() {
+        // After the user has scrolled away, pressing `G` (Shift-G) re-engages
+        // follow-bottom by resetting scroll to the sentinel.
+        let mut app = app_in_session(5);
+        app.handle(AppEvent::Input(KeyEvent::new(
+            KeyCode::Char('G'),
+            KeyModifiers::SHIFT,
+        )));
         assert_eq!(current_scroll(&app), usize::MAX);
     }
 
@@ -1324,7 +1382,9 @@ mod tests {
 
     #[tokio::test]
     async fn session_rehydration_appends_history_in_order_and_follows_bottom() {
-        let mut app = app_in_session(0);
+        // Start in follow-bottom mode (the default on session entry) so
+        // we can verify the sentinel persists across rehydration.
+        let mut app = app_in_session(usize::MAX);
 
         // Simulate session/load replay: a few prior turns.
         let turns = [
@@ -1363,11 +1423,16 @@ mod tests {
             }
         }
 
-        // Scroll must be pinned to bottom.
+        // Sticky scroll: rehydration events do not move the scroll.
+        // The session starts in follow-bottom mode (usize::MAX) and stays
+        // there because no manual scroll was performed; the renderer will
+        // naturally show the bottom (i.e. the latest turn) — see the
+        // `rehydration_renders_latest_turn_visible` UI test for the
+        // visible end-to-end behaviour.
         assert_eq!(
             current_scroll(&app),
             usize::MAX,
-            "scroll must auto-follow during rehydration"
+            "scroll sentinel must be preserved when no user input intervenes"
         );
     }
 

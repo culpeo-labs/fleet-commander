@@ -4,6 +4,7 @@
 //! what command to launch (e.g. "copilot --acp --stdio"). When `workspace_folder`
 //! is set, the agent runs inside a dev container for that repo.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 
 use tokio::sync::mpsc;
@@ -74,6 +75,14 @@ pub struct Agent {
     pub task_handle: Option<AbortHandle>,
     /// ACP session ID — persisted across reconnections for session resume.
     pub session_id: Option<String>,
+    /// Updated by `render_conversation` each frame: the line index that
+    /// ended up at the top of the viewport after clamping. Read by the
+    /// Up/Down handlers so they can decrement from "wherever you actually
+    /// were on screen" instead of from the abstract `scroll` field
+    /// (which is a sentinel like `usize::MAX` while auto-following).
+    ///
+    /// `Cell` because `render_conversation` only has `&Agent`.
+    pub last_effective_top: Cell<usize>,
 }
 
 impl Agent {
@@ -88,6 +97,7 @@ impl Agent {
             prompt_tx: None,
             task_handle: None,
             session_id: None,
+            last_effective_top: Cell::new(0),
         }
     }
 

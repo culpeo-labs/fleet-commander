@@ -24,6 +24,9 @@ pub enum Action {
     DismissPane,
     Insert,
     Command,
+    /// Re-engage "follow bottom" — viewport snaps to and tracks the newest
+    /// content. Default bind: `G` (vim's go-to-end-of-file).
+    FollowBottom,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -56,6 +59,8 @@ pub struct Bindings {
     pub insert: Vec<Binding>,
     #[serde(default = "default_command")]
     pub command: Vec<Binding>,
+    #[serde(default = "default_follow_bottom")]
+    pub follow_bottom: Vec<Binding>,
 }
 
 impl Default for Bindings {
@@ -72,6 +77,7 @@ impl Default for Bindings {
             dismiss_pane: default_dismiss_pane(),
             insert: default_insert(),
             command: default_command(),
+            follow_bottom: default_follow_bottom(),
         }
     }
 }
@@ -100,6 +106,7 @@ impl Bindings {
             (Action::DismissPane, self.dismiss_pane.as_slice()),
             (Action::Insert, self.insert.as_slice()),
             (Action::Command, self.command.as_slice()),
+            (Action::FollowBottom, self.follow_bottom.as_slice()),
         ]
         .into_iter()
     }
@@ -156,6 +163,9 @@ fn default_insert() -> Vec<Binding> {
 }
 fn default_command() -> Vec<Binding> {
     parse_each(&[":"])
+}
+fn default_follow_bottom() -> Vec<Binding> {
+    parse_each(&["G"])
 }
 
 #[cfg(test)]

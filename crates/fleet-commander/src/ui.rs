@@ -212,12 +212,19 @@ fn render_agent_session(
         render_conversation(frame, body_area, agent, scroll, true);
     }
 
-    let hint = if input_mode {
-        "Enter send  Esc cancel"
+    let following = scroll == usize::MAX;
+    let hint: std::borrow::Cow<'static, str> = if input_mode {
+        "Enter send  Esc cancel".into()
     } else if side_pane.is_some() {
-        "Esc back  Tab switch focus  d dismiss pane  i input  ↑/↓ scroll"
+        if following {
+            "Esc back  Tab switch focus  d dismiss pane  i input  ↑/↓ scroll".into()
+        } else {
+            "Esc back  Tab switch focus  d dismiss pane  i input  ↑/↓ scroll  G follow".into()
+        }
+    } else if following {
+        "Esc back  i input  ↑/↓ scroll".into()
     } else {
-        "Esc back  i input  ↑/↓ scroll"
+        "Esc back  i input  ↑/↓ scroll  G follow".into()
     };
     let footer = Paragraph::new(hint)
         .alignment(Alignment::Center)
@@ -270,6 +277,13 @@ fn render_conversation(
     } else {
         scroll.min(total_lines.saturating_sub(viewport_height))
     };
+
+    // Stash the computed top-of-viewport line so that the synchronous
+    // handler for `Action::Up` can break out of follow-bottom mode by
+    // anchoring at exactly the line the user is currently looking at.
+    if let Some(a) = agent {
+        a.last_effective_top.set(effective_scroll);
+    }
 
     let paragraph = Paragraph::new(lines)
         .scroll((effective_scroll as u16, 0))
@@ -922,6 +936,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn manual_scroll_position_persists_when_new_entries_arrive() {
+        // Sticky-scroll regression test: once the user has scrolled to a
+        // specific line, appending more history must not shift what is
+        // displayed in the viewport.
+        let mut app = app_in_session_with(many_info_entries(50));
+        let before = render_with_scroll(&mut app, 5, 60, 16);
+        // Append more entries (simulating streaming output).
+        let a = app.agents.iter_mut().find(|a| a.id == "a1").unwrap();
+        for i in 50..70 {
+            a.info(format!("line {i}"));
+        }
+        // Re-render with the same explicit scroll value.
+        let after = render_with_scroll(&mut app, 5, 60, 16);
+        assert_eq!(
+            before, after,
+            "appending entries below the viewport must not move what is rendered"
+        );
+    }
+
     #[tokio::test]
     async fn rehydration_renders_latest_turn_visible() {
         // Simulate session/load: a long replayed conversation. After all
@@ -934,7 +968,7 @@ mod tests {
             agent_id: "a1".into(),
             focus: SessionFocus::Conversation,
             side_pane: None,
-            scroll: 0,
+            scroll: usize::MAX,
             input_mode: false,
         };
 
