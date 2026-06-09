@@ -564,4 +564,302 @@ mod tests {
             "conversation must remain visible"
         );
     }
+
+    // ─── render_history_entry coverage ────────────────────────────────────
+    //
+    // These tests exercise the new handle-based conversation rendering.
+    // We construct watch channels by hand (the same way the runtime does
+    // internally) and drive them synchronously, then render to a
+    // TestBackend and scrape the resulting cell buffer.
+
+    use crate::agent::HistoryEntry;
+    use fleet_commander_core::session::{
+        AssistantMessage as AssistantHandle, MessageStatus, Thought as ThoughtHandle,
+        ToolCall as ToolCallHandle, ToolCallStatusKind, UserMessage as UserHandle,
+    };
+    use tokio::sync::watch;
+
+    /// Build an app whose first agent is parked in a session screen so
+    /// `render_conversation` is the target of any frame draw.
+    fn app_in_session_with(history: Vec<HistoryEntry>) -> App {
+        let mut app = test_app();
+        if let Some(agent) = app.agents.iter_mut().find(|a| a.id == "a1") {
+            agent.history = history;
+        }
+        app.screen = Screen::AgentSession {
+            agent_id: "a1".into(),
+            focus: SessionFocus::Conversation,
+            side_pane: None,
+            // usize::MAX = follow bottom — same as the live app.
+            scroll: usize::MAX,
+            input_mode: false,
+        };
+        app
+    }
+
+    fn render_to_string(app: &App, cols: u16, rows: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        buffer_text(&terminal)
+    }
+
+    fn assistant(
+        initial: &str,
+        status: MessageStatus,
+    ) -> (
+        HistoryEntry,
+        watch::Sender<String>,
+        watch::Sender<MessageStatus>,
+    ) {
+        let (text_tx, text_rx) = watch::channel(initial.to_string());
+        let (status_tx, status_rx) = watch::channel(status);
+        (
+            HistoryEntry::Assistant(AssistantHandle {
+                text: text_rx,
+                status: status_rx,
+            }),
+            text_tx,
+            status_tx,
+        )
+    }
+
+    fn thought(
+        initial: &str,
+        status: MessageStatus,
+    ) -> HistoryEntry {
+        let (_text_tx, text_rx) = watch::channel(initial.to_string());
+        let (_status_tx, status_rx) = watch::channel(status);
+        // Leak the senders so the receivers keep yielding the initial value
+        // for the lifetime of the test render.
+        Box::leak(Box::new((_text_tx, _status_tx)));
+        HistoryEntry::Thought(ThoughtHandle {
+            text: text_rx,
+            status: status_rx,
+        })
+    }
+
+    fn user(initial: &str) -> HistoryEntry {
+        let (text_tx, text_rx) = watch::channel(initial.to_string());
+        let (status_tx, status_rx) = watch::channel(MessageStatus::Completed);
+        Box::leak(Box::new((text_tx, status_tx)));
+        HistoryEntry::User(UserHandle {
+            text: text_rx,
+            status: status_rx,
+        })
+    }
+
+    fn tool(
+        id: &str,
+        title: &str,
+        status: ToolCallStatusKind,
+    ) -> (
+        HistoryEntry,
+        watch::Sender<String>,
+        watch::Sender<ToolCallStatusKind>,
+    ) {
+        let (title_tx, title_rx) = watch::channel(title.to_string());
+        let (status_tx, status_rx) = watch::channel(status);
+        (
+            HistoryEntry::Tool(ToolCallHandle {
+                id: id.to_string(),
+                title: title_rx,
+                status: status_rx,
+            }),
+            title_tx,
+            status_tx,
+        )
+    }
+
+    #[test]
+    fn empty_conversation_shows_placeholder() {
+        let app = app_in_session_with(vec![]);
+        let text = render_to_string(&app, 60, 12);
+        assert!(
+            text.contains("(no messages yet)"),
+            "expected placeholder, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn info_and_error_entries_render_plain_text() {
+        let app = app_in_session_with(vec![
+            HistoryEntry::Info("ACP session connected.".into()),
+            HistoryEntry::Error("[error] connection lost".into()),
+        ]);
+        let text = render_to_string(&app, 60, 12);
+        assert!(text.contains("ACP session connected."));
+        assert!(text.contains("connection lost"));
+    }
+
+    #[test]
+    fn prompt_entry_has_caret_prefix() {
+        let app = app_in_session_with(vec![HistoryEntry::Prompt("hello there".into())]);
+        let text = render_to_string(&app, 60, 12);
+        assert!(
+            text.contains("> hello there"),
+            "expected `> hello there`, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn streaming_assistant_shows_cursor() {
+        let (entry, text_tx, _status_tx) = assistant("", MessageStatus::Streaming);
+        let app = app_in_session_with(vec![entry]);
+        // Empty body: cursor `▊` should be visible.
+        let text = render_to_string(&app, 60, 12);
+        assert!(text.contains('▊'), "expected cursor while streaming");
+
+        // Push some content; cursor remains because still streaming.
+        text_tx.send("Hello, wor".to_string()).unwrap();
+        let text = render_to_string(&app, 60, 12);
+        assert!(text.contains("Hello, wor"));
+        assert!(text.contains('▊'));
+    }
+
+    #[test]
+    fn completed_assistant_renders_without_cursor() {
+        let (entry, text_tx, status_tx) = assistant("", MessageStatus::Streaming);
+        let app = app_in_session_with(vec![entry]);
+
+        text_tx.send("Plain reply".to_string()).unwrap();
+        status_tx.send(MessageStatus::Completed).unwrap();
+
+        let text = render_to_string(&app, 60, 12);
+        assert!(text.contains("Plain reply"));
+        assert!(!text.contains('▊'), "cursor should be gone once terminal");
+    }
+
+    #[test]
+    fn completed_assistant_renders_markdown_heading() {
+        let (entry, text_tx, status_tx) = assistant("", MessageStatus::Streaming);
+        let app = app_in_session_with(vec![entry]);
+
+        text_tx
+            .send("# Big Heading\n\nbody line".to_string())
+            .unwrap();
+        status_tx.send(MessageStatus::Completed).unwrap();
+
+        let text = render_to_string(&app, 60, 12);
+        // Both heading text and body survive the markdown pipeline.
+        assert!(text.contains("Big Heading"), "got:\n{text}");
+        assert!(text.contains("body line"));
+    }
+
+    #[test]
+    fn streaming_assistant_does_not_run_markdown_pipeline() {
+        // A streaming assistant with markdown-looking content should NOT
+        // collapse paragraph breaks — we render it as raw streaming text.
+        let (entry, text_tx, _status_tx) = assistant("", MessageStatus::Streaming);
+        let app = app_in_session_with(vec![entry]);
+        text_tx
+            .send("first paragraph\n\nsecond paragraph".to_string())
+            .unwrap();
+
+        let text = render_to_string(&app, 60, 12);
+        assert!(text.contains("first paragraph"));
+        assert!(text.contains("second paragraph"));
+        // Cursor visible because still streaming.
+        assert!(text.contains('▊'));
+    }
+
+    #[test]
+    fn streaming_thought_collapses_to_preview() {
+        let long = "x".repeat(200);
+        let app = app_in_session_with(vec![thought(&long, MessageStatus::Streaming)]);
+        let text = render_to_string(&app, 100, 12);
+        assert!(text.contains('💭'), "expected thought marker");
+        assert!(text.contains('…'), "streaming thought should be truncated");
+    }
+
+    #[test]
+    fn completed_thought_renders_full_body() {
+        let app = app_in_session_with(vec![thought(
+            "I should call read_file next.",
+            MessageStatus::Completed,
+        )]);
+        let text = render_to_string(&app, 80, 12);
+        assert!(text.contains('💭'));
+        assert!(text.contains("I should call read_file next."));
+        assert!(
+            !text.contains('…'),
+            "completed thought should not be truncated"
+        );
+    }
+
+    #[test]
+    fn user_message_uses_caret_prefix() {
+        let app = app_in_session_with(vec![user("previous question")]);
+        let text = render_to_string(&app, 60, 12);
+        assert!(text.contains("> previous question"));
+    }
+
+    #[test]
+    fn tool_call_marker_reflects_status_transitions() {
+        let (entry, title_tx, status_tx) =
+            tool("call_1", "read_file", ToolCallStatusKind::InProgress);
+        let app = app_in_session_with(vec![entry]);
+
+        // InProgress: ⏳ marker.
+        let text = render_to_string(&app, 60, 12);
+        assert!(text.contains('⏳'), "got:\n{text}");
+        assert!(text.contains("read_file"));
+
+        // Title update + status transition reflect on next render without
+        // a new HistoryEntry.
+        title_tx.send("read_file (cached)".to_string()).unwrap();
+        status_tx.send(ToolCallStatusKind::Completed).unwrap();
+
+        let text = render_to_string(&app, 60, 12);
+        assert!(text.contains('✓'));
+        assert!(text.contains("read_file (cached)"));
+        assert!(!text.contains('⏳'));
+    }
+
+    #[test]
+    fn failed_tool_call_uses_cross_marker() {
+        let (entry, _title_tx, _status_tx) =
+            tool("call_2", "shell", ToolCallStatusKind::Failed);
+        // Keep the senders alive for the duration of the render.
+        Box::leak(Box::new((_title_tx, _status_tx)));
+        let app = app_in_session_with(vec![entry]);
+        let text = render_to_string(&app, 60, 12);
+        assert!(text.contains('✗'));
+    }
+
+    #[test]
+    fn empty_tool_title_falls_back_to_placeholder() {
+        let (entry, _title_tx, _status_tx) =
+            tool("call_3", "", ToolCallStatusKind::InProgress);
+        Box::leak(Box::new((_title_tx, _status_tx)));
+        let app = app_in_session_with(vec![entry]);
+        let text = render_to_string(&app, 60, 12);
+        assert!(text.contains("(tool)"));
+    }
+
+    #[test]
+    fn mixed_history_renders_in_order() {
+        let (assistant_entry, assistant_text, assistant_status) =
+            assistant("", MessageStatus::Streaming);
+        assistant_text.send("All done.".to_string()).unwrap();
+        assistant_status.send(MessageStatus::Completed).unwrap();
+        let (tool_entry, _tt, _ts) =
+            tool("t1", "list_files", ToolCallStatusKind::Completed);
+        Box::leak(Box::new((_tt, _ts)));
+
+        let app = app_in_session_with(vec![
+            HistoryEntry::Prompt("show me everything".into()),
+            HistoryEntry::Info("ACP session connected.".into()),
+            tool_entry,
+            assistant_entry,
+        ]);
+        let text = render_to_string(&app, 80, 12);
+        let prompt_pos = text.find("show me everything").expect("prompt");
+        let info_pos = text.find("ACP session connected.").expect("info");
+        let tool_pos = text.find("list_files").expect("tool");
+        let assistant_pos = text.find("All done.").expect("assistant");
+        assert!(
+            prompt_pos < info_pos && info_pos < tool_pos && tool_pos < assistant_pos,
+            "entries rendered out of order:\n{text}"
+        );
+    }
 }
