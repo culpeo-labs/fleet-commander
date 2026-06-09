@@ -244,13 +244,22 @@ fn spawn_input_task(tx: mpsc::UnboundedSender<AppEvent>) -> tokio::task::JoinHan
         let mut events = EventStream::new();
         while let Some(event) = events.next().await {
             let Ok(event) = event else { break };
-            if let Event::Key(key) = event {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            match event {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    if tx.send(AppEvent::Input(key)).is_err() {
+                        break;
+                    }
                 }
-                if tx.send(AppEvent::Input(key)).is_err() {
+                Event::Resize(_, _) if tx.send(AppEvent::Repaint).is_err() => {
+                    // The terminal was resized — wake the event loop so it
+                    // re-renders at the new dimensions. Without this the
+                    // visible frame is stale until the user types something.
                     break;
                 }
+                _ => {}
             }
         }
     })
