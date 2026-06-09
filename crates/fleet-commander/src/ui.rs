@@ -6,7 +6,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
+    },
 };
 use std::sync::LazyLock;
 use syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet};
@@ -269,13 +272,24 @@ fn render_conversation(
         })
         .unwrap_or_default();
 
-    // Compute effective scroll: usize::MAX means "follow bottom".
+    // The paragraph wraps long lines, so the visible row count is *not*
+    // equal to `lines.len()`. Build the paragraph first and ask it how
+    // many rendered rows it will produce at the inner width, then use
+    // that to clamp scroll. Without this, follow-bottom mode crops the
+    // last N rows whenever any line wraps.
+    //
+    // Note: `Paragraph::line_count` includes the block's vertical border
+    // space, so we measure *before* attaching the block to avoid
+    // double-counting the two border rows.
+    let inner_width = area.width.saturating_sub(2); // minus borders
     let viewport_height = area.height.saturating_sub(2) as usize; // minus borders
-    let total_lines = lines.len();
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let total_rows = paragraph.line_count(inner_width);
+    let max_scroll = total_rows.saturating_sub(viewport_height);
     let effective_scroll = if scroll == usize::MAX {
-        total_lines.saturating_sub(viewport_height)
+        max_scroll
     } else {
-        scroll.min(total_lines.saturating_sub(viewport_height))
+        scroll.min(max_scroll)
     };
 
     // Stash the computed top-of-viewport line so that the synchronous
@@ -285,16 +299,27 @@ fn render_conversation(
         a.last_effective_top.set(effective_scroll);
     }
 
-    let paragraph = Paragraph::new(lines)
-        .scroll((effective_scroll as u16, 0))
-        .wrap(Wrap { trim: false })
+    let paragraph = paragraph
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Conversation ")
                 .border_style(style),
-        );
+        )
+        .scroll((effective_scroll as u16, 0));
     frame.render_widget(paragraph, area);
+
+    // Render a scrollbar on the right border whenever content overflows
+    // the viewport. The scrollbar overlays the block's right border so it
+    // doesn't steal any text column.
+    if max_scroll > 0 {
+        let mut scrollbar_state = ScrollbarState::new(max_scroll).position(effective_scroll);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(style)
+            .begin_symbol(None)
+            .end_symbol(None);
+        frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+    }
 }
 
 /// Append a single history entry to the rendered line buffer.
@@ -923,6 +948,39 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_appears_when_content_overflows_viewport() {
+        // With 50 entries in a small viewport, content overflows so the
+        // scrollbar thumb (█) and track (║) should be rendered on the
+        // right border of the conversation pane.
+        let mut app = app_in_session_with(many_info_entries(50));
+        let text = render_with_scroll(&mut app, usize::MAX, 60, 16);
+        assert!(
+            text.contains('█'),
+            "expected scrollbar thumb when content overflows, got:\n{text}"
+        );
+        assert!(
+            text.contains('║'),
+            "expected scrollbar track when content overflows, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn scrollbar_hidden_when_content_fits_in_viewport() {
+        // With only a handful of entries, content fits entirely so no
+        // scrollbar overlay should appear.
+        let mut app = app_in_session_with(many_info_entries(3));
+        let text = render_with_scroll(&mut app, usize::MAX, 60, 16);
+        assert!(
+            !text.contains('█'),
+            "scrollbar thumb should not render when content fits, got:\n{text}"
+        );
+        assert!(
+            !text.contains('║'),
+            "scrollbar track should not render when content fits, got:\n{text}"
+        );
+    }
+
+    #[test]
     fn manual_scroll_position_persists_when_new_entries_arrive() {
         // Sticky-scroll regression test: once the user has scrolled to a
         // specific line, appending more history must not shift what is
@@ -936,8 +994,23 @@ mod tests {
         }
         // Re-render with the same explicit scroll value.
         let after = render_with_scroll(&mut app, 5, 60, 16);
+        // Strip the right-most column from each line: the scrollbar lives
+        // on the right border and its thumb size shrinks as content grows
+        // (which is the *correct* visual signal, but unrelated to whether
+        // the anchored content shifted).
+        let strip_rightmost = |s: &str| -> String {
+            s.lines()
+                .map(|line| {
+                    let mut chars: Vec<char> = line.chars().collect();
+                    chars.pop();
+                    chars.into_iter().collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         assert_eq!(
-            before, after,
+            strip_rightmost(&before),
+            strip_rightmost(&after),
             "appending entries below the viewport must not move what is rendered"
         );
     }
