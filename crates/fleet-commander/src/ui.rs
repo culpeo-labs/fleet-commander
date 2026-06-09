@@ -862,4 +862,117 @@ mod tests {
             "entries rendered out of order:\n{text}"
         );
     }
+
+    // ─── scroll / follow-bottom rendering ─────────────────────────────────
+
+    /// Build many Info entries so the conversation overflows the viewport.
+    fn many_info_entries(n: usize) -> Vec<HistoryEntry> {
+        (0..n)
+            .map(|i| HistoryEntry::Info(format!("line {i}")))
+            .collect()
+    }
+
+    /// Render with an explicit `scroll` value (instead of `usize::MAX`).
+    fn render_with_scroll(app: &mut App, scroll: usize, cols: u16, rows: u16) -> String {
+        if let Screen::AgentSession {
+            scroll: s, ..
+        } = &mut app.screen
+        {
+            *s = scroll;
+        }
+        render_to_string(app, cols, rows)
+    }
+
+    #[test]
+    fn follow_bottom_shows_most_recent_entries_when_overflowing() {
+        // 50 entries, viewport ~10 lines (12 rows - header - footer - borders).
+        let mut app = app_in_session_with(many_info_entries(50));
+        // usize::MAX => follow bottom.
+        let text = render_with_scroll(&mut app, usize::MAX, 60, 16);
+        // The latest entries should be visible.
+        assert!(text.contains("line 49"), "expected last entry, got:\n{text}");
+        assert!(text.contains("line 48"));
+        // The earliest must have scrolled out of view.
+        assert!(
+            !text.contains("line 0\n") && !text.contains("line 1\n"),
+            "early entries should be off-screen:\n{text}"
+        );
+    }
+
+    #[test]
+    fn scroll_at_zero_shows_oldest_entries() {
+        let mut app = app_in_session_with(many_info_entries(50));
+        let text = render_with_scroll(&mut app, 0, 60, 16);
+        assert!(text.contains("line 0"), "expected first entry, got:\n{text}");
+        assert!(text.contains("line 1"));
+        // Last lines are clearly off-screen for a 50-entry buffer with a
+        // viewport of ~10 lines.
+        assert!(!text.contains("line 49"));
+    }
+
+    #[test]
+    fn scroll_clamps_when_set_past_end() {
+        // A scroll value far beyond the actual content length should clamp
+        // to the bottom, not produce a blank pane.
+        let mut app = app_in_session_with(many_info_entries(50));
+        let text = render_with_scroll(&mut app, 10_000, 60, 16);
+        assert!(
+            text.contains("line 49"),
+            "out-of-range scroll must clamp to bottom, got:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rehydration_renders_latest_turn_visible() {
+        // Simulate session/load: a long replayed conversation. After all
+        // events are processed, the latest exchange must be the one shown.
+        use crate::event::AppEvent;
+        use fleet_commander_core::session::SessionEvent;
+
+        let mut app = test_app();
+        app.screen = Screen::AgentSession {
+            agent_id: "a1".into(),
+            focus: SessionFocus::Conversation,
+            side_pane: None,
+            scroll: 0,
+            input_mode: false,
+        };
+
+        // 20 prior turns (40 entries) — easily overflows any reasonable viewport.
+        for i in 0..20 {
+            let (text_tx, text_rx) = watch::channel(format!("question {i}"));
+            let (status_tx, status_rx) = watch::channel(MessageStatus::Completed);
+            let _ = (text_tx, status_tx);
+            app.handle(AppEvent::Session(SessionEvent::UserMessage {
+                agent_id: "a1".into(),
+                message: UserHandle {
+                    text: text_rx,
+                    status: status_rx,
+                },
+            }));
+
+            let (text_tx, text_rx) = watch::channel(format!("answer {i}"));
+            let (status_tx, status_rx) = watch::channel(MessageStatus::Completed);
+            let _ = (text_tx, status_tx);
+            app.handle(AppEvent::Session(SessionEvent::AssistantMessage {
+                agent_id: "a1".into(),
+                message: AssistantHandle {
+                    text: text_rx,
+                    status: status_rx,
+                },
+            }));
+        }
+
+        let text = render_to_string(&app, 80, 18);
+        assert!(
+            text.contains("answer 19"),
+            "expected most recent answer to be visible, got:\n{text}"
+        );
+        assert!(text.contains("question 19"));
+        // The first turn must have scrolled off-screen.
+        assert!(
+            !text.contains("question 0\n") && !text.contains("answer 0\n"),
+            "oldest turn should not be visible after rehydration:\n{text}"
+        );
+    }
 }

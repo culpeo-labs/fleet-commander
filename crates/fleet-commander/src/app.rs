@@ -1184,4 +1184,212 @@ mod tests {
             _ => panic!("expected tool entry"),
         }
     }
+
+    // ─── scrolling ────────────────────────────────────────────────────────
+
+    /// Drive the app into a session screen with a known scroll offset so we
+    /// can verify how events / key actions mutate it.
+    fn app_in_session(scroll: usize) -> App {
+        let mut app = app_with_agents();
+        app.screen = Screen::AgentSession {
+            agent_id: "a1".into(),
+            focus: super::SessionFocus::Conversation,
+            side_pane: None,
+            scroll,
+            input_mode: false,
+        };
+        app
+    }
+
+    fn current_scroll(app: &App) -> usize {
+        match &app.screen {
+            Screen::AgentSession { scroll, .. } => *scroll,
+            _ => panic!("expected AgentSession"),
+        }
+    }
+
+    #[test]
+    fn incoming_event_for_current_agent_follows_bottom() {
+        let mut app = app_in_session(5);
+        app.handle(AppEvent::Session(SessionEvent::Output {
+            agent_id: "a1".into(),
+            line: "new line".into(),
+        }));
+        assert_eq!(
+            current_scroll(&app),
+            usize::MAX,
+            "scroll should snap to bottom on new content"
+        );
+    }
+
+    #[test]
+    fn incoming_event_for_other_agent_does_not_change_scroll() {
+        let mut app = app_in_session(5);
+        // Viewing a1, event arrives for a2.
+        app.handle(AppEvent::Session(SessionEvent::Output {
+            agent_id: "a2".into(),
+            line: "new line".into(),
+        }));
+        assert_eq!(
+            current_scroll(&app),
+            5,
+            "scroll for a1 must not move when a2 receives content"
+        );
+    }
+
+    #[test]
+    fn repaint_event_follows_bottom() {
+        // The Repaint event is what tracker tasks emit when a handle's
+        // watch channel ticks; it must keep the auto-follow behaviour.
+        let mut app = app_in_session(3);
+        app.handle(AppEvent::Repaint {
+            agent_id: "a1".into(),
+        });
+        assert_eq!(current_scroll(&app), usize::MAX);
+    }
+
+    #[test]
+    fn down_action_increments_scroll() {
+        let mut app = app_in_session(0);
+        app.handle(press(KeyCode::Char('j')));
+        assert_eq!(current_scroll(&app), 1);
+        app.handle(press(KeyCode::Char('j')));
+        assert_eq!(current_scroll(&app), 2);
+    }
+
+    #[test]
+    fn up_action_saturates_at_zero() {
+        let mut app = app_in_session(1);
+        app.handle(press(KeyCode::Char('k')));
+        assert_eq!(current_scroll(&app), 0);
+        app.handle(press(KeyCode::Char('k')));
+        assert_eq!(
+            current_scroll(&app),
+            0,
+            "scrolling up past 0 must saturate, not underflow"
+        );
+    }
+
+    #[test]
+    fn manual_scroll_is_overridden_by_next_event() {
+        // Current behavior: any incoming event re-pins to bottom even if
+        // the user had scrolled away. This is documented here as a
+        // regression test — change with intent.
+        let mut app = app_in_session(usize::MAX);
+        app.handle(press(KeyCode::Char('k'))); // scroll up
+        assert_eq!(current_scroll(&app), usize::MAX.saturating_sub(1));
+        app.handle(AppEvent::Session(SessionEvent::Output {
+            agent_id: "a1".into(),
+            line: "interrupt".into(),
+        }));
+        assert_eq!(current_scroll(&app), usize::MAX);
+    }
+
+    // ─── session rehydration ──────────────────────────────────────────────
+    //
+    // During session/load the agent replays prior turns as a sequence of
+    // SessionEvent::UserMessage and SessionEvent::AssistantMessage events
+    // (with handles whose status quickly transitions to Completed). The
+    // app must:
+    //   - append each entry to history in arrival order;
+    //   - auto-follow to the bottom after each event so the most recent
+    //     turn is the one the user sees.
+
+    fn replayed_assistant(body: &str) -> fleet_commander_core::session::AssistantMessage {
+        use tokio::sync::watch;
+        let (text_tx, text_rx) = watch::channel(body.to_string());
+        let (status_tx, status_rx) =
+            watch::channel(fleet_commander_core::session::MessageStatus::Completed);
+        // Senders are dropped after the channels are seeded, which is fine
+        // for replayed (terminal) entries — the receiver still yields the
+        // last value via `borrow()`.
+        let _ = (text_tx, status_tx);
+        fleet_commander_core::session::AssistantMessage {
+            text: text_rx,
+            status: status_rx,
+        }
+    }
+
+    fn replayed_user(body: &str) -> fleet_commander_core::session::UserMessage {
+        use tokio::sync::watch;
+        let (text_tx, text_rx) = watch::channel(body.to_string());
+        let (status_tx, status_rx) =
+            watch::channel(fleet_commander_core::session::MessageStatus::Completed);
+        let _ = (text_tx, status_tx);
+        fleet_commander_core::session::UserMessage {
+            text: text_rx,
+            status: status_rx,
+        }
+    }
+
+    #[tokio::test]
+    async fn session_rehydration_appends_history_in_order_and_follows_bottom() {
+        let mut app = app_in_session(0);
+
+        // Simulate session/load replay: a few prior turns.
+        let turns = [
+            ("first question", "first answer"),
+            ("second question", "second answer"),
+            ("third question", "third answer"),
+        ];
+        for (q, a) in turns.iter() {
+            app.handle(AppEvent::Session(SessionEvent::UserMessage {
+                agent_id: "a1".into(),
+                message: replayed_user(q),
+            }));
+            app.handle(AppEvent::Session(SessionEvent::AssistantMessage {
+                agent_id: "a1".into(),
+                message: replayed_assistant(a),
+            }));
+        }
+
+        let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        assert_eq!(
+            a1.history.len(),
+            6,
+            "all 6 replayed entries (3 turns) must be in history"
+        );
+
+        // Verify order: User, Assistant, User, Assistant, User, Assistant.
+        let mut iter = a1.history.iter();
+        for (q, a) in turns.iter() {
+            match iter.next().unwrap() {
+                HistoryEntry::User(u) => assert_eq!(u.text.borrow().as_str(), *q),
+                other => panic!("expected User, got {other:?}"),
+            }
+            match iter.next().unwrap() {
+                HistoryEntry::Assistant(m) => assert_eq!(m.text.borrow().as_str(), *a),
+                other => panic!("expected Assistant, got {other:?}"),
+            }
+        }
+
+        // Scroll must be pinned to bottom.
+        assert_eq!(
+            current_scroll(&app),
+            usize::MAX,
+            "scroll must auto-follow during rehydration"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_rehydration_for_inactive_agent_does_not_move_scroll() {
+        let mut app = app_in_session(7);
+        // App is viewing a1; rehydration arrives for a2.
+        app.handle(AppEvent::Session(SessionEvent::UserMessage {
+            agent_id: "a2".into(),
+            message: replayed_user("not me"),
+        }));
+        app.handle(AppEvent::Session(SessionEvent::AssistantMessage {
+            agent_id: "a2".into(),
+            message: replayed_assistant("nor me"),
+        }));
+        assert_eq!(
+            current_scroll(&app),
+            7,
+            "scroll for a1 must not move when a2 rehydrates"
+        );
+        // But a2's history must have grown.
+        let a2 = app.agents.iter().find(|a| a.id == "a2").unwrap();
+        assert_eq!(a2.history.len(), 2);
+    }
 }
