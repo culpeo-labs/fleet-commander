@@ -1,0 +1,19 @@
+[package]
+name = "fleet-commander-core"
+description = "Devcontainer lifecycle and ACP (Agent Client Protocol) runtime for Fleet Commander"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+agent-client-protocol.workspace = true
+devcontainer-lib.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

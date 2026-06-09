@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use dialoguer::{Confirm, Select};
 
+use fleet_commander_core::base_layer::{workspace_layer_dir, workspace_slug};
+
 use crate::agent::Agent;
 use crate::agent_kind::AgentKind;
 use crate::workspace;
@@ -230,59 +232,6 @@ pub fn generate_workspace_layer(workspace: &Path, agent_kind: AgentKind) -> Resu
     std::fs::write(&layer_path, &json)?;
 
     Ok(())
-}
-
-/// Path to fleet-commander's config directory.
-pub fn fleet_commander_config_dir() -> Result<PathBuf> {
-    let dir = dirs::config_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
-        .join("fleet-commander");
-    Ok(dir)
-}
-
-/// Directory for a workspace's base layer.
-fn workspace_layer_dir(workspace: &Path) -> Result<PathBuf> {
-    let slug = workspace_slug(workspace);
-    let dir = fleet_commander_config_dir()?.join("layers").join(slug);
-    Ok(dir)
-}
-
-/// Stable slug for a workspace path (last component, or hash if ambiguous).
-pub fn workspace_slug(workspace: &Path) -> String {
-    workspace
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{:x}", fxhash(workspace)))
-}
-
-/// Simple hash for workspace paths that don't have a clean file name.
-fn fxhash(path: &Path) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Path to the base devcontainer layer for a workspace, if it exists.
-pub fn base_layer_path_for(workspace: &Path) -> Option<PathBuf> {
-    let path = workspace_layer_dir(workspace).ok()?.join("devcontainer.json");
-    if path.is_file() { Some(path) } else { None }
-}
-
-/// Per-workspace data directory for persisting runtime state (sessions, tokens).
-///
-/// Located at `~/.local/share/fleet-commander/<slug>/`.
-pub fn workspace_data_dir(workspace: &Path) -> Option<PathBuf> {
-    let slug = workspace_slug(workspace);
-    let dir = dirs::data_dir()?.join("fleet-commander").join(slug);
-    Some(dir)
-}
-
-/// Legacy: global base layer path (kept for backward compat during transition).
-pub fn base_layer_path() -> Option<PathBuf> {
-    let path = fleet_commander_config_dir().ok()?.join("base-devcontainer.json");
-    if path.is_file() { Some(path) } else { None }
 }
 
 #[cfg(test)]

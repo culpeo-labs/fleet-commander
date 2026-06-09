@@ -1,16 +1,16 @@
-//! The single event the application loop reacts to. Everything that wants
-//! to nudge the UI (input, agent output, file changes) flows through this
-//! enum into the main `select!` loop.
+//! Events emitted by the ACP runtime to its consumer (typically a TUI).
+//!
+//! The runtime is decoupled from any specific frontend: it pushes
+//! `RuntimeEvent`s onto an `mpsc::UnboundedSender` provided at startup and
+//! lets the consumer translate them into application-level events.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crossterm::event::KeyEvent;
+pub type AgentId = String;
 
-use crate::agent::AgentId;
-use crate::change_source::ChangeEvent;
-
-/// A oneshot reply channel for permission responses, wrapped so AppEvent
-/// can derive Clone (the sender is taken once when the user responds).
+/// A oneshot reply channel for permission responses, wrapped so events stay
+/// `Clone` (the sender is taken once when the consumer responds).
 pub type PermissionReply = Arc<Mutex<Option<tokio::sync::oneshot::Sender<Option<String>>>>>;
 
 /// Execution status reported by the agent for a tool call. Mirrors the ACP
@@ -25,9 +25,7 @@ pub enum ToolCallStatusKind {
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub enum AppEvent {
-    Input(KeyEvent),
-    Change(ChangeEvent),
+pub enum RuntimeEvent {
     AgentOutput {
         agent_id: AgentId,
         line: String,
@@ -35,23 +33,6 @@ pub enum AppEvent {
     AgentExited {
         agent_id: AgentId,
         code: Option<i32>,
-    },
-    /// An MCP client called the `show_diff` tool.
-    McpShowDiff {
-        agent_id: AgentId,
-        path: std::path::PathBuf,
-        content: String,
-    },
-    /// An MCP client called the `show_file` tool.
-    McpShowFile {
-        agent_id: AgentId,
-        path: std::path::PathBuf,
-        content: String,
-    },
-    /// An MCP client called the `notify` tool.
-    McpNotify {
-        agent_id: AgentId,
-        message: String,
     },
     /// Streaming text chunk from the ACP agent.
     AssistantDelta {
@@ -79,8 +60,8 @@ pub enum AppEvent {
         message: String,
     },
     /// The ACP agent reported a tool call (initial registration or status
-    /// update). Identified by `tool_call_id`; the app upserts a single
-    /// history entry per id so completion replaces the running entry
+    /// update). Identified by `tool_call_id`; consumers should upsert a
+    /// single entry per id so completion replaces the running entry
     /// in-place instead of appending duplicates.
     ToolCallUpdate {
         agent_id: AgentId,
@@ -98,14 +79,10 @@ pub enum AppEvent {
         session_id: Option<String>,
     },
     /// The agent needs interactive authentication (e.g. `copilot login`).
-    /// The main loop should suspend the TUI and run the command interactively.
+    /// The consumer should suspend its UI and run the command interactively.
     AuthRequired {
         agent_id: AgentId,
         command: Vec<String>,
-    },
-    /// Request to reconnect an agent (e.g. after container rebuild).
-    ReconnectAgent {
-        agent_id: AgentId,
     },
     /// The agent is requesting tool-use permission from the user.
     /// Send `Some(option_id)` to approve or `None` to cancel via the reply channel.
@@ -116,4 +93,35 @@ pub enum AppEvent {
         options: Vec<(String, String, String)>,
         reply: PermissionReply,
     },
+}
+
+#[allow(dead_code)]
+impl RuntimeEvent {
+    /// The agent id this event is about.
+    pub fn agent_id(&self) -> &AgentId {
+        match self {
+            RuntimeEvent::AgentOutput { agent_id, .. }
+            | RuntimeEvent::AgentExited { agent_id, .. }
+            | RuntimeEvent::AssistantDelta { agent_id, .. }
+            | RuntimeEvent::ThoughtDelta { agent_id, .. }
+            | RuntimeEvent::UserMessageDelta { agent_id, .. }
+            | RuntimeEvent::AssistantDone { agent_id }
+            | RuntimeEvent::SessionError { agent_id, .. }
+            | RuntimeEvent::ToolCallUpdate { agent_id, .. }
+            | RuntimeEvent::AgentConnected { agent_id, .. }
+            | RuntimeEvent::AuthRequired { agent_id, .. }
+            | RuntimeEvent::PermissionRequest { agent_id, .. } => agent_id,
+        }
+    }
+}
+
+/// Reference for what the runtime needs to know about an agent at startup.
+/// Kept tiny to avoid leaking TUI-side state into the runtime crate.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct AgentSpec {
+    pub id: AgentId,
+    pub acp_command: String,
+    pub workspace_folder: Option<PathBuf>,
+    pub previous_session_id: Option<String>,
 }

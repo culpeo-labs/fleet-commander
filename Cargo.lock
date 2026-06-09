@@ -1186,9 +1186,9 @@ dependencies = [
  "axum",
  "clap",
  "crossterm",
- "devcontainer",
  "dialoguer",
  "dirs",
+ "fleet-commander-core",
  "futures-util",
  "notify",
  "portable-pty",
@@ -1209,6 +1209,22 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "vt100",
+]
+
+[[package]]
+name = "fleet-commander-core"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "devcontainer",
+ "dirs",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

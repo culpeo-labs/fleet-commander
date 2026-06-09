@@ -18,13 +18,14 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use fleet_commander_core::event::RuntimeEvent;
+use fleet_commander_core::{agent_runtime, container};
+
 use crate::agent::{Agent, AgentId, AgentStatus};
 use crate::agent_kind::AgentKind;
-use crate::agent_runtime;
 use crate::change_source::ChangeEvent;
 use crate::completion::{PathCompleter, split_command_and_path};
 use crate::config::{Action, Config};
-use crate::container;
 use crate::event::{AppEvent, ToolCallStatusKind};
 use crate::init;
 use crate::workspace;
@@ -89,6 +90,9 @@ pub struct App {
     pub completer: PathCompleter,
     /// Channel for sending events (used to dispatch messages to agents).
     pub tx: mpsc::UnboundedSender<AppEvent>,
+    /// Channel handed to the runtime crate for it to emit `RuntimeEvent`s.
+    /// A bridge task in `main.rs` forwards these into `tx` as `AppEvent`s.
+    pub runtime_tx: mpsc::UnboundedSender<RuntimeEvent>,
     /// Set when an agent needs interactive auth — the main loop suspends the
     /// TUI and runs this command with inherited stdio.
     pub auth_pending: Option<(AgentId, Vec<String>)>,
@@ -115,13 +119,15 @@ pub struct PendingPermission {
 impl App {
     #[cfg(test)]
     pub fn new(config: Config, agents: Vec<Agent>, tx: mpsc::UnboundedSender<AppEvent>) -> Self {
-        Self::with_acp_log(config, agents, tx, None, None)
+        let (runtime_tx, _runtime_rx) = mpsc::unbounded_channel();
+        Self::with_acp_log(config, agents, tx, runtime_tx, None, None)
     }
 
     pub fn with_acp_log(
         config: Config,
         agents: Vec<Agent>,
         tx: mpsc::UnboundedSender<AppEvent>,
+        runtime_tx: mpsc::UnboundedSender<RuntimeEvent>,
         acp_log: Option<Arc<Mutex<File>>>,
         acp_log_filter: Option<String>,
     ) -> Self {
@@ -136,6 +142,7 @@ impl App {
             status_message: None,
             completer: PathCompleter::default(),
             tx,
+            runtime_tx,
             auth_pending: None,
             permission_pending: None,
             acp_log,
@@ -382,7 +389,7 @@ impl App {
                             agent.id.clone(),
                             agent.prompt_tx.as_ref(),
                             message,
-                            self.tx.clone(),
+                            self.runtime_tx.clone(),
                         );
                     }
                     if let Screen::AgentSession { input_mode, .. } = &mut self.screen {
@@ -461,7 +468,7 @@ impl App {
             agent.effective_acp_command(),
             agent.workspace_folder.clone(),
             agent.session_id.clone(),
-            self.tx.clone(),
+            self.runtime_tx.clone(),
             log_for_agent,
         );
         agent.prompt_tx = Some(prompt_tx);

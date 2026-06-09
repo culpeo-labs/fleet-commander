@@ -12,15 +12,16 @@ use std::{io, path::PathBuf, process::Stdio};
 use tokio::sync::mpsc;
 use tracing::{info, warn, error};
 
+use fleet_commander_core::container;
+use fleet_commander_core::event::RuntimeEvent;
+
 mod agent;
 mod agent_kind;
-mod agent_runtime;
 mod app;
 mod change_source;
 mod cli;
 mod completion;
 mod config;
-mod container;
 mod event;
 mod init;
 mod keybind;
@@ -92,6 +93,8 @@ async fn run_tui(
     let mut terminal = setup_terminal()?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+    let (runtime_tx, runtime_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+    spawn_runtime_forwarder(runtime_rx, tx.clone());
 
     // Load persisted workspaces — no more hardcoded mock agents.
     let saved = workspace::load();
@@ -103,7 +106,7 @@ async fn run_tui(
         info!(pattern = %pattern, "ACP log filter active");
     }
 
-    let mut app = App::with_acp_log(config, agents, tx.clone(), acp_log, acp_log_filter);
+    let mut app = App::with_acp_log(config, agents, tx.clone(), runtime_tx, acp_log, acp_log_filter);
 
     let mut input_task = spawn_input_task(tx.clone());
     let _change_handle = start_default_change_source(tx.clone())?;
@@ -218,6 +221,22 @@ fn teardown_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> R
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)?;
     Ok(())
+}
+
+/// Pump `RuntimeEvent`s from the core runtime into the TUI's `AppEvent`
+/// channel. The runtime crate is frontend-agnostic, so this small adapter
+/// is where we adopt its events into our application loop.
+fn spawn_runtime_forwarder(
+    mut rx: mpsc::UnboundedReceiver<RuntimeEvent>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if tx.send(AppEvent::from(event)).is_err() {
+                break;
+            }
+        }
+    })
 }
 
 fn spawn_input_task(tx: mpsc::UnboundedSender<AppEvent>) -> tokio::task::JoinHandle<()> {

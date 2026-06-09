@@ -71,7 +71,7 @@ pub fn save(entries: &[WorkspaceEntry]) -> Result<(), String> {
 
 /// Load runtime state for a workspace from its data directory.
 pub fn load_state(workspace: &std::path::Path) -> WorkspaceState {
-    let Some(data_dir) = crate::init::workspace_data_dir(workspace) else {
+    let Some(data_dir) = fleet_commander_core::base_layer::workspace_data_dir(workspace) else {
         debug!(workspace = %workspace.display(), "No data dir for workspace");
         return WorkspaceState::default();
     };
@@ -91,7 +91,7 @@ pub fn load_state(workspace: &std::path::Path) -> WorkspaceState {
 
 /// Save runtime state for a workspace to its data directory.
 pub fn save_state(workspace: &std::path::Path, state: &WorkspaceState) -> Result<(), String> {
-    let data_dir = crate::init::workspace_data_dir(workspace)
+    let data_dir = fleet_commander_core::base_layer::workspace_data_dir(workspace)
         .ok_or("Could not determine data directory")?;
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("Failed to create data dir: {e}"))?;

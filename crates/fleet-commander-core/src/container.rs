@@ -28,7 +28,7 @@ use devcontainer_lib::runtime::{
 use devcontainer_lib::util::{container_name, workspace_labels, workspace_folder_name};
 use tracing::{info, warn, error, debug};
 
-use crate::init;
+use crate::base_layer;
 
 /// Configuration for running an agent inside a dev container.
 #[derive(Debug, Clone)]
@@ -61,8 +61,8 @@ fn load_merged_config(config_path: &Path) -> Result<DevcontainerConfig, Containe
         .and_then(|p| p.parent()) // .devcontainer/ -> project root
         .unwrap_or(Path::new("/"));
 
-    let base_path = init::base_layer_path_for(workspace)
-        .or_else(|| init::base_layer_path());
+    let base_path = base_layer::base_layer_path_for(workspace)
+        .or_else(|| base_layer::base_layer_path());
 
     if let Some(ref base_path) = base_path {
         debug!(layer = %base_path.display(), "Merging base layer");
