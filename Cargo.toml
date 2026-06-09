@@ -9,7 +9,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/culpeo-labs/term"
+repository = "https://github.com/culpeo-labs/fleet-commander"
 
 [workspace.dependencies]
 anyhow = "1.0.102"

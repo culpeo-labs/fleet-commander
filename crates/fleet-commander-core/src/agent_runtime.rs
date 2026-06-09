@@ -24,7 +24,8 @@ use tokio::sync::mpsc;
 use tracing::{info, error};
 
 use crate::container::{self, ContainerConfig};
-use crate::event::{AgentId, RuntimeEvent, ToolCallStatusKind};
+use crate::session::{AgentId, SessionEvent, ToolCallStatusKind};
+use crate::session_state::SessionStateMachine;
 
 /// Shared handle to the optional ACP wire-log file. Cloned cheaply across
 /// agent tasks so all of them write into the same file.
@@ -43,7 +44,7 @@ pub fn start_agent(
     acp_command: String,
     workspace_folder: Option<PathBuf>,
     previous_session_id: Option<String>,
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: mpsc::UnboundedSender<SessionEvent>,
     acp_log: Option<AcpLog>,
 ) -> (mpsc::UnboundedSender<String>, tokio::task::AbortHandle) {
     let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<String>();
@@ -64,7 +65,7 @@ pub fn start_agent(
             let progress_tx = event_tx.clone();
             let progress_aid = agent_id.clone();
             match container::start_container(&config, |msg| {
-                let _ = progress_tx.send(RuntimeEvent::AgentOutput {
+                let _ = progress_tx.send(SessionEvent::Output {
                     agent_id: progress_aid.clone(),
                     line: format!("  ⏳ {msg}"),
                 });
@@ -77,7 +78,7 @@ pub fn start_agent(
                         remote_workspace = %info.remote_workspace_folder,
                         "Container ready"
                     );
-                    let _ = event_tx.send(RuntimeEvent::AgentOutput {
+                    let _ = event_tx.send(SessionEvent::Output {
                         agent_id: agent_id.clone(),
                         line: format!(
                             "Container ready (user: {}, workspace: {})",
@@ -104,11 +105,11 @@ pub fn start_agent(
                 }
                 Err(err) => {
                     error!(agent_id = %agent_id, error = %err, "Container failed to start");
-                    let _ = event_tx.send(RuntimeEvent::SessionError {
+                    let _ = event_tx.send(SessionEvent::Error {
                         agent_id: agent_id.clone(),
                         message: format!("Container failed: {err}"),
                     });
-                    let _ = event_tx.send(RuntimeEvent::AgentExited {
+                    let _ = event_tx.send(SessionEvent::Exited {
                         agent_id,
                         code: None,
                     });
@@ -139,13 +140,13 @@ pub fn start_agent(
         )
         .await
         {
-            let _ = event_tx.send(RuntimeEvent::SessionError {
+            let _ = event_tx.send(SessionEvent::Error {
                 agent_id: agent_id.clone(),
                 message: format!("ACP connection failed: {err}"),
             });
         }
         // Connection ended — mark agent as stopped.
-        let _ = event_tx.send(RuntimeEvent::AgentExited {
+        let _ = event_tx.send(SessionEvent::Exited {
             agent_id,
             code: None,
         });
@@ -155,29 +156,28 @@ pub fn start_agent(
 }
 
 /// Send a prompt through an existing agent connection.
+///
+/// Note: this does not echo the prompt back as a `SessionEvent` — local
+/// echo is purely a frontend concern. The agent itself never sends the
+/// live prompt back; it does replay user messages during `session/load`
+/// via `SessionEvent::UserMessage`.
 pub fn send_message(
     agent_id: AgentId,
     prompt_tx: Option<&mpsc::UnboundedSender<String>>,
     message: String,
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: mpsc::UnboundedSender<SessionEvent>,
 ) {
-    // Echo the user's message.
-    let _ = event_tx.send(RuntimeEvent::AgentOutput {
-        agent_id: agent_id.clone(),
-        line: format!("> {message}"),
-    });
-
     match prompt_tx {
         Some(tx) => {
             if tx.send(message).is_err() {
-                let _ = event_tx.send(RuntimeEvent::SessionError {
+                let _ = event_tx.send(SessionEvent::Error {
                     agent_id,
                     message: "Agent connection closed".into(),
                 });
             }
         }
         None => {
-            let _ = event_tx.send(RuntimeEvent::SessionError {
+            let _ = event_tx.send(SessionEvent::Error {
                 agent_id,
                 message: "Agent not connected — press Enter on agent list to connect".into(),
             });
@@ -192,7 +192,7 @@ async fn run_persistent_connection(
     container_info: Option<&container::ContainerInfo>,
     previous_session_id: Option<String>,
     prompt_rx: mpsc::UnboundedReceiver<String>,
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: mpsc::UnboundedSender<SessionEvent>,
     acp_log: Option<AcpLog>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let prompt_rx = std::sync::Arc::new(tokio::sync::Mutex::new(prompt_rx));
@@ -226,7 +226,7 @@ async fn connect_and_run(
     container_info: Option<&container::ContainerInfo>,
     previous_session_id: Option<String>,
     prompt_rx: std::sync::Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<String>>>,
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: mpsc::UnboundedSender<SessionEvent>,
     acp_log: Option<AcpLog>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut agent = AcpAgent::from_str(acp_command)?;
@@ -240,7 +240,7 @@ async fn connect_and_run(
     let debug_log = acp_log.clone();
     agent = agent.with_debug(move |line, direction| {
         if direction == LineDirection::Stderr {
-            let _ = debug_tx.send(RuntimeEvent::AgentOutput {
+            let _ = debug_tx.send(SessionEvent::Output {
                 agent_id: debug_aid.clone(),
                 line: format!("  {line}"),
             });
@@ -265,15 +265,16 @@ async fn connect_and_run(
 
     let aid = agent_id.clone();
     let tx = event_tx.clone();
+    let state = Arc::new(Mutex::new(SessionStateMachine::new(aid.clone(), tx.clone())));
 
     agent_client_protocol::Client
         .builder()
         .on_receive_notification(
             {
-                let aid = aid.clone();
-                let tx = tx.clone();
+                let state = state.clone();
                 async move |notification: SessionNotification, _cx| {
-                    forward_session_update(&aid, &notification.update, &tx);
+                    let mut sm = state.lock().expect("session state lock poisoned");
+                    apply_session_update(&mut sm, &notification.update);
                     Ok(())
                 }
             },
@@ -312,7 +313,7 @@ async fn connect_and_run(
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                     let reply = std::sync::Arc::new(std::sync::Mutex::new(Some(reply_tx)));
 
-                    let _ = tx.send(RuntimeEvent::PermissionRequest {
+                    let _ = tx.send(SessionEvent::PermissionRequest {
                         agent_id: aid.clone(),
                         tool_name: tool_title.clone(),
                         options,
@@ -322,7 +323,7 @@ async fn connect_and_run(
                     // Wait for the user to respond.
                     match reply_rx.await {
                         Ok(Some(option_id)) => {
-                            let _ = tx.send(RuntimeEvent::AgentOutput {
+                            let _ = tx.send(SessionEvent::Output {
                                 agent_id: aid.clone(),
                                 line: format!("[permission] approved: {tool_title}"),
                             });
@@ -333,7 +334,7 @@ async fn connect_and_run(
                             ))
                         }
                         _ => {
-                            let _ = tx.send(RuntimeEvent::AgentOutput {
+                            let _ = tx.send(SessionEvent::Output {
                                 agent_id: aid.clone(),
                                 line: format!("[permission] denied: {tool_title}"),
                             });
@@ -360,7 +361,7 @@ async fn connect_and_run(
                 if !init_resp.auth_methods.is_empty() {
                     info!(agent_id = %aid, methods = init_resp.auth_methods.len(), "Authentication required");
                     let method = &init_resp.auth_methods[0];
-                    let _ = tx.send(RuntimeEvent::AgentOutput {
+                    let _ = tx.send(SessionEvent::Output {
                         agent_id: aid.clone(),
                         line: format!(
                             "🔑 Authentication required: {} — {}",
@@ -375,13 +376,13 @@ async fn connect_and_run(
                         .await
                     {
                         Ok(_) => {
-                            let _ = tx.send(RuntimeEvent::AgentOutput {
+                            let _ = tx.send(SessionEvent::Output {
                                 agent_id: aid.clone(),
                                 line: "✓ Authentication successful.".into(),
                             });
                         }
                         Err(err) => {
-                            let _ = tx.send(RuntimeEvent::SessionError {
+                            let _ = tx.send(SessionEvent::Error {
                                 agent_id: aid.clone(),
                                 message: format!("Authentication failed: {err}"),
                             });
@@ -408,7 +409,7 @@ async fn connect_and_run(
                 // Copilot CLI) that only support the older mechanism.
                 let session_id = if let Some(ref prev_id) = previous_session_id {
                     if can_resume {
-                        let _ = tx.send(RuntimeEvent::AgentOutput {
+                        let _ = tx.send(SessionEvent::Output {
                             agent_id: aid.clone(),
                             line: format!("Resuming session {prev_id}…"),
                         });
@@ -422,7 +423,7 @@ async fn connect_and_run(
                         {
                             Ok(_) => Some(prev_id.clone()),
                             Err(err) => {
-                                let _ = tx.send(RuntimeEvent::AgentOutput {
+                                let _ = tx.send(SessionEvent::Output {
                                     agent_id: aid.clone(),
                                     line: format!("Resume failed ({err}), creating new session…"),
                                 });
@@ -430,7 +431,7 @@ async fn connect_and_run(
                             }
                         }
                     } else if can_load {
-                        let _ = tx.send(RuntimeEvent::AgentOutput {
+                        let _ = tx.send(SessionEvent::Output {
                             agent_id: aid.clone(),
                             line: format!("Loading session {prev_id}…"),
                         });
@@ -447,7 +448,7 @@ async fn connect_and_run(
                                 Some(prev_id.clone())
                             }
                             Err(err) => {
-                                let _ = tx.send(RuntimeEvent::AgentOutput {
+                                let _ = tx.send(SessionEvent::Output {
                                     agent_id: aid.clone(),
                                     line: format!("Load failed ({err}), creating new session…"),
                                 });
@@ -482,9 +483,7 @@ async fn connect_and_run(
                 // get markdown rendering — the agent never sends an explicit
                 // turn-end signal for replayed history.
                 let session_id: String = if let Some(id) = resumed_session_id {
-                    let _ = tx.send(RuntimeEvent::AssistantDone {
-                        agent_id: aid.clone(),
-                    });
+                    state.lock().expect("session state lock poisoned").prompt_complete();
                     id
                 } else {
                     let session_result = connection
@@ -502,12 +501,12 @@ async fn connect_and_run(
                             let msg = format!("{err}");
                             if msg.contains("Authentication required") || msg.contains("auth") {
                                 let auth_cmd = build_auth_command(ci_for_auth.as_ref());
-                                let _ = tx.send(RuntimeEvent::AuthRequired {
+                                let _ = tx.send(SessionEvent::AuthRequired {
                                     agent_id: aid.clone(),
                                     command: auth_cmd,
                                 });
                             } else {
-                                let _ = tx.send(RuntimeEvent::SessionError {
+                                let _ = tx.send(SessionEvent::Error {
                                     agent_id: aid.clone(),
                                     message: format!("Session creation failed: {err}"),
                                 });
@@ -517,7 +516,7 @@ async fn connect_and_run(
                     }
                 };
 
-                let _ = tx.send(RuntimeEvent::AgentConnected {
+                let _ = tx.send(SessionEvent::Connected {
                     agent_id: aid.clone(),
                     session_id: Some(session_id.clone()),
                 });
@@ -525,11 +524,6 @@ async fn connect_and_run(
                 // Prompt loop — wait for messages from the TUI and forward to agent.
                 let mut rx = prompt_rx.lock().await;
                 while let Some(message) = rx.recv().await {
-                    let _ = tx.send(RuntimeEvent::AssistantDelta {
-                        agent_id: aid.clone(),
-                        text: String::new(),
-                    });
-
                     let result = connection
                         .send_request(PromptRequest::new(
                             session_id.clone(),
@@ -540,14 +534,20 @@ async fn connect_and_run(
 
                     match result {
                         Ok(_prompt_resp) => {
-                            let _ = tx.send(RuntimeEvent::AssistantDone {
-                                agent_id: aid.clone(),
-                            });
+                            state
+                                .lock()
+                                .expect("session state lock poisoned")
+                                .prompt_complete();
                         }
                         Err(err) => {
-                            let _ = tx.send(RuntimeEvent::SessionError {
+                            let msg = format!("Prompt error: {err}");
+                            state
+                                .lock()
+                                .expect("session state lock poisoned")
+                                .fail_active(&msg);
+                            let _ = tx.send(SessionEvent::Error {
                                 agent_id: aid.clone(),
-                                message: format!("Prompt error: {err}"),
+                                message: msg,
                             });
                         }
                     }
@@ -570,7 +570,7 @@ async fn try_find_and_resume(
     connection: &ConnectionTo<AcpAgentRole>,
     session_cwd: &PathBuf,
     agent_id: &str,
-    tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    tx: &mpsc::UnboundedSender<SessionEvent>,
     can_resume: bool,
     can_load: bool,
 ) -> Option<String> {
@@ -592,7 +592,7 @@ async fn try_find_and_resume(
             .cmp(b.updated_at.as_deref().unwrap_or(""))
     })?;
 
-    let _ = tx.send(RuntimeEvent::AgentOutput {
+    let _ = tx.send(SessionEvent::Output {
         agent_id: agent_id.to_string(),
         line: format!(
             "Found existing session {} — resuming…",
@@ -625,7 +625,7 @@ async fn try_find_and_resume(
     match result {
         Ok(()) => Some(best.session_id.to_string()),
         Err(err) => {
-            let _ = tx.send(RuntimeEvent::AgentOutput {
+            let _ = tx.send(SessionEvent::Output {
                 agent_id: agent_id.to_string(),
                 line: format!("Resume failed ({err}), creating new session…"),
             });
@@ -634,52 +634,39 @@ async fn try_find_and_resume(
     }
 }
 
-/// Map an ACP `SessionUpdate` to `RuntimeEvent`s and send them.
-fn forward_session_update(
-    agent_id: &str,
-    update: &SessionUpdate,
-    tx: &mpsc::UnboundedSender<RuntimeEvent>,
-) {
+/// Apply an ACP `SessionUpdate` to the per-session state machine. The state
+/// machine handles emitting the `*Started` events on the first chunk of a
+/// new entity and routing follow-up updates through the live handles.
+fn apply_session_update(state: &mut SessionStateMachine, update: &SessionUpdate) {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
             if let ContentBlock::Text(text) = &chunk.content {
-                let _ = tx.send(RuntimeEvent::AssistantDelta {
-                    agent_id: agent_id.to_string(),
-                    text: text.text.clone(),
-                });
+                state.assistant_chunk(&text.text);
             }
         }
         SessionUpdate::UserMessageChunk(chunk) => {
             if let ContentBlock::Text(text) = &chunk.content {
-                let _ = tx.send(RuntimeEvent::UserMessageDelta {
-                    agent_id: agent_id.to_string(),
-                    text: text.text.clone(),
-                });
+                state.user_chunk(&text.text);
             }
         }
         SessionUpdate::AgentThoughtChunk(chunk) => {
             if let ContentBlock::Text(text) = &chunk.content {
-                let _ = tx.send(RuntimeEvent::ThoughtDelta {
-                    agent_id: agent_id.to_string(),
-                    text: text.text.clone(),
-                });
+                state.thought_chunk(&text.text);
             }
         }
         SessionUpdate::ToolCall(tool_call) => {
-            let _ = tx.send(RuntimeEvent::ToolCallUpdate {
-                agent_id: agent_id.to_string(),
-                tool_call_id: tool_call.tool_call_id.0.to_string(),
-                title: Some(tool_call.title.clone()),
-                status: Some(map_tool_status(&tool_call.status)),
-            });
+            state.tool_call(
+                &tool_call.tool_call_id.0,
+                tool_call.title.clone(),
+                map_tool_status(&tool_call.status),
+            );
         }
         SessionUpdate::ToolCallUpdate(update) => {
-            let _ = tx.send(RuntimeEvent::ToolCallUpdate {
-                agent_id: agent_id.to_string(),
-                tool_call_id: update.tool_call_id.0.to_string(),
-                title: update.fields.title.clone(),
-                status: update.fields.status.as_ref().map(map_tool_status),
-            });
+            state.tool_call_update(
+                &update.tool_call_id.0,
+                update.fields.title.clone(),
+                update.fields.status.as_ref().map(map_tool_status),
+            );
         }
         _ => {}
     }

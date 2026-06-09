@@ -11,7 +11,7 @@ use ratatui::{
 use std::sync::LazyLock;
 use syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet};
 
-use crate::agent::Agent;
+use crate::agent::{Agent, HistoryEntry};
 use crate::app::{App, Screen, SessionFocus, SidePane};
 use crate::markdown;
 
@@ -248,57 +248,14 @@ fn render_conversation(
     let lines: Vec<Line> = agent
         .map(|a| {
             let mut result: Vec<Line> = Vec::new();
-            if a.history.is_empty() && a.pending_response.is_empty() {
+            if a.history.is_empty() {
                 result.push(Line::from(Span::styled(
                     "(no messages yet)",
                     Style::default().fg(Color::DarkGray),
                 )));
             } else {
                 for entry in &a.history {
-                    let entry_style = classify_entry_style(entry);
-                    if entry_style == Style::default()
-                        && (markdown::looks_like_markdown(entry)
-                            || markdown::looks_like_json(entry))
-                    {
-                        // Render as markdown (handles code blocks, JSON, etc.)
-                        let md_lines = if markdown::looks_like_json(entry) {
-                            // Wrap JSON in a code block for highlighting.
-                            let wrapped = format!("```json\n{entry}\n```");
-                            markdown::render_markdown(&wrapped)
-                        } else {
-                            markdown::render_markdown(entry)
-                        };
-                        result.extend(md_lines);
-                    } else {
-                        for line in entry.lines() {
-                            result.push(Line::from(Span::styled(
-                                line.to_string(),
-                                entry_style,
-                            )));
-                        }
-                    }
-                }
-                // Show streaming thought in progress (collapsed single line).
-                if !a.pending_thought.is_empty() {
-                    let preview: String = a.pending_thought.chars().take(80).collect();
-                    result.push(Line::from(Span::styled(
-                        format!("💭 {preview}…"),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-                // Show streaming response in progress — split by lines.
-                if !a.pending_response.is_empty() {
-                    for line in a.pending_response.lines() {
-                        result.push(Line::from(Span::styled(
-                            line.to_string(),
-                            Style::default().fg(Color::Green),
-                        )));
-                    }
-                    // Cursor indicator on a new line.
-                    result.push(Line::from(Span::styled(
-                        "▊",
-                        Style::default().fg(Color::Green),
-                    )));
+                    render_history_entry(entry, &mut result);
                 }
             }
             result
@@ -326,30 +283,125 @@ fn render_conversation(
     frame.render_widget(paragraph, area);
 }
 
-/// Determine the style for a history entry based on its prefix.
-fn classify_entry_style(entry: &str) -> Style {
-    if entry.starts_with("> ") {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else if entry.starts_with("[error]") {
-        Style::default().fg(Color::Red)
-    } else if entry.starts_with('⏳') {
-        Style::default().fg(Color::Yellow)
-    } else if entry.starts_with('✓') {
-        Style::default().fg(Color::Green)
-    } else if entry.starts_with('✗') {
-        Style::default().fg(Color::Red)
-    } else if entry.starts_with("[tool") {
-        Style::default().fg(Color::Yellow)
-    } else if entry.starts_with('💭') {
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC)
-    } else if entry.starts_with("[thought]") || entry.starts_with("[permission]") {
-        Style::default().fg(Color::DarkGray)
-    } else {
-        Style::default()
+/// Append a single history entry to the rendered line buffer.
+fn render_history_entry(entry: &HistoryEntry, out: &mut Vec<Line<'static>>) {
+    use fleet_commander_core::session::{MessageStatus, ToolCallStatusKind};
+
+    match entry {
+        HistoryEntry::Info(text) => {
+            for line in text.lines() {
+                out.push(Line::from(Span::raw(line.to_string())));
+            }
+        }
+        HistoryEntry::Error(text) => {
+            let style = Style::default().fg(Color::Red);
+            for line in text.lines() {
+                out.push(Line::from(Span::styled(line.to_string(), style)));
+            }
+        }
+        HistoryEntry::Prompt(text) => {
+            let style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
+            for line in text.lines() {
+                out.push(Line::from(Span::styled(format!("> {line}"), style)));
+            }
+        }
+        HistoryEntry::Assistant(msg) => {
+            let text = msg.text.borrow();
+            let status_ref = msg.status.borrow();
+            let terminal = status_ref.is_terminal();
+            let failed = matches!(&*status_ref, MessageStatus::Failed(_));
+            let body: &str = text.as_str();
+            if body.is_empty() {
+                if !terminal {
+                    out.push(Line::from(Span::styled(
+                        "▊",
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+                return;
+            }
+            if terminal && (markdown::looks_like_markdown(body) || markdown::looks_like_json(body))
+            {
+                let md_lines = if markdown::looks_like_json(body) {
+                    let wrapped = format!("```json\n{body}\n```");
+                    markdown::render_markdown(&wrapped)
+                } else {
+                    markdown::render_markdown(body)
+                };
+                out.extend(md_lines);
+            } else {
+                let style = if terminal {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::Green)
+                };
+                for line in body.lines() {
+                    out.push(Line::from(Span::styled(line.to_string(), style)));
+                }
+                if !terminal {
+                    out.push(Line::from(Span::styled(
+                        "▊",
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+            }
+            if failed {
+                out.push(Line::from(Span::styled(
+                    "[message failed]",
+                    Style::default().fg(Color::Red),
+                )));
+            }
+        }
+        HistoryEntry::Thought(thought) => {
+            let text = thought.text.borrow();
+            let terminal = thought.status.borrow().is_terminal();
+            let body: &str = text.as_str();
+            let style = Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC);
+            if terminal {
+                let trimmed = body.trim();
+                if trimmed.is_empty() {
+                    return;
+                }
+                out.push(Line::from(Span::styled(format!("💭 {trimmed}"), style)));
+            } else {
+                let preview: String = body.chars().take(80).collect();
+                out.push(Line::from(Span::styled(format!("💭 {preview}…"), style)));
+            }
+        }
+        HistoryEntry::User(msg) => {
+            let text = msg.text.borrow();
+            let body: &str = text.as_str();
+            let style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
+            for line in body.lines() {
+                out.push(Line::from(Span::styled(format!("> {line}"), style)));
+            }
+        }
+        HistoryEntry::Tool(tc) => {
+            let title = tc.title.borrow();
+            let status = *tc.status.borrow();
+            let (marker, color) = match status {
+                ToolCallStatusKind::Pending | ToolCallStatusKind::InProgress => {
+                    ("⏳", Color::Yellow)
+                }
+                ToolCallStatusKind::Completed => ("✓", Color::Green),
+                ToolCallStatusKind::Failed => ("✗", Color::Red),
+            };
+            let display_title = if title.is_empty() {
+                "(tool)"
+            } else {
+                title.as_str()
+            };
+            out.push(Line::from(Span::styled(
+                format!("{marker} {display_title}"),
+                Style::default().fg(color),
+            )));
+        }
     }
 }
 

@@ -18,15 +18,15 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use fleet_commander_core::event::RuntimeEvent;
+use fleet_commander_core::session::{MessageStatus, SessionEvent, ToolCallStatusKind};
 use fleet_commander_core::{agent_runtime, container};
 
-use crate::agent::{Agent, AgentId, AgentStatus};
+use crate::agent::{Agent, AgentId, AgentStatus, HistoryEntry};
 use crate::agent_kind::AgentKind;
 use crate::change_source::ChangeEvent;
 use crate::completion::{PathCompleter, split_command_and_path};
 use crate::config::{Action, Config};
-use crate::event::{AppEvent, ToolCallStatusKind};
+use crate::event::AppEvent;
 use crate::init;
 use crate::workspace;
 
@@ -92,7 +92,7 @@ pub struct App {
     pub tx: mpsc::UnboundedSender<AppEvent>,
     /// Channel handed to the runtime crate for it to emit `RuntimeEvent`s.
     /// A bridge task in `main.rs` forwards these into `tx` as `AppEvent`s.
-    pub runtime_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    pub runtime_tx: mpsc::UnboundedSender<SessionEvent>,
     /// Set when an agent needs interactive auth — the main loop suspends the
     /// TUI and runs this command with inherited stdio.
     pub auth_pending: Option<(AgentId, Vec<String>)>,
@@ -127,7 +127,7 @@ impl App {
         config: Config,
         agents: Vec<Agent>,
         tx: mpsc::UnboundedSender<AppEvent>,
-        runtime_tx: mpsc::UnboundedSender<RuntimeEvent>,
+        runtime_tx: mpsc::UnboundedSender<SessionEvent>,
         acp_log: Option<Arc<Mutex<File>>>,
         acp_log_filter: Option<String>,
     ) -> Self {
@@ -154,19 +154,6 @@ impl App {
         match event {
             AppEvent::Input(key) => self.handle_key(key),
             AppEvent::Change(change) => self.handle_change(change),
-            AppEvent::AgentOutput { agent_id, line } => {
-                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-                    agent.history.push(line);
-                }
-                self.auto_scroll_for(&agent_id);
-            }
-            AppEvent::AgentExited { agent_id, .. } => {
-                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-                    agent.status = AgentStatus::Stopped;
-                    agent.prompt_tx = None;
-                    agent.task_handle = None;
-                }
-            }
             AppEvent::McpShowDiff {
                 agent_id,
                 path,
@@ -179,70 +166,51 @@ impl App {
             } => self.handle_mcp_side_pane(agent_id, SidePane::Diff { path, content }),
             AppEvent::McpNotify { agent_id, message } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-                    agent.history.push(message);
-                }
-            }
-            AppEvent::AssistantDelta { agent_id, text } => {
-                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-                    // A new assistant chunk closes any pending replayed user
-                    // message and the prior thought stream.
-                    flush_pending_user_message(agent);
-                    flush_pending_thought(agent);
-                    agent.status = AgentStatus::Running;
-                    agent.pending_response.push_str(&text);
+                    agent.info(message);
                 }
                 self.auto_scroll_for(&agent_id);
             }
-            AppEvent::ThoughtDelta { agent_id, text } => {
+            AppEvent::ReconnectAgent { agent_id } => {
+                info!(agent_id = %agent_id, "Reconnecting agent after rebuild");
+                self.ensure_agent_connected(agent_id);
+            }
+            AppEvent::Repaint { agent_id } => {
+                self.auto_scroll_for(&agent_id);
+            }
+            AppEvent::Session(event) => self.handle_session_event(event),
+        }
+    }
+
+    fn handle_session_event(&mut self, event: SessionEvent) {
+        match event {
+            SessionEvent::Output { agent_id, line } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-                    flush_pending_user_message(agent);
-                    agent.pending_thought.push_str(&text);
+                    agent.info(line);
                 }
                 self.auto_scroll_for(&agent_id);
             }
-            AppEvent::UserMessageDelta { agent_id, text } => {
+            SessionEvent::Exited { agent_id, .. } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-                    // A new user message marks the end of the prior turn —
-                    // flush so the assistant response (if any) gets pushed to
-                    // history and rendered as markdown.
-                    flush_pending_thought(agent);
-                    flush_pending_response(agent);
-                    agent.pending_user_message.push_str(&text);
+                    agent.status = AgentStatus::Stopped;
+                    agent.prompt_tx = None;
+                    agent.task_handle = None;
                 }
-                self.auto_scroll_for(&agent_id);
             }
-            AppEvent::AssistantDone { agent_id } => {
+            SessionEvent::Error { agent_id, message } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-                    flush_pending_user_message(agent);
-                    flush_pending_thought(agent);
-                    flush_pending_response(agent);
-                    agent.status = AgentStatus::Idle;
-                }
-                self.auto_scroll_for(&agent_id);
-            }
-            AppEvent::SessionError { agent_id, message } => {
-                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-                    agent.history.push(format!("[error] {message}"));
+                    agent.error(format!("[error] {message}"));
                     agent.status = AgentStatus::Error;
                 }
-            }
-            AppEvent::ToolCallUpdate {
-                agent_id,
-                tool_call_id,
-                title,
-                status,
-            } => {
-                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-                    upsert_tool_call(agent, &tool_call_id, title, status);
-                }
                 self.auto_scroll_for(&agent_id);
             }
-            AppEvent::AgentConnected { agent_id, session_id } => {
+            SessionEvent::Connected {
+                agent_id,
+                session_id,
+            } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.status = AgentStatus::Idle;
                     agent.session_id = session_id.clone();
-                    agent.history.push("ACP session connected.".into());
-                    // Persist session_id to per-workspace data dir.
+                    agent.info("ACP session connected.");
                     if let Some(ws) = &agent.workspace_folder {
                         let state = workspace::WorkspaceState { session_id };
                         if let Err(e) = workspace::save_state(ws, &state) {
@@ -251,9 +219,9 @@ impl App {
                     }
                 }
             }
-            AppEvent::AuthRequired { agent_id, command } => {
+            SessionEvent::AuthRequired { agent_id, command } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-                    agent.history.push("🔑 Authentication required — launching login flow...".into());
+                    agent.info("🔑 Authentication required — launching login flow...");
                     agent.status = AgentStatus::Stopped;
                     agent.prompt_tx = None;
                     // The runtime task already returned after sending this
@@ -263,18 +231,14 @@ impl App {
                 }
                 self.auth_pending = Some((agent_id, command));
             }
-            AppEvent::ReconnectAgent { agent_id } => {
-                info!(agent_id = %agent_id, "Reconnecting agent after rebuild");
-                self.ensure_agent_connected(agent_id);
-            }
-            AppEvent::PermissionRequest {
+            SessionEvent::PermissionRequest {
                 agent_id,
                 tool_name,
                 options,
                 reply,
             } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-                    agent.history.push(format!("🔐 Permission requested: {tool_name}"));
+                    agent.info(format!("🔐 Permission requested: {tool_name}"));
                 }
                 self.permission_pending = Some(PendingPermission {
                     agent_id,
@@ -282,6 +246,55 @@ impl App {
                     options,
                     reply,
                 });
+            }
+            SessionEvent::AssistantMessage { agent_id, message } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    agent.status = AgentStatus::Running;
+                    agent.history.push(HistoryEntry::Assistant(message.clone()));
+                }
+                spawn_text_tracker(
+                    agent_id.clone(),
+                    message.text,
+                    message.status,
+                    self.tx.clone(),
+                );
+                self.auto_scroll_for(&agent_id);
+            }
+            SessionEvent::Thought { agent_id, thought } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    agent.history.push(HistoryEntry::Thought(thought.clone()));
+                }
+                spawn_text_tracker(
+                    agent_id.clone(),
+                    thought.text,
+                    thought.status,
+                    self.tx.clone(),
+                );
+                self.auto_scroll_for(&agent_id);
+            }
+            SessionEvent::UserMessage { agent_id, message } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    agent.history.push(HistoryEntry::User(message.clone()));
+                }
+                spawn_text_tracker(
+                    agent_id.clone(),
+                    message.text,
+                    message.status,
+                    self.tx.clone(),
+                );
+                self.auto_scroll_for(&agent_id);
+            }
+            SessionEvent::ToolCall { agent_id, call } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    agent.history.push(HistoryEntry::Tool(call.clone()));
+                }
+                spawn_tool_tracker(
+                    agent_id.clone(),
+                    call.title,
+                    call.status,
+                    self.tx.clone(),
+                );
+                self.auto_scroll_for(&agent_id);
             }
         }
     }
@@ -381,16 +394,18 @@ impl App {
                 }
                 KeyCode::Enter => {
                     let message = std::mem::take(&mut self.input_buffer);
-                    if let Some(agent) = (!message.is_empty())
-                        .then(|| self.agents.iter().find(|a| a.id == *agent_id))
-                        .flatten()
-                    {
-                        agent_runtime::send_message(
-                            agent.id.clone(),
-                            agent.prompt_tx.as_ref(),
-                            message,
-                            self.runtime_tx.clone(),
-                        );
+                    if !message.is_empty() {
+                        let agent_id = agent_id.clone();
+                        if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                            agent.prompt(message.clone());
+                            agent_runtime::send_message(
+                                agent.id.clone(),
+                                agent.prompt_tx.as_ref(),
+                                message,
+                                self.runtime_tx.clone(),
+                            );
+                        }
+                        self.auto_scroll_for(&agent_id);
                     }
                     if let Screen::AgentSession { input_mode, .. } = &mut self.screen {
                         *input_mode = false;
@@ -478,7 +493,7 @@ impl App {
             Some(ws) => format!("Starting container ({})...", ws.display()),
             None => "Connecting...".into(),
         };
-        agent.history.push(label);
+        agent.info(label);
     }
 
     /// Scroll to the bottom when content arrives for the currently viewed agent.
@@ -666,7 +681,7 @@ impl App {
         agent.prompt_tx = None;
         agent.status = AgentStatus::Stopped;
         agent.session_id = None;
-        agent.history.push("🔄 Rebuilding container...".into());
+        agent.info("🔄 Rebuilding container...");
 
         // Regenerate base layer with latest mount config.
         if let Err(err) = init::generate_workspace_layer(&workspace, AgentKind::Copilot) {
@@ -679,15 +694,15 @@ impl App {
         let aid = agent_id;
         tokio::spawn(async move {
             if let Err(err) = container::remove_workspace_container(&workspace).await {
-                let _ = tx.send(AppEvent::AgentOutput {
+                let _ = tx.send(AppEvent::Session(SessionEvent::Output {
                     agent_id: aid.clone(),
                     line: format!("[warn] Failed to remove container: {err}"),
-                });
+                }));
             }
-            let _ = tx.send(AppEvent::AgentOutput {
+            let _ = tx.send(AppEvent::Session(SessionEvent::Output {
                 agent_id: aid.clone(),
                 line: "Container removed. Reconnecting...".into(),
-            });
+            }));
             let _ = tx.send(AppEvent::ReconnectAgent { agent_id: aid });
         });
 
@@ -698,105 +713,70 @@ impl App {
     }
 }
 
-/// Flush accumulated thought text into history as a single dimmed entry
-/// prefixed with `💭`. Lines render naturally instead of being collapsed
-/// into one paragraph.
-fn flush_pending_thought(agent: &mut Agent) {
-    if !agent.pending_thought.is_empty() {
-        let thought = std::mem::take(&mut agent.pending_thought);
-        let trimmed = thought.trim();
-        if trimmed.is_empty() {
-            return;
-        }
-        agent.history.push(format!("💭 {trimmed}"));
-    }
-}
-
-/// Render a tool-call status as a leading marker. Pending/InProgress show a
-/// spinner, completed shows a check, failed shows a cross.
-fn tool_status_marker(status: ToolCallStatusKind) -> &'static str {
-    match status {
-        ToolCallStatusKind::Pending | ToolCallStatusKind::InProgress => "⏳",
-        ToolCallStatusKind::Completed => "✓",
-        ToolCallStatusKind::Failed => "✗",
-    }
-}
-
-/// Format a tool-call history entry. Title falls back to "(tool)" so the
-/// line is never empty.
-fn format_tool_entry(title: &str, status: ToolCallStatusKind) -> String {
-    let display_title = if title.is_empty() { "(tool)" } else { title };
-    format!("{} {display_title}", tool_status_marker(status))
-}
-
-/// Add or update the history entry for an in-flight tool call. New calls
-/// flush any pending thought/response so the entry lands in the right
-/// position; updates rewrite the entry in place so completion replaces the
-/// running line instead of stacking duplicates.
-fn upsert_tool_call(
-    agent: &mut Agent,
-    tool_call_id: &str,
-    title: Option<String>,
-    status: Option<ToolCallStatusKind>,
+/// Spawn a tracker task for a streaming text handle (assistant, thought,
+/// user). Sends `AppEvent::Repaint` whenever the handle's text or status
+/// changes; terminates when the status reaches a terminal state or either
+/// watch channel is closed.
+fn spawn_text_tracker(
+    agent_id: AgentId,
+    mut text: tokio::sync::watch::Receiver<String>,
+    mut status: tokio::sync::watch::Receiver<MessageStatus>,
+    tx: mpsc::UnboundedSender<AppEvent>,
 ) {
-    if let Some(&idx) = agent.tool_call_entries.get(tool_call_id) {
-        if idx >= agent.history.len() {
-            return;
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                res = text.changed() => {
+                    if res.is_err() {
+                        let _ = tx.send(AppEvent::Repaint { agent_id: agent_id.clone() });
+                        break;
+                    }
+                }
+                res = status.changed() => {
+                    if res.is_err() {
+                        let _ = tx.send(AppEvent::Repaint { agent_id: agent_id.clone() });
+                        break;
+                    }
+                }
+            }
+            let _ = tx.send(AppEvent::Repaint { agent_id: agent_id.clone() });
+            if status.borrow().is_terminal() {
+                break;
+            }
         }
-        let current = &agent.history[idx];
-        // Extract the existing title (everything after the marker + space).
-        let existing_title = current.splitn(2, ' ').nth(1).unwrap_or("").to_string();
-        let new_title = title.unwrap_or(existing_title);
-        // Existing marker → status. Rebuild from new status if provided,
-        // otherwise reuse the marker by classifying it back.
-        let new_status = status.unwrap_or_else(|| classify_marker(current));
-        agent.history[idx] = format_tool_entry(&new_title, new_status);
-    } else {
-        // First time we see this call — flush pending content so order is
-        // correct, then register a fresh entry.
-        flush_pending_user_message(agent);
-        flush_pending_thought(agent);
-        flush_pending_response(agent);
-        let entry_title = title.unwrap_or_else(|| "(tool)".to_string());
-        let entry_status = status.unwrap_or(ToolCallStatusKind::InProgress);
-        let entry = format_tool_entry(&entry_title, entry_status);
-        let idx = agent.history.len();
-        agent.history.push(entry);
-        agent.tool_call_entries.insert(tool_call_id.to_string(), idx);
-    }
+    });
 }
 
-/// Classify an existing tool-call entry back into a status from its leading
-/// marker character.
-fn classify_marker(entry: &str) -> ToolCallStatusKind {
-    if entry.starts_with('✓') {
-        ToolCallStatusKind::Completed
-    } else if entry.starts_with('✗') {
-        ToolCallStatusKind::Failed
-    } else {
-        ToolCallStatusKind::InProgress
-    }
-}
-
-/// Flush accumulated assistant response into history so it gets rendered
-/// with full markdown formatting (rather than as plain streaming text).
-fn flush_pending_response(agent: &mut Agent) {
-    if !agent.pending_response.is_empty() {
-        let response = std::mem::take(&mut agent.pending_response);
-        agent.history.push(response);
-    }
-}
-
-/// Flush accumulated user-message chunks (replayed during session/load) into
-/// history with the `> ` prefix used for regular user messages so they get
-/// the same cyan-bold styling.
-fn flush_pending_user_message(agent: &mut Agent) {
-    if !agent.pending_user_message.is_empty() {
-        let message = std::mem::take(&mut agent.pending_user_message);
-        for line in message.lines() {
-            agent.history.push(format!("> {line}"));
+/// Spawn a tracker task for a tool-call handle. Like `spawn_text_tracker`
+/// but watches `title` + `status` instead.
+fn spawn_tool_tracker(
+    agent_id: AgentId,
+    mut title: tokio::sync::watch::Receiver<String>,
+    mut status: tokio::sync::watch::Receiver<ToolCallStatusKind>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                res = title.changed() => {
+                    if res.is_err() {
+                        let _ = tx.send(AppEvent::Repaint { agent_id: agent_id.clone() });
+                        break;
+                    }
+                }
+                res = status.changed() => {
+                    if res.is_err() {
+                        let _ = tx.send(AppEvent::Repaint { agent_id: agent_id.clone() });
+                        break;
+                    }
+                }
+            }
+            let _ = tx.send(AppEvent::Repaint { agent_id: agent_id.clone() });
+            if status.borrow().is_terminal() {
+                break;
+            }
         }
-    }
+    });
 }
 
 fn handle_list_action(
@@ -1037,66 +1017,68 @@ mod tests {
     #[test]
     fn agent_output_appends_to_history() {
         let mut app = app_with_agents();
-        app.handle(AppEvent::AgentOutput {
+        app.handle(AppEvent::Session(SessionEvent::Output {
             agent_id: "a2".into(),
             line: "hello".into(),
-        });
+        }));
         let a2 = app.agents.iter().find(|a| a.id == "a2").unwrap();
-        assert_eq!(a2.history, vec!["hello".to_string()]);
+        assert_eq!(a2.history.len(), 1);
+        assert!(matches!(&a2.history[0], HistoryEntry::Info(s) if s == "hello"));
     }
 
     #[test]
     fn agent_exited_marks_status_stopped() {
         let mut app = app_with_agents();
-        app.handle(AppEvent::AgentExited {
+        app.handle(AppEvent::Session(SessionEvent::Exited {
             agent_id: "a1".into(),
             code: Some(0),
-        });
+        }));
         let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
         assert_eq!(a1.status, AgentStatus::Stopped);
     }
 
-    #[test]
-    fn assistant_delta_accumulates_pending_response() {
+    #[tokio::test]
+    async fn assistant_message_started_appends_handle() {
+        use tokio::sync::watch;
         let mut app = app_with_agents();
-        app.handle(AppEvent::AssistantDelta {
+        let (text_tx, text_rx) = watch::channel(String::new());
+        let (status_tx, status_rx) = watch::channel(MessageStatus::Streaming);
+        let message = fleet_commander_core::session::AssistantMessage {
+            text: text_rx,
+            status: status_rx,
+        };
+        app.handle(AppEvent::Session(SessionEvent::AssistantMessage {
             agent_id: "a1".into(),
-            text: "Hello".into(),
-        });
-        app.handle(AppEvent::AssistantDelta {
-            agent_id: "a1".into(),
-            text: " world".into(),
-        });
-        let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
-        assert_eq!(a1.pending_response, "Hello world");
-        assert_eq!(a1.status, AgentStatus::Running);
-    }
+            message,
+        }));
 
-    #[test]
-    fn assistant_done_flushes_pending_to_history() {
-        let mut app = app_with_agents();
-        app.handle(AppEvent::AssistantDelta {
-            agent_id: "a1".into(),
-            text: "response text".into(),
-        });
-        app.handle(AppEvent::AssistantDone {
-            agent_id: "a1".into(),
-        });
+        let _ = text_tx.send("Hello".to_string());
+        let _ = status_tx.send(MessageStatus::Completed);
+
         let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
-        assert!(a1.pending_response.is_empty());
-        assert_eq!(a1.history.last().unwrap(), "response text");
-        assert_eq!(a1.status, AgentStatus::Idle);
+        assert_eq!(a1.status, AgentStatus::Running);
+        assert_eq!(a1.history.len(), 1);
+        match &a1.history[0] {
+            HistoryEntry::Assistant(m) => {
+                assert_eq!(*m.text.borrow(), "Hello");
+                assert_eq!(*m.status.borrow(), MessageStatus::Completed);
+            }
+            _ => panic!("expected assistant entry"),
+        }
     }
 
     #[test]
     fn session_error_appends_to_history() {
         let mut app = app_with_agents();
-        app.handle(AppEvent::SessionError {
+        app.handle(AppEvent::Session(SessionEvent::Error {
             agent_id: "a2".into(),
             message: "connection lost".into(),
-        });
+        }));
         let a2 = app.agents.iter().find(|a| a.id == "a2").unwrap();
-        assert!(a2.history.last().unwrap().contains("connection lost"));
+        match a2.history.last().unwrap() {
+            HistoryEntry::Error(s) => assert!(s.contains("connection lost")),
+            other => panic!("expected error entry, got {other:?}"),
+        }
         assert_eq!(a2.status, AgentStatus::Error);
     }
 
@@ -1134,13 +1116,16 @@ mod tests {
     #[test]
     fn agent_connected_sets_idle_status() {
         let mut app = app_with_agents();
-        app.handle(AppEvent::AgentConnected {
+        app.handle(AppEvent::Session(SessionEvent::Connected {
             agent_id: "a1".into(),
             session_id: Some("sess_test".into()),
-        });
+        }));
         let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
         assert_eq!(a1.status, AgentStatus::Idle);
-        assert!(a1.history.last().unwrap().contains("connected"));
+        match a1.history.last().unwrap() {
+            HistoryEntry::Info(s) => assert!(s.contains("connected")),
+            other => panic!("expected info entry, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1148,55 +1133,55 @@ mod tests {
         let mut app = app_with_agents();
         let (tx, _rx) = mpsc::unbounded_channel::<String>();
         app.agents[0].prompt_tx = Some(tx);
-        app.handle(AppEvent::AgentExited {
+        app.handle(AppEvent::Session(SessionEvent::Exited {
             agent_id: "a1".into(),
             code: Some(0),
-        });
+        }));
         let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
         assert_eq!(a1.status, AgentStatus::Stopped);
         assert!(a1.prompt_tx.is_none());
     }
 
-    #[test]
-    fn tool_call_update_appends_to_history() {
+    #[tokio::test]
+    async fn tool_call_started_appends_handle() {
+        use tokio::sync::watch;
         let mut app = app_with_agents();
-        app.handle(AppEvent::ToolCallUpdate {
+        let (title_tx, title_rx) = watch::channel("read_file".to_string());
+        let (status_tx, status_rx) = watch::channel(ToolCallStatusKind::InProgress);
+        let call = fleet_commander_core::session::ToolCall {
+            id: "call_1".into(),
+            title: title_rx,
+            status: status_rx,
+        };
+        app.handle(AppEvent::Session(SessionEvent::ToolCall {
             agent_id: "a1".into(),
-            tool_call_id: "call_1".into(),
-            title: Some("read_file".into()),
-            status: Some(ToolCallStatusKind::InProgress),
-        });
-        let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
-        assert!(a1.history.last().unwrap().contains("read_file"));
-        assert!(a1.history.last().unwrap().starts_with('⏳'));
-    }
+            call,
+        }));
 
-    #[test]
-    fn tool_call_completion_updates_existing_entry() {
-        let mut app = app_with_agents();
-        app.handle(AppEvent::ToolCallUpdate {
-            agent_id: "a1".into(),
-            tool_call_id: "call_1".into(),
-            title: Some("read_file".into()),
-            status: Some(ToolCallStatusKind::InProgress),
-        });
-        let len_before = app
-            .agents
-            .iter()
-            .find(|a| a.id == "a1")
-            .unwrap()
-            .history
-            .len();
-        app.handle(AppEvent::ToolCallUpdate {
-            agent_id: "a1".into(),
-            tool_call_id: "call_1".into(),
-            title: None,
-            status: Some(ToolCallStatusKind::Completed),
-        });
         let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
-        // No duplicate appended — completion replaces the running entry.
-        assert_eq!(a1.history.len(), len_before);
-        assert!(a1.history.last().unwrap().starts_with('✓'));
-        assert!(a1.history.last().unwrap().contains("read_file"));
+        assert_eq!(a1.history.len(), 1);
+        match &a1.history[0] {
+            HistoryEntry::Tool(tc) => {
+                assert_eq!(tc.id, "call_1");
+                assert_eq!(*tc.title.borrow(), "read_file");
+                assert_eq!(*tc.status.borrow(), ToolCallStatusKind::InProgress);
+            }
+            _ => panic!("expected tool entry"),
+        }
+
+        // Title rewrites + status flips reflect through the handle without
+        // any extra history mutation.
+        let _ = title_tx.send("read_file completed".to_string());
+        let _ = status_tx.send(ToolCallStatusKind::Completed);
+
+        let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        assert_eq!(a1.history.len(), 1);
+        match &a1.history[0] {
+            HistoryEntry::Tool(tc) => {
+                assert_eq!(*tc.title.borrow(), "read_file completed");
+                assert_eq!(*tc.status.borrow(), ToolCallStatusKind::Completed);
+            }
+            _ => panic!("expected tool entry"),
+        }
     }
 }

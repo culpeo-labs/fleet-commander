@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn, error};
 
 use fleet_commander_core::container;
-use fleet_commander_core::event::RuntimeEvent;
+use fleet_commander_core::session::SessionEvent;
 
 mod agent;
 mod agent_kind;
@@ -93,7 +93,7 @@ async fn run_tui(
     let mut terminal = setup_terminal()?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
-    let (runtime_tx, runtime_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+    let (runtime_tx, runtime_rx) = mpsc::unbounded_channel::<SessionEvent>();
     spawn_runtime_forwarder(runtime_rx, tx.clone());
 
     // Load persisted workspaces — no more hardcoded mock agents.
@@ -223,16 +223,16 @@ fn teardown_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> R
     Ok(())
 }
 
-/// Pump `RuntimeEvent`s from the core runtime into the TUI's `AppEvent`
+/// Pump `SessionEvent`s from the core runtime into the TUI's `AppEvent`
 /// channel. The runtime crate is frontend-agnostic, so this small adapter
-/// is where we adopt its events into our application loop.
+/// is where we wrap its events into our application loop.
 fn spawn_runtime_forwarder(
-    mut rx: mpsc::UnboundedReceiver<RuntimeEvent>,
+    mut rx: mpsc::UnboundedReceiver<SessionEvent>,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            if tx.send(AppEvent::from(event)).is_err() {
+            if tx.send(AppEvent::Session(event)).is_err() {
                 break;
             }
         }

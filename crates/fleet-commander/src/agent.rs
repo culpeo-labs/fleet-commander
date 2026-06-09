@@ -4,13 +4,12 @@
 //! what command to launch (e.g. "copilot --acp --stdio"). When `workspace_folder`
 //! is set, the agent runs inside a dev container for that repo.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
-pub use fleet_commander_core::event::AgentId;
+pub use fleet_commander_core::session::{AgentId, AssistantMessage, Thought, ToolCall, UserMessage};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -31,26 +30,42 @@ impl AgentStatus {
     }
 }
 
+/// A single visible item in an agent's conversation pane.
+///
+/// `Info` / `Error` / `Prompt` are static text the TUI itself authored;
+/// the other variants carry live handles whose state updates in place
+/// through `watch` channels.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum HistoryEntry {
+    /// Informational line authored by the TUI (e.g. "ACP session connected").
+    Info(String),
+    /// Error line authored by the TUI.
+    Error(String),
+    /// User prompt the operator typed and dispatched.
+    Prompt(String),
+    /// A streamed assistant message. While `status` is `Streaming` it
+    /// renders as plain text; once it reaches `Completed`, it re-renders
+    /// through the markdown pipeline.
+    Assistant(AssistantMessage),
+    /// A streamed agent thought (Copilot's internal reasoning).
+    Thought(Thought),
+    /// A user message replayed from session history during load/resume.
+    User(UserMessage),
+    /// A tool call. Title and status update through `watch` channels.
+    Tool(ToolCall),
+}
+
 pub struct Agent {
     pub id: AgentId,
     pub name: String,
     pub status: AgentStatus,
-    pub history: Vec<String>,
+    pub history: Vec<HistoryEntry>,
     /// Command to launch the ACP agent (e.g. "copilot --acp --stdio").
     pub acp_command: String,
     /// Optional repo path with `.devcontainer/` config.
     /// When set, the agent runs inside a dev container.
     pub workspace_folder: Option<PathBuf>,
-    /// Accumulates streaming deltas for the current assistant turn.
-    pub pending_response: String,
-    /// Accumulates thought chunks until the thought stream ends.
-    pub pending_thought: String,
-    /// Accumulates user-message chunks replayed during session load.
-    pub pending_user_message: String,
-    /// Maps an in-flight tool call's id to its index in `history` so updates
-    /// (e.g. status change to Completed) replace the same line instead of
-    /// pushing a new entry.
-    pub tool_call_entries: HashMap<String, usize>,
     /// Channel for sending prompts to the persistent ACP connection.
     /// `None` until the connection is established.
     pub prompt_tx: Option<mpsc::UnboundedSender<String>>,
@@ -70,10 +85,6 @@ impl Agent {
             history: Vec::new(),
             acp_command: String::new(),
             workspace_folder: None,
-            pending_response: String::new(),
-            pending_thought: String::new(),
-            pending_user_message: String::new(),
-            tool_call_entries: HashMap::new(),
             prompt_tx: None,
             task_handle: None,
             session_id: None,
@@ -99,6 +110,21 @@ impl Agent {
     /// runtime handles exec via the container ID.
     pub fn effective_acp_command(&self) -> String {
         self.acp_command.clone()
+    }
+
+    /// Append an informational line.
+    pub fn info(&mut self, line: impl Into<String>) {
+        self.history.push(HistoryEntry::Info(line.into()));
+    }
+
+    /// Append an error line.
+    pub fn error(&mut self, line: impl Into<String>) {
+        self.history.push(HistoryEntry::Error(line.into()));
+    }
+
+    /// Append a user prompt.
+    pub fn prompt(&mut self, line: impl Into<String>) {
+        self.history.push(HistoryEntry::Prompt(line.into()));
     }
 }
 
