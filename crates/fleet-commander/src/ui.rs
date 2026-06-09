@@ -104,7 +104,7 @@ fn render_agent_list(frame: &mut Frame<'_>, area: Rect, agents: &[Agent], select
     let items: Vec<ListItem> = agents
         .iter()
         .map(|agent| {
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     format!(" {:<20} ", agent.name),
                     Style::default().fg(Color::White),
@@ -113,7 +113,15 @@ fn render_agent_list(frame: &mut Frame<'_>, area: Rect, agents: &[Agent], select
                     format!("[{}]", agent.status.label()),
                     Style::default().fg(status_color(&agent.status)),
                 ),
-            ]))
+            ];
+            if let Some(branch) = agent.git_branch() {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!("⎇ {branch}"),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -184,7 +192,13 @@ fn render_agent_session(
 
     let agent = app.agents.iter().find(|a| a.id == agent_id);
     let title = agent
-        .map(|a| format!(" {} [{}] ", a.name, a.status.label()))
+        .map(|a| {
+            let branch = a
+                .git_branch()
+                .map(|b| format!(" ⎇ {b} "))
+                .unwrap_or_default();
+            format!(" {} [{}]{branch} ", a.name, a.status.label())
+        })
         .unwrap_or_else(|| format!(" {agent_id} "));
     let header = Paragraph::new(Line::from(vec![Span::styled(
         title,
@@ -1067,5 +1081,68 @@ mod tests {
             !text.contains("question 0\n") && !text.contains("answer 0\n"),
             "oldest turn should not be visible after rehydration:\n{text}"
         );
+    }
+
+    // ---- Git branch in UI ----------------------------------------------
+
+    fn make_git_workspace(branch: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let head = tmp.path().join(".git").join("HEAD");
+        std::fs::create_dir_all(head.parent().unwrap()).unwrap();
+        std::fs::write(head, format!("ref: refs/heads/{branch}\n")).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn agent_list_shows_git_branch_when_workspace_is_repo() {
+        let tmp = make_git_workspace("topic/widgets");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let agents = vec![
+            Agent::new("a1", "First").with_workspace(tmp.path()),
+            Agent::new("a2", "Second"),
+        ];
+        let app = App::new(Config::default(), agents, tx);
+        let text = render_to_string(&app, 80, 12);
+        assert!(
+            text.contains("⎇ topic/widgets"),
+            "branch missing from agent list:\n{text}"
+        );
+    }
+
+    #[test]
+    fn session_header_shows_git_branch() {
+        let tmp = make_git_workspace("main");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let agents = vec![Agent::new("a1", "First").with_workspace(tmp.path())];
+        let mut app = App::new(Config::default(), agents, tx);
+        app.screen = Screen::AgentSession {
+            agent_id: "a1".into(),
+            focus: SessionFocus::Conversation,
+            side_pane: None,
+            scroll: 0,
+            input_mode: false,
+        };
+        let text = render_to_string(&app, 90, 20);
+        assert!(
+            text.contains("⎇ main"),
+            "branch missing from session header:\n{text}"
+        );
+    }
+
+    #[test]
+    fn session_header_omits_branch_outside_git_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let agents = vec![Agent::new("a1", "First").with_workspace(tmp.path())];
+        let mut app = App::new(Config::default(), agents, tx);
+        app.screen = Screen::AgentSession {
+            agent_id: "a1".into(),
+            focus: SessionFocus::Conversation,
+            side_pane: None,
+            scroll: 0,
+            input_mode: false,
+        };
+        let text = render_to_string(&app, 90, 20);
+        assert!(!text.contains("⎇"), "branch glyph leaked:\n{text}");
     }
 }
