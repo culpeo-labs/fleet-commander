@@ -170,11 +170,20 @@ fn render_agent_session(
     input_mode: bool,
     input_buffer: &str,
 ) {
+    let input_height = if input_mode {
+        // Pick the input box height based on what the buffer will need
+        // after wrapping. Capped so it can't eat the conversation.
+        let inner_width = area.width.saturating_sub(2).max(1);
+        let max_rows: u16 = (area.height / 3).clamp(3, 12);
+        compute_input_height(input_buffer, inner_width as usize, max_rows)
+    } else {
+        3
+    };
     let constraints = if input_mode {
         vec![
             Constraint::Length(3),
             Constraint::Min(0),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
             Constraint::Length(3),
         ]
     } else {
@@ -231,7 +240,7 @@ fn render_agent_session(
 
     let following = scroll == usize::MAX;
     let hint: std::borrow::Cow<'static, str> = if input_mode {
-        "Enter send  Esc cancel".into()
+        "Enter send  Alt/Shift+Enter newline  Esc cancel".into()
     } else if side_pane.is_some() {
         if following {
             "Esc back  Tab switch focus  d dismiss pane  i input  ↑/↓ scroll".into()
@@ -251,14 +260,76 @@ fn render_agent_session(
 
     // Render input box when in input mode.
     if input_mode {
-        let input = Paragraph::new(input_buffer).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Message ")
-                .border_style(Style::default().fg(Color::Yellow)),
-        );
-        frame.render_widget(input, layout[2]);
+        let input_area = layout[2];
+        let inner_width = input_area.width.saturating_sub(2).max(1) as usize;
+        let visible_rows = input_area.height.saturating_sub(2).max(1) as usize;
+        let needed_rows = wrapped_row_count(input_buffer, inner_width);
+        // If the buffer is taller than the visible area, scroll so the
+        // last (caret) line stays in view.
+        let scroll_offset = needed_rows.saturating_sub(visible_rows);
+        let input = Paragraph::new(input_buffer)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_offset as u16, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Message ")
+                    .border_style(Style::default().fg(Color::Yellow)),
+            );
+        frame.render_widget(input, input_area);
+
+        // Place the terminal cursor at the end of the buffer so the
+        // user can see where their next keystroke lands.
+        let (caret_row, caret_col) = caret_position(input_buffer, inner_width);
+        let visible_caret_row = caret_row.saturating_sub(scroll_offset);
+        let cx = input_area.x + 1 + caret_col.min(inner_width.saturating_sub(1)) as u16;
+        let cy = input_area.y + 1 + visible_caret_row as u16;
+        frame.set_cursor_position((cx, cy));
     }
+}
+
+/// Number of terminal rows the wrapped `buffer` will occupy when laid
+/// out into a paragraph of `width` columns. Approximates wide chars as
+/// width-1 — good enough for the input-box sizing heuristic.
+fn wrapped_row_count(buffer: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let mut rows = 0usize;
+    for line in buffer.split('\n') {
+        let cols = line.chars().count().max(1);
+        rows += cols.div_ceil(width);
+    }
+    rows.max(1)
+}
+
+/// Height (in rows) the input box should request, in [3, `max_rows`].
+fn compute_input_height(buffer: &str, inner_width: usize, max_rows: u16) -> u16 {
+    let content_rows = wrapped_row_count(buffer, inner_width) as u16;
+    // +2 for the top/bottom borders.
+    (content_rows + 2).clamp(3, max_rows)
+}
+
+/// Wrapped (row, col) position of the caret (assumed to be at the end
+/// of `buffer`).
+fn caret_position(buffer: &str, width: usize) -> (usize, usize) {
+    if width == 0 {
+        return (0, 0);
+    }
+    let mut row = 0usize;
+    let mut col = 0usize;
+    for ch in buffer.chars() {
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+        } else if col >= width {
+            row += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (row, col)
 }
 
 fn render_conversation(
@@ -1144,5 +1215,62 @@ mod tests {
         };
         let text = render_to_string(&app, 90, 20);
         assert!(!text.contains("⎇"), "branch glyph leaked:\n{text}");
+    }
+
+    // ---- Input box autosize / wrap -------------------------------------
+
+    #[test]
+    fn input_height_floor_is_three_rows() {
+        assert_eq!(compute_input_height("", 40, 12), 3);
+        assert_eq!(compute_input_height("hi", 40, 12), 3);
+    }
+
+    #[test]
+    fn input_height_grows_with_newlines() {
+        assert_eq!(compute_input_height("a\nb\nc", 40, 12), 5);
+    }
+
+    #[test]
+    fn input_height_grows_with_wrapped_long_line() {
+        // 25 columns, width 10 → ceil(25/10) = 3 rows + borders.
+        let long = "x".repeat(25);
+        assert_eq!(compute_input_height(&long, 10, 12), 5);
+    }
+
+    #[test]
+    fn input_height_is_capped_at_max() {
+        let huge = "line\n".repeat(50);
+        assert_eq!(compute_input_height(&huge, 40, 8), 8);
+    }
+
+    #[test]
+    fn caret_position_tracks_newlines_and_wrap() {
+        // Single line, mid-buffer.
+        assert_eq!(caret_position("hello", 20), (0, 5));
+        // Newline pushes onto next row.
+        assert_eq!(caret_position("a\nb", 20), (1, 1));
+        // Wrap onto a new row when col == width.
+        let s = "x".repeat(11);
+        assert_eq!(caret_position(&s, 10), (1, 1));
+    }
+
+    #[test]
+    fn input_box_renders_multi_line_content() {
+        let mut app = test_app();
+        app.screen = Screen::AgentSession {
+            agent_id: "a1".into(),
+            focus: SessionFocus::Conversation,
+            side_pane: None,
+            scroll: 0,
+            input_mode: true,
+        };
+        app.input_buffer = "first line\nsecond line".into();
+        let text = render_to_string(&app, 60, 20);
+        assert!(text.contains("first line"), "first line missing:\n{text}");
+        assert!(text.contains("second line"), "second line missing:\n{text}");
+        assert!(
+            text.contains("Alt/Shift+Enter newline"),
+            "footer hint missing:\n{text}"
+        );
     }
 }
