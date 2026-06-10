@@ -79,4 +79,12 @@ mod tests {
         let text = render_to_string(&app, 90, 20);
         assert!(!text.contains("⎇"), "branch glyph leaked:\n{text}");
     }
+
+    #[test]
+    fn shows_agent_name_and_status_label() {
+        let app = app_in_session(None);
+        let text = render_to_string(&app, 90, 20);
+        assert!(text.contains("First"), "agent name missing:\n{text}");
+        assert!(text.contains("[idle]"), "status label missing:\n{text}");
+    }
 }

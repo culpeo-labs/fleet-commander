@@ -511,4 +511,61 @@ mod tests {
         let top_after = after.lines().nth(2).unwrap_or("");
         assert_eq!(top_baseline, top_after);
     }
+
+    // ─── Wrap-aware sizing ───────────────────────────────────────────────
+
+    #[test]
+    fn single_long_line_wraps_and_counts_toward_total_rows() {
+        // A single Info entry whose body is much wider than the
+        // viewport should still drive the scrollbar — the wrap-aware
+        // line_count() call is what guarantees this. If it regressed
+        // back to lines.len() the bar would never appear.
+        let long = "y".repeat(200);
+        let mut app = app_in_session_with(vec![HistoryEntry::Info(long)]);
+        let text = render_with_scroll(&mut app, usize::MAX, 30, 8);
+        assert!(
+            text.contains('█') || text.contains('▆'),
+            "scrollbar missing for wrapped single line:\n{text}"
+        );
+    }
+
+    #[test]
+    fn follow_bottom_with_wrapped_lines_shows_tail() {
+        // Build entries whose body wraps onto several visual rows. In
+        // follow-bottom mode the very last entry must still be visible
+        // — this catches the regression where `lines.len()` was used
+        // instead of `paragraph.line_count(width)` for clamping scroll.
+        let history: Vec<HistoryEntry> = (0..30)
+            .map(|i| HistoryEntry::Info(format!("entry{i}-{}", "z".repeat(120))))
+            .collect();
+        let mut app = app_in_session_with(history);
+        // 16 rows total leaves the conversation pane ~10 inner rows,
+        // enough to hold the last entry's wrapped body.
+        let text = render_with_scroll(&mut app, usize::MAX, 30, 16);
+        assert!(
+            text.contains("entry29"),
+            "newest wrapped entry missing in follow-bottom:\n{text}"
+        );
+    }
+
+    // ─── last_effective_top anchor for breaking follow-bottom on `Up` ────
+
+    #[test]
+    fn last_effective_top_is_recorded_on_each_render() {
+        let mut app = app_in_session_with(many_info_entries(50));
+        // Follow-bottom should anchor at max_scroll (>0 with 50 lines
+        // in a small viewport).
+        render_with_scroll(&mut app, usize::MAX, 60, 8);
+        let agent = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        let top_following = agent.last_effective_top.get();
+        assert!(
+            top_following > 0,
+            "follow-bottom should anchor below 0 with overflowing content"
+        );
+
+        // Scroll explicitly to 5 — anchor should now reflect that.
+        render_with_scroll(&mut app, 5, 60, 8);
+        let agent = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        assert_eq!(agent.last_effective_top.get(), 5);
+    }
 }

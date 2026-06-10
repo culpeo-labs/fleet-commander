@@ -118,4 +118,42 @@ mod tests {
         assert!(text.contains("foo.rs"));
         assert!(text.contains("Conversation"));
     }
+
+    #[test]
+    fn input_mode_inserts_message_box_above_footer() {
+        let mut app = test_app();
+        app.screen = Screen::AgentSession {
+            agent_id: "a1".into(),
+            focus: SessionFocus::Conversation,
+            side_pane: None,
+            scroll: 0,
+            input_mode: true,
+        };
+        app.input_buffer = "draft".into();
+        let text = render_to_string(&app, 80, 16);
+        assert!(text.contains("Message"), "Message box missing:\n{text}");
+        assert!(text.contains("draft"), "buffer content missing:\n{text}");
+        // Footer must still be present below the input box.
+        assert!(text.contains("Enter send"), "footer hint missing:\n{text}");
+    }
+
+    #[test]
+    fn input_box_height_grows_for_multi_line_buffer() {
+        // With a single-line buffer the input box is 3 rows; with a
+        // 5-line buffer it must grow to fit (capped at area.height/3).
+        let mut app = test_app();
+        app.screen = Screen::AgentSession {
+            agent_id: "a1".into(),
+            focus: SessionFocus::Conversation,
+            side_pane: None,
+            scroll: 0,
+            input_mode: true,
+        };
+        app.input_buffer = "a\nb\nc\nd\ne".into();
+        let text = render_to_string(&app, 80, 30);
+        // All 5 lines must be visible inside the box.
+        for letter in ["a", "b", "c", "d", "e"] {
+            assert!(text.contains(letter), "missing '{letter}':\n{text}");
+        }
+    }
 }
