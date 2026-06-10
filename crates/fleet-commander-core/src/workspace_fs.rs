@@ -50,9 +50,15 @@ pub trait WorkspaceFs: Send + Sync + Debug {
     fn git_branch(&self) -> Option<String>;
 
     /// Map of `rel -> status` for every non-clean path. Tracked-and-
-    /// clean files are absent. Ignored files **are** included; the
-    /// UI hides them by default and surfaces them on toggle.
-    fn git_status(&self) -> Result<HashMap<PathBuf, StatusKind>, StatusError>;
+    /// clean files are absent. `include_ignored` is **off** by default
+    /// because asking git for ignored entries on a Rust/Node repo can
+    /// emit hundreds of thousands of paths and add seconds of latency.
+    /// The UI calls this with `true` only when the user has toggled
+    /// ignored visibility on.
+    fn git_status(
+        &self,
+        include_ignored: bool,
+    ) -> Result<HashMap<PathBuf, StatusKind>, StatusError>;
 }
 
 /// Backed by the local filesystem and the host's `git` binary.
@@ -98,8 +104,11 @@ impl WorkspaceFs for LocalFs {
         git::current_branch(&self.root)
     }
 
-    fn git_status(&self) -> Result<HashMap<PathBuf, StatusKind>, StatusError> {
-        git::status(&self.root)
+    fn git_status(
+        &self,
+        include_ignored: bool,
+    ) -> Result<HashMap<PathBuf, StatusKind>, StatusError> {
+        git::status(&self.root, include_ignored)
     }
 }
 

@@ -47,8 +47,21 @@ pub struct ExplorerState {
     /// Map of relative path → git status. Tracked-and-clean files
     /// are absent from the map.
     pub status: HashMap<PathBuf, StatusKind>,
+    /// Pre-computed aggregate status for every ancestor directory of
+    /// a non-clean entry — the most "interesting" status among its
+    /// descendants. Built once per `refresh_status` so that rendering
+    /// each directory row is O(1) instead of O(status_count).
+    dir_status: HashMap<PathBuf, StatusKind>,
     /// Whether ignored files are visible. Off by default.
     pub show_ignored: bool,
+    /// True while a background `git status` is in flight. The app
+    /// uses this to coalesce bursty refresh requests (e.g. many
+    /// diffs landing in a row) into a single follow-up refresh.
+    pub is_refreshing: bool,
+    /// True when a refresh was requested while one was already in
+    /// flight. We honour it by re-issuing the refresh as soon as the
+    /// in-flight one completes.
+    pub refresh_pending: bool,
     /// Last error from a status fetch, surfaced once via the status
     /// bar.
     pub last_error: Option<String>,
@@ -86,24 +99,30 @@ impl ExplorerState {
         self.selected = None;
         self.expanded.clear();
         self.status.clear();
+        self.dir_status.clear();
         self.last_error = None;
     }
 
-    /// Re-read git status via the workspace FS. Sets `last_error` on
-    /// failure (e.g. workspace isn't a repo) rather than panicking.
-    pub fn refresh_status(&mut self) {
-        let Some(fs) = self.fs.clone() else {
-            self.status.clear();
-            return;
-        };
-        match fs.git_status() {
+    /// Re-read git status via the workspace FS *synchronously*. Sets
+    /// `last_error` on failure (e.g. workspace isn't a repo) rather
+    /// than panicking.
+    ///
+    /// Install a freshly-fetched status map and rebuild the
+    /// directory-aggregate index. Called by the app when an
+    /// `AppEvent::ExplorerStatusReady` lands (and by tests
+    /// that want to seed status without running git).
+    pub fn apply_status(&mut self, result: Result<HashMap<PathBuf, StatusKind>, String>) {
+        self.is_refreshing = false;
+        match result {
             Ok(map) => {
+                self.dir_status = build_dir_aggregates(&map);
                 self.status = map;
                 self.last_error = None;
             }
-            Err(e) => {
+            Err(message) => {
                 self.status.clear();
-                self.last_error = Some(e.to_string());
+                self.dir_status.clear();
+                self.last_error = Some(message);
             }
         }
     }
@@ -226,26 +245,34 @@ fn walk_dir(
 }
 
 /// Status to display for a row. Files just use their entry from the
-/// status map. Directories aggregate their descendants and report
-/// the most interesting status.
+/// status map. Directory rows look up the pre-computed aggregate;
+/// see [`build_dir_aggregates`].
 fn derive_status(state: &ExplorerState, rel: &Path, is_dir: bool) -> Option<StatusKind> {
     if !is_dir {
         return state.status.get(rel).copied();
     }
-    let prefix = format!("{}/", rel.display());
-    let mut best: Option<StatusKind> = None;
-    for (path, kind) in &state.status {
-        let s = path.to_string_lossy();
-        if !s.starts_with(&prefix) {
-            continue;
+    state.dir_status.get(rel).copied()
+}
+
+/// Build the `dir_path -> aggregated StatusKind` map in one O(n × depth)
+/// pass over the status map, so the per-render directory lookup is
+/// O(1) instead of O(status_count).
+fn build_dir_aggregates(status: &HashMap<PathBuf, StatusKind>) -> HashMap<PathBuf, StatusKind> {
+    let mut out: HashMap<PathBuf, StatusKind> = HashMap::new();
+    for (path, kind) in status {
+        let mut cursor: &Path = path;
+        while let Some(parent) = cursor.parent() {
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            let entry = out.entry(parent.to_path_buf()).or_insert(*kind);
+            if priority(*kind) > priority(*entry) {
+                *entry = *kind;
+            }
+            cursor = parent;
         }
-        best = match (best, *kind) {
-            (None, k) => Some(k),
-            (Some(prev), k) if priority(k) > priority(prev) => Some(k),
-            (Some(prev), _) => Some(prev),
-        };
     }
-    best
+    out
 }
 
 fn priority(kind: StatusKind) -> u8 {
@@ -360,9 +387,9 @@ mod tests {
     fn directories_aggregate_status_from_descendants() {
         let tmp = fixture();
         let mut state = state_for(&tmp);
-        state
-            .status
-            .insert(PathBuf::from("src/nested/deep.rs"), StatusKind::Modified);
+        let mut map = HashMap::new();
+        map.insert(PathBuf::from("src/nested/deep.rs"), StatusKind::Modified);
+        state.apply_status(Ok(map));
         let entries = state.visible_entries();
         let src = entries.iter().find(|e| e.name == "src").unwrap();
         assert_eq!(src.status, Some(StatusKind::Modified));
@@ -372,12 +399,10 @@ mod tests {
     fn priority_picks_more_interesting_status_for_dir_aggregation() {
         let tmp = fixture();
         let mut state = state_for(&tmp);
-        state
-            .status
-            .insert(PathBuf::from("src/lib.rs"), StatusKind::Untracked);
-        state
-            .status
-            .insert(PathBuf::from("src/nested/deep.rs"), StatusKind::Modified);
+        let mut map = HashMap::new();
+        map.insert(PathBuf::from("src/lib.rs"), StatusKind::Untracked);
+        map.insert(PathBuf::from("src/nested/deep.rs"), StatusKind::Modified);
+        state.apply_status(Ok(map));
         let entries = state.visible_entries();
         let src = entries.iter().find(|e| e.name == "src").unwrap();
         // Modified outranks Untracked.

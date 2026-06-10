@@ -146,10 +146,17 @@ impl std::error::Error for StatusError {}
 /// inside `workspace`. Tracked files with no changes are absent from
 /// the map (the explorer treats absence as "clean").
 ///
-/// Ignored files **are** included — the UI is responsible for hiding
-/// them when the user has the ignored-toggle off.
-pub fn status(workspace: &Path) -> Result<HashMap<PathBuf, StatusKind>, StatusError> {
-    let entries = status_entries(workspace)?;
+/// `include_ignored` controls whether `--ignored=traditional` and
+/// `--untracked-files=all` are added to the git invocation. Both are
+/// **off** by default because on a Rust/Node repo with `target/` or
+/// `node_modules/` they balloon the output to hundreds of thousands
+/// of entries and add multiple seconds of latency for a feature
+/// (showing ignored files in the tree) that's behind a toggle.
+pub fn status(
+    workspace: &Path,
+    include_ignored: bool,
+) -> Result<HashMap<PathBuf, StatusKind>, StatusError> {
+    let entries = status_entries(workspace, include_ignored)?;
     let mut map = HashMap::with_capacity(entries.len());
     for entry in entries {
         map.insert(entry.path, entry.kind);
@@ -160,19 +167,20 @@ pub fn status(workspace: &Path) -> Result<HashMap<PathBuf, StatusKind>, StatusEr
 /// Lower-level variant returning the parsed entries in the order git
 /// reported them. Useful when the consumer wants the raw list (e.g.
 /// for a "changes" summary) rather than a lookup table.
-pub fn status_entries(workspace: &Path) -> Result<Vec<FileStatus>, StatusError> {
-    let output = Command::new("git")
-        .arg("-C")
+pub fn status_entries(
+    workspace: &Path,
+    include_ignored: bool,
+) -> Result<Vec<FileStatus>, StatusError> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(workspace)
-        .args([
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--ignored=traditional",
-            "--untracked-files=all",
-        ])
-        .output()
-        .map_err(StatusError::SpawnFailed)?;
+        .args(["status", "--porcelain=v1", "-z"]);
+    if include_ignored {
+        // Listing ignored entries is only useful when the user has
+        // asked to see them; otherwise it's pure overhead.
+        cmd.args(["--ignored=traditional", "--untracked-files=all"]);
+    }
+    let output = cmd.output().map_err(StatusError::SpawnFailed)?;
 
     if !output.status.success() {
         return Err(StatusError::NonZeroExit {
@@ -437,7 +445,7 @@ mod tests {
         write(&tmp.path().join("untracked.rs"), "fn c() {}\n");
         write(&tmp.path().join("ignored.txt"), "noise");
 
-        let map = status(tmp.path()).expect("status");
+        let map = status(tmp.path(), true).expect("status");
         assert_eq!(
             map.get(&PathBuf::from("tracked.rs")),
             Some(&StatusKind::Modified),
@@ -460,7 +468,7 @@ mod tests {
             return;
         }
         let tmp = tempdir().unwrap();
-        let err = status(tmp.path()).expect_err("expected NonZeroExit");
+        let err = status(tmp.path(), false).expect_err("expected NonZeroExit");
         assert!(matches!(err, StatusError::NonZeroExit { .. }), "{err}");
     }
 }

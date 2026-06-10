@@ -169,6 +169,29 @@ impl App {
                 // text, etc.) ticks. We deliberately do not snap scroll
                 // here — if the user is reading history, leave them alone.
             }
+            AppEvent::ExplorerStatusReady {
+                root,
+                include_ignored,
+                result,
+            } => {
+                // Drop responses from a previous workspace or a stale
+                // include_ignored value — they would overwrite the
+                // current state with the wrong data.
+                let root_matches = self
+                    .explorer
+                    .fs
+                    .as_ref()
+                    .map(|fs| fs.root_display() == root)
+                    .unwrap_or(false);
+                if root_matches && include_ignored == self.explorer.show_ignored {
+                    self.explorer.apply_status(result);
+                } else {
+                    self.explorer.is_refreshing = false;
+                }
+                if self.explorer.refresh_pending {
+                    self.request_explorer_refresh();
+                }
+            }
             AppEvent::Session(event) => self.handle_session_event(event),
         }
     }
@@ -406,9 +429,12 @@ impl App {
                 && !key.modifiers.contains(KeyModifiers::CONTROL)
             {
                 match c {
-                    'r' => self.explorer.refresh_status(),
+                    'r' => self.request_explorer_refresh(),
                     '.' => {
                         self.explorer.show_ignored = !self.explorer.show_ignored;
+                        // Re-query because the include_ignored flag changes
+                        // what git returns.
+                        self.request_explorer_refresh();
                     }
                     '@' => {
                         if let Some(entry) = self.explorer.selected_entry() {
@@ -468,6 +494,50 @@ impl App {
                 self.ensure_agent_connected(agent_id.clone());
             }
         }
+        // Toggling the explorer open is the one mutation handle_session_action
+        // makes that the user expects to see freshly-resolved git status for.
+        // Issue the refresh from here because spawning the background task
+        // needs `&mut App`.
+        if action == Action::ToggleExplorer && self.explorer.open && self.explorer.fs.is_some() {
+            self.request_explorer_refresh();
+        }
+    }
+
+    /// Spawn a background `git status` for the active workspace and
+    /// pump the result back into the event loop as
+    /// [`AppEvent::ExplorerStatusReady`]. Coalesces bursty callers:
+    /// if a refresh is already in flight, sets a pending flag so a
+    /// follow-up runs once the in-flight one lands.
+    ///
+    /// Cheap no-op when the explorer has no filesystem attached **or
+    /// is closed** — there's no point spending cycles updating git
+    /// state the user can't see.
+    pub fn request_explorer_refresh(&mut self) {
+        if !self.explorer.open {
+            return;
+        }
+        let Some(fs) = self.explorer.fs.clone() else {
+            return;
+        };
+        if self.explorer.is_refreshing {
+            self.explorer.refresh_pending = true;
+            return;
+        }
+        self.explorer.is_refreshing = true;
+        self.explorer.refresh_pending = false;
+        let include_ignored = self.explorer.show_ignored;
+        let root = fs.root_display().to_path_buf();
+        let tx = self.tx.clone();
+        // `git status` is a sync subprocess; off-load it to the blocking
+        // pool so the UI loop keeps draining events while it runs.
+        tokio::task::spawn_blocking(move || {
+            let result = fs.git_status(include_ignored).map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::ExplorerStatusReady {
+                root,
+                include_ignored,
+                result,
+            });
+        });
     }
 
     /// Start the ACP connection for an agent if not already connected.
@@ -486,7 +556,7 @@ impl App {
             // Refresh status when the workspace is set for the first time
             // (or when switching to a new agent's workspace cleared state).
             if self.explorer.fs.is_some() && (!had_fs || self.explorer.status.is_empty()) {
-                self.explorer.refresh_status();
+                self.request_explorer_refresh();
             }
         }
         let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) else {
@@ -562,7 +632,7 @@ impl App {
             });
         }
         if self.explorer.fs.is_some() {
-            self.explorer.refresh_status();
+            self.request_explorer_refresh();
         }
     }
 
@@ -591,7 +661,7 @@ impl App {
         // A new diff means files on disk likely changed — refresh the
         // explorer's git cues so the user sees the same files highlighted.
         if self.explorer.fs.is_some() {
-            self.explorer.refresh_status();
+            self.request_explorer_refresh();
         }
     }
 
@@ -900,12 +970,8 @@ fn handle_session_action(
         Action::ToggleExplorer => {
             explorer.open = !explorer.open;
             if explorer.open {
-                if explorer.fs.is_some() {
-                    // Refresh on every open so cues stay accurate when the user
-                    // re-summons the pane after running commands in the agent.
-                    explorer.refresh_status();
-                }
-                // Auto-focus so arrow keys immediately navigate the tree.
+                // Refresh happens in the caller because it's an async
+                // operation that needs `&mut App` to spawn the task.
                 *focus = SessionFocus::Explorer;
             } else if *focus == SessionFocus::Explorer {
                 *focus = SessionFocus::Conversation;
