@@ -27,6 +27,8 @@ pub enum Action {
     /// Re-engage "follow bottom" — viewport snaps to and tracks the newest
     /// content. Default bind: `G` (vim's go-to-end-of-file).
     FollowBottom,
+    /// Show/hide the file explorer side pane. Default bind: `Ctrl+E`.
+    ToggleExplorer,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -61,6 +63,8 @@ pub struct Bindings {
     pub command: Vec<Binding>,
     #[serde(default = "default_follow_bottom")]
     pub follow_bottom: Vec<Binding>,
+    #[serde(default = "default_toggle_explorer")]
+    pub toggle_explorer: Vec<Binding>,
 }
 
 impl Default for Bindings {
@@ -78,6 +82,7 @@ impl Default for Bindings {
             insert: default_insert(),
             command: default_command(),
             follow_bottom: default_follow_bottom(),
+            toggle_explorer: default_toggle_explorer(),
         }
     }
 }
@@ -107,6 +112,7 @@ impl Bindings {
             (Action::Insert, self.insert.as_slice()),
             (Action::Command, self.command.as_slice()),
             (Action::FollowBottom, self.follow_bottom.as_slice()),
+            (Action::ToggleExplorer, self.toggle_explorer.as_slice()),
         ]
         .into_iter()
     }
@@ -166,6 +172,9 @@ fn default_command() -> Vec<Binding> {
 }
 fn default_follow_bottom() -> Vec<Binding> {
     parse_each(&["G"])
+}
+fn default_toggle_explorer() -> Vec<Binding> {
+    parse_each(&["C-e"])
 }
 
 #[cfg(test)]

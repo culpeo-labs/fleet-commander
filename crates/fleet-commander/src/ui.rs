@@ -10,6 +10,7 @@
 mod agent_list;
 mod agent_session;
 mod conversation;
+mod explorer;
 mod input_box;
 mod keys_footer;
 mod overlay;

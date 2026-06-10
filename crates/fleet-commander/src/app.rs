@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use fleet_commander_core::session::{MessageStatus, SessionEvent, ToolCallStatusKind};
+use fleet_commander_core::workspace_fs::LocalFs;
 use fleet_commander_core::{agent_runtime, container};
 
 use crate::agent::{Agent, AgentId, AgentStatus, HistoryEntry};
@@ -27,6 +28,7 @@ use crate::change_source::ChangeEvent;
 use crate::completion::{PathCompleter, split_command_and_path};
 use crate::config::{Action, Config};
 use crate::event::AppEvent;
+use crate::explorer::ExplorerState;
 use crate::init;
 use crate::workspace;
 
@@ -49,6 +51,7 @@ pub enum Screen {
 pub enum SessionFocus {
     Conversation,
     SidePane,
+    Explorer,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +91,10 @@ pub struct App {
     /// Optional substring filter applied to agent id when deciding whether
     /// to enable ACP logging for a given agent.
     pub acp_log_filter: Option<String>,
+    /// Lazy tree-view state for the current agent's workspace. Reset
+    /// whenever the active workspace changes. Toggle visibility with
+    /// `Ctrl+E`.
+    pub explorer: ExplorerState,
 }
 
 /// A tool permission request waiting for the user's y/n decision.
@@ -128,6 +135,7 @@ impl App {
             permission_pending: None,
             acp_log,
             acp_log_filter,
+            explorer: ExplorerState::default(),
         }
     }
 
@@ -160,6 +168,29 @@ impl App {
                 // event loop when a tracked handle (tool call, streaming
                 // text, etc.) ticks. We deliberately do not snap scroll
                 // here — if the user is reading history, leave them alone.
+            }
+            AppEvent::ExplorerStatusReady {
+                root,
+                include_ignored,
+                result,
+            } => {
+                // Drop responses from a previous workspace or a stale
+                // include_ignored value — they would overwrite the
+                // current state with the wrong data.
+                let root_matches = self
+                    .explorer
+                    .fs
+                    .as_ref()
+                    .map(|fs| fs.root_display() == root)
+                    .unwrap_or(false);
+                if root_matches && include_ignored == self.explorer.show_ignored {
+                    self.explorer.apply_status(result);
+                } else {
+                    self.explorer.is_refreshing = false;
+                }
+                if self.explorer.refresh_pending {
+                    self.request_explorer_refresh();
+                }
             }
             AppEvent::Session(event) => self.handle_session_event(event),
         }
@@ -389,6 +420,43 @@ impl App {
         }
 
         let Some(action) = self.config.bindings.action_for(&key) else {
+            // Explorer-focus-specific character keys that aren't part of
+            // the global Action set: `r` refresh, `.` toggle ignored,
+            // `@` insert reference + switch to input mode.
+            if let Screen::AgentSession { focus, .. } = &self.screen
+                && *focus == SessionFocus::Explorer
+                && let KeyCode::Char(c) = key.code
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                match c {
+                    'r' => self.request_explorer_refresh(),
+                    '.' => {
+                        self.explorer.show_ignored = !self.explorer.show_ignored;
+                        // Re-query because the include_ignored flag changes
+                        // what git returns.
+                        self.request_explorer_refresh();
+                    }
+                    '@' => {
+                        if let Some(entry) = self.explorer.selected_entry() {
+                            let path = entry.path.display().to_string();
+                            if !self.input_buffer.is_empty() && !self.input_buffer.ends_with(' ') {
+                                self.input_buffer.push(' ');
+                            }
+                            self.input_buffer.push('@');
+                            self.input_buffer.push_str(&path);
+                            self.input_buffer.push(' ');
+                            if let Screen::AgentSession {
+                                input_mode, focus, ..
+                            } = &mut self.screen
+                            {
+                                *input_mode = true;
+                                *focus = SessionFocus::Conversation;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             return;
         };
 
@@ -409,7 +477,15 @@ impl App {
                 side_pane,
                 scroll,
                 ..
-            } => handle_session_action(action, agent_id, focus, side_pane, scroll, &self.agents),
+            } => handle_session_action(
+                action,
+                agent_id,
+                focus,
+                side_pane,
+                scroll,
+                &self.agents,
+                &mut self.explorer,
+            ),
         };
         if let Some(next) = next {
             self.screen = next;
@@ -418,10 +494,71 @@ impl App {
                 self.ensure_agent_connected(agent_id.clone());
             }
         }
+        // Toggling the explorer open is the one mutation handle_session_action
+        // makes that the user expects to see freshly-resolved git status for.
+        // Issue the refresh from here because spawning the background task
+        // needs `&mut App`.
+        if action == Action::ToggleExplorer && self.explorer.open && self.explorer.fs.is_some() {
+            self.request_explorer_refresh();
+        }
+    }
+
+    /// Spawn a background `git status` for the active workspace and
+    /// pump the result back into the event loop as
+    /// [`AppEvent::ExplorerStatusReady`]. Coalesces bursty callers:
+    /// if a refresh is already in flight, sets a pending flag so a
+    /// follow-up runs once the in-flight one lands.
+    ///
+    /// Cheap no-op when the explorer has no filesystem attached **or
+    /// is closed** — there's no point spending cycles updating git
+    /// state the user can't see.
+    pub fn request_explorer_refresh(&mut self) {
+        if !self.explorer.open {
+            return;
+        }
+        let Some(fs) = self.explorer.fs.clone() else {
+            return;
+        };
+        if self.explorer.is_refreshing {
+            self.explorer.refresh_pending = true;
+            return;
+        }
+        self.explorer.is_refreshing = true;
+        self.explorer.refresh_pending = false;
+        let include_ignored = self.explorer.show_ignored;
+        let root = fs.root_display().to_path_buf();
+        let tx = self.tx.clone();
+        // `git status` is a sync subprocess; off-load it to the blocking
+        // pool so the UI loop keeps draining events while it runs.
+        tokio::task::spawn_blocking(move || {
+            let result = fs.git_status(include_ignored).map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::ExplorerStatusReady {
+                root,
+                include_ignored,
+                result,
+            });
+        });
     }
 
     /// Start the ACP connection for an agent if not already connected.
     pub fn ensure_agent_connected(&mut self, agent_id: AgentId) {
+        // Point the explorer at this agent's workspace (no-op if same root).
+        // This happens on every screen change into AgentSession, including
+        // when the agent is already connected, so the explorer always reflects
+        // the currently-viewed agent.
+        if let Some(agent) = self.agents.iter().find(|a| a.id == agent_id) {
+            let fs = agent.workspace_folder.as_ref().map(|ws| {
+                Arc::new(LocalFs::new(ws))
+                    as Arc<dyn fleet_commander_core::workspace_fs::WorkspaceFs>
+            });
+            let had_fs = self.explorer.fs.is_some();
+            self.explorer.set_fs(fs);
+            // Refresh status when the workspace is set for the first time
+            // (or when switching to a new agent's workspace cleared state).
+            if self.explorer.fs.is_some() && (!had_fs || self.explorer.status.is_empty()) {
+                self.request_explorer_refresh();
+            }
+        }
         let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) else {
             return;
         };
@@ -494,6 +631,9 @@ impl App {
                 content,
             });
         }
+        if self.explorer.fs.is_some() {
+            self.request_explorer_refresh();
+        }
     }
 
     /// Open or replace the side pane when an MCP tool targets a specific agent.
@@ -517,6 +657,11 @@ impl App {
                     input_mode: false,
                 };
             }
+        }
+        // A new diff means files on disk likely changed — refresh the
+        // explorer's git cues so the user sees the same files highlighted.
+        if self.explorer.fs.is_some() {
+            self.request_explorer_refresh();
         }
     }
 
@@ -793,7 +938,13 @@ fn handle_session_action(
     side_pane: &mut Option<SidePane>,
     scroll: &mut usize,
     agents: &[Agent],
+    explorer: &mut ExplorerState,
 ) -> Option<Screen> {
+    // Explorer-focused actions: arrows navigate the tree, Enter expands
+    // dirs / opens files, DismissPane returns focus to conversation.
+    if *focus == SessionFocus::Explorer {
+        return handle_explorer_action(action, focus, side_pane, agents, agent_id, explorer);
+    }
     match action {
         Action::Back => {
             let idx = agents.iter().position(|a| &a.id == agent_id).unwrap_or(0);
@@ -811,11 +962,20 @@ fn handle_session_action(
             *focus = SessionFocus::Conversation;
             None
         }
-        Action::TogglePane if side_pane.is_some() => {
-            *focus = match *focus {
-                SessionFocus::Conversation => SessionFocus::SidePane,
-                SessionFocus::SidePane => SessionFocus::Conversation,
-            };
+        Action::TogglePane => {
+            // Cycle: Conversation -> Explorer (if open) -> SidePane (if open) -> Conversation
+            *focus = next_focus(*focus, explorer.open, side_pane.is_some());
+            None
+        }
+        Action::ToggleExplorer => {
+            explorer.open = !explorer.open;
+            if explorer.open {
+                // Refresh happens in the caller because it's an async
+                // operation that needs `&mut App` to spawn the task.
+                *focus = SessionFocus::Explorer;
+            } else if *focus == SessionFocus::Explorer {
+                *focus = SessionFocus::Conversation;
+            }
             None
         }
         Action::Down => {
@@ -840,6 +1000,86 @@ fn handle_session_action(
         }
         Action::FollowBottom => {
             *scroll = usize::MAX;
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Tab cycle through visible panes. Skips panes that aren't currently
+/// showing so the user never lands on an invisible focus target.
+fn next_focus(current: SessionFocus, explorer_open: bool, side_pane_open: bool) -> SessionFocus {
+    let order = [
+        SessionFocus::Conversation,
+        SessionFocus::Explorer,
+        SessionFocus::SidePane,
+    ];
+    let idx = order.iter().position(|f| *f == current).unwrap_or(0);
+    for step in 1..=order.len() {
+        let candidate = order[(idx + step) % order.len()];
+        let visible = match candidate {
+            SessionFocus::Conversation => true,
+            SessionFocus::Explorer => explorer_open,
+            SessionFocus::SidePane => side_pane_open,
+        };
+        if visible {
+            return candidate;
+        }
+    }
+    SessionFocus::Conversation
+}
+
+fn handle_explorer_action(
+    action: Action,
+    focus: &mut SessionFocus,
+    side_pane: &mut Option<SidePane>,
+    agents: &[Agent],
+    agent_id: &AgentId,
+    explorer: &mut ExplorerState,
+) -> Option<Screen> {
+    match action {
+        Action::ToggleExplorer => {
+            explorer.open = false;
+            *focus = SessionFocus::Conversation;
+            None
+        }
+        Action::TogglePane => {
+            *focus = next_focus(*focus, explorer.open, side_pane.is_some());
+            None
+        }
+        Action::Back => {
+            // Esc unfocuses the explorer without closing the pane, mirroring
+            // how Esc dismisses other modal focus states.
+            *focus = SessionFocus::Conversation;
+            None
+        }
+        Action::Down => {
+            explorer.move_cursor(1);
+            None
+        }
+        Action::Up => {
+            explorer.move_cursor(-1);
+            None
+        }
+        Action::Activate => {
+            if let Some(entry) = explorer.selected_entry() {
+                if entry.is_dir {
+                    explorer.toggle_selected_dir();
+                } else if let Some(fs) = explorer.fs.clone()
+                    && let Ok(bytes) = fs.read_file(&entry.path)
+                {
+                    let content = String::from_utf8_lossy(&bytes).into_owned();
+                    let full = fs.root_display().join(&entry.path);
+                    *side_pane = Some(SidePane::Diff {
+                        path: full,
+                        content,
+                    });
+                }
+            }
+            // Touch agents/agent_id to keep the signature usable for future
+            // per-agent dispatch (e.g. sending the file path to the agent).
+            let _ = agents;
+            let _ = agent_id;
             None
         }
         _ => None,
@@ -1361,6 +1601,57 @@ mod tests {
             KeyModifiers::SHIFT,
         )));
         assert_eq!(current_scroll(&app), usize::MAX);
+    }
+
+    // ─── file explorer ────────────────────────────────────────────────────
+
+    fn ctrl_e() -> AppEvent {
+        AppEvent::Input(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL))
+    }
+
+    #[test]
+    fn ctrl_e_toggles_the_explorer_pane() {
+        let mut app = app_in_session(0);
+        assert!(!app.explorer.open);
+        app.handle(ctrl_e());
+        assert!(app.explorer.open, "Ctrl+E must open the explorer");
+        // Focus follows the new pane so arrows immediately navigate it.
+        match &app.screen {
+            Screen::AgentSession { focus, .. } => {
+                assert_eq!(*focus, SessionFocus::Explorer);
+            }
+            _ => panic!("expected AgentSession"),
+        }
+        app.handle(ctrl_e());
+        assert!(!app.explorer.open, "Ctrl+E must close the explorer");
+    }
+
+    #[test]
+    fn esc_unfocuses_explorer_without_closing_it() {
+        let mut app = app_in_session(0);
+        app.handle(ctrl_e());
+        app.handle(press(KeyCode::Esc));
+        match &app.screen {
+            Screen::AgentSession { focus, .. } => {
+                assert_eq!(*focus, SessionFocus::Conversation);
+            }
+            _ => panic!("expected AgentSession"),
+        }
+        assert!(
+            app.explorer.open,
+            "Esc from explorer focus must keep the pane open"
+        );
+    }
+
+    #[test]
+    fn dot_toggles_show_ignored_when_explorer_focused() {
+        let mut app = app_in_session(0);
+        app.handle(ctrl_e());
+        assert!(!app.explorer.show_ignored);
+        app.handle(press(KeyCode::Char('.')));
+        assert!(app.explorer.show_ignored, ". must toggle show_ignored on");
+        app.handle(press(KeyCode::Char('.')));
+        assert!(!app.explorer.show_ignored);
     }
 
     // ─── session rehydration ──────────────────────────────────────────────

@@ -49,6 +49,19 @@ pub enum AppEvent {
     /// AuthRequired, Output, …) or the `*Started` introduction of a
     /// streamed entity whose handle then drives its own updates.
     Session(SessionEvent),
+    /// Result of an explorer status refresh that ran on a background
+    /// thread. Carries the new `path -> status` map (empty on error)
+    /// and the `include_ignored` flag the refresh was issued with —
+    /// the app drops responses that no longer match the current
+    /// toggle state to avoid stale overlays.
+    ExplorerStatusReady {
+        root: std::path::PathBuf,
+        include_ignored: bool,
+        result: std::result::Result<
+            std::collections::HashMap<std::path::PathBuf, fleet_commander_core::git::StatusKind>,
+            String,
+        >,
+    },
     /// Nudge from a per-handle tracker task to redraw because one of its
     /// handles' `watch` channels ticked. Carries no state — the renderer
     /// reads the handle directly. (The redraw itself is performed by the
