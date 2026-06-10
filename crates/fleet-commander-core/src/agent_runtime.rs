@@ -21,7 +21,7 @@ use agent_client_protocol::schema::{
 };
 use agent_client_protocol::{AcpAgent, Agent as AcpAgentRole, ConnectionTo, LineDirection};
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::container::{self, ContainerConfig};
 use crate::session::{AgentId, SessionEvent, ToolCallStatusKind};
@@ -419,61 +419,30 @@ async fn connect_and_run(
 
                 // Try to resume an existing session. Prefer `session/resume` when
                 // advertised; fall back to `session/load` for agents (like
-                // Copilot CLI) that only support the older mechanism.
-                let session_id = if let Some(ref prev_id) = previous_session_id {
-                    if can_resume {
-                        let _ = tx.send(SessionEvent::Output {
-                            agent_id: aid.clone(),
-                            line: format!("Resuming session {prev_id}…"),
-                        });
-                        match connection
-                            .send_request(ResumeSessionRequest::new(
-                                prev_id.clone(),
-                                session_cwd.clone(),
-                            ))
-                            .block_task()
-                            .await
-                        {
-                            Ok(_) => Some(prev_id.clone()),
-                            Err(err) => {
-                                let _ = tx.send(SessionEvent::Output {
-                                    agent_id: aid.clone(),
-                                    line: format!("Resume failed ({err}), creating new session…"),
-                                });
-                                None
-                            }
-                        }
-                    } else if can_load {
-                        let _ = tx.send(SessionEvent::Output {
-                            agent_id: aid.clone(),
-                            line: format!("Loading session {prev_id}…"),
-                        });
-                        match connection
-                            .send_request(LoadSessionRequest::new(
-                                prev_id.clone(),
-                                session_cwd.clone(),
-                            ))
-                            .block_task()
-                            .await
-                        {
-                            Ok(_) => {
-                                info!(agent_id = %aid, session_id = %prev_id, "Session loaded");
-                                Some(prev_id.clone())
-                            }
-                            Err(err) => {
-                                let _ = tx.send(SessionEvent::Output {
-                                    agent_id: aid.clone(),
-                                    line: format!("Load failed ({err}), creating new session…"),
-                                });
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                } else if can_list && (can_resume || can_load) {
-                    // No previous session_id stored — try listing sessions for this cwd.
-                    try_find_and_resume(
+                // Copilot CLI) that only support the older mechanism. If the
+                // saved session id is rejected (e.g., Copilot CLI dropped it
+                // from its store between runs), fall back to `session/list` to
+                // discover any other session for the same cwd before giving up
+                // and creating a fresh one.
+                let mut session_id: Option<String> = None;
+
+                if let Some(ref prev_id) = previous_session_id {
+                    session_id = try_resume_specific(
+                        &connection,
+                        prev_id,
+                        &session_cwd,
+                        &aid,
+                        &tx,
+                        can_resume,
+                        can_load,
+                    )
+                    .await;
+                }
+
+                if session_id.is_none() && can_list && (can_resume || can_load) {
+                    // Either no saved id, or the saved id is stale. Ask the
+                    // agent which sessions it actually has for this cwd.
+                    session_id = try_find_and_resume(
                         &connection,
                         &session_cwd,
                         &aid,
@@ -481,10 +450,8 @@ async fn connect_and_run(
                         can_resume,
                         can_load,
                     )
-                    .await
-                } else {
-                    None
-                };
+                    .await;
+                }
 
                 // Rename to make the next step's intent explicit: this is the
                 // id from the resume/load path, if any.
@@ -574,6 +541,99 @@ async fn connect_and_run(
     Ok(())
 }
 
+/// Try to rehydrate a specific session by id. Returns the id on success,
+/// `None` on any failure (including the agent reporting that it no longer
+/// has the session in its store). All failures are logged at WARN level
+/// and a user-facing message is sent to the TUI so the operator can see why
+/// the saved session couldn't be restored.
+async fn try_resume_specific(
+    connection: &ConnectionTo<AcpAgentRole>,
+    prev_id: &str,
+    session_cwd: &Path,
+    agent_id: &str,
+    tx: &mpsc::UnboundedSender<SessionEvent>,
+    can_resume: bool,
+    can_load: bool,
+) -> Option<String> {
+    if can_resume {
+        info!(
+            agent_id = %agent_id,
+            session_id = %prev_id,
+            cwd = %session_cwd.display(),
+            "Resuming session"
+        );
+        let _ = tx.send(SessionEvent::Output {
+            agent_id: agent_id.to_string(),
+            line: format!("Resuming session {prev_id}…"),
+        });
+        match connection
+            .send_request(ResumeSessionRequest::new(
+                prev_id.to_string(),
+                session_cwd.to_path_buf(),
+            ))
+            .block_task()
+            .await
+        {
+            Ok(_) => {
+                info!(agent_id = %agent_id, session_id = %prev_id, "Session resumed");
+                Some(prev_id.to_string())
+            }
+            Err(err) => {
+                warn!(
+                    agent_id = %agent_id,
+                    session_id = %prev_id,
+                    error = %err,
+                    "Session resume failed"
+                );
+                let _ = tx.send(SessionEvent::Output {
+                    agent_id: agent_id.to_string(),
+                    line: format!("Resume failed ({err})."),
+                });
+                None
+            }
+        }
+    } else if can_load {
+        info!(
+            agent_id = %agent_id,
+            session_id = %prev_id,
+            cwd = %session_cwd.display(),
+            "Loading session"
+        );
+        let _ = tx.send(SessionEvent::Output {
+            agent_id: agent_id.to_string(),
+            line: format!("Loading session {prev_id}…"),
+        });
+        match connection
+            .send_request(LoadSessionRequest::new(
+                prev_id.to_string(),
+                session_cwd.to_path_buf(),
+            ))
+            .block_task()
+            .await
+        {
+            Ok(_) => {
+                info!(agent_id = %agent_id, session_id = %prev_id, "Session loaded");
+                Some(prev_id.to_string())
+            }
+            Err(err) => {
+                warn!(
+                    agent_id = %agent_id,
+                    session_id = %prev_id,
+                    error = %err,
+                    "Session load failed"
+                );
+                let _ = tx.send(SessionEvent::Output {
+                    agent_id: agent_id.to_string(),
+                    line: format!("Load failed ({err})."),
+                });
+                None
+            }
+        }
+    } else {
+        None
+    }
+}
+
 /// Try to find an existing session for `cwd` via `session/list` and resume it.
 ///
 /// Uses `session/resume` when the agent supports it, otherwise falls back to
@@ -593,8 +653,24 @@ async fn try_find_and_resume(
         .await;
 
     let sessions = match list_result {
-        Ok(resp) => resp.sessions,
-        Err(_) => return None,
+        Ok(resp) => {
+            info!(
+                agent_id = %agent_id,
+                cwd = %session_cwd.display(),
+                count = resp.sessions.len(),
+                "session/list result"
+            );
+            resp.sessions
+        }
+        Err(err) => {
+            warn!(
+                agent_id = %agent_id,
+                cwd = %session_cwd.display(),
+                error = %err,
+                "session/list failed"
+            );
+            return None;
+        }
     };
 
     // Pick the most recently updated session.
@@ -604,6 +680,13 @@ async fn try_find_and_resume(
             .unwrap_or("")
             .cmp(b.updated_at.as_deref().unwrap_or(""))
     })?;
+
+    info!(
+        agent_id = %agent_id,
+        session_id = %best.session_id.0,
+        title = ?best.title,
+        "Picking most recent session for cwd"
+    );
 
     let _ = tx.send(SessionEvent::Output {
         agent_id: agent_id.to_string(),
