@@ -25,5 +25,6 @@ pub mod base_layer;
 pub mod container;
 pub mod git;
 pub mod session;
+pub mod workspace_fs;
 
 mod session_state;

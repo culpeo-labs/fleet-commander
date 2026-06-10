@@ -21,12 +21,14 @@ pub fn session_hint(input_mode: bool, side_pane: bool, following: bool) -> &'sta
         return "Enter send  Alt/Shift+Enter newline  Esc cancel";
     }
     match (side_pane, following) {
-        (true, true) => "Esc back  Tab switch focus  d dismiss pane  i input  ↑/↓ scroll",
-        (true, false) => {
-            "Esc back  Tab switch focus  d dismiss pane  i input  ↑/↓ scroll  G follow"
+        (true, true) => {
+            "Esc back  Tab switch focus  d dismiss pane  i input  C-e explorer  ↑/↓ scroll"
         }
-        (false, true) => "Esc back  i input  ↑/↓ scroll",
-        (false, false) => "Esc back  i input  ↑/↓ scroll  G follow",
+        (true, false) => {
+            "Esc back  Tab switch focus  d dismiss pane  i input  C-e explorer  ↑/↓ scroll  G follow"
+        }
+        (false, true) => "Esc back  i input  C-e explorer  ↑/↓ scroll",
+        (false, false) => "Esc back  i input  C-e explorer  ↑/↓ scroll  G follow",
     }
 }
 

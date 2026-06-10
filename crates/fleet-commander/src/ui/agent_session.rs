@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, SessionFocus, SidePane};
-use crate::ui::{conversation, input_box, keys_footer, session_header, side_pane};
+use crate::ui::{conversation, explorer, input_box, keys_footer, session_header, side_pane};
 
 #[allow(clippy::too_many_arguments)]
 pub fn render(
@@ -52,21 +52,50 @@ pub fn render(
     session_header::render(frame, layout[0], agent, agent_id);
 
     let body_area = layout[1];
+    let explorer_open = app.explorer.open;
+    // Compose horizontal layout: optional explorer | conversation | optional side pane.
+    let mut constraints: Vec<Constraint> = Vec::new();
+    if explorer_open {
+        constraints.push(Constraint::Length(30));
+    }
+    if side.is_some() {
+        constraints.push(Constraint::Percentage(55));
+        constraints.push(Constraint::Percentage(45));
+    } else {
+        constraints.push(Constraint::Min(0));
+    }
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(body_area);
+
+    let mut idx = 0;
+    if explorer_open {
+        explorer::render(
+            frame,
+            body[idx],
+            &app.explorer,
+            focus == SessionFocus::Explorer,
+        );
+        idx += 1;
+    }
     if let Some(pane) = side {
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(body_area);
         conversation::render(
             frame,
-            body[0],
+            body[idx],
             agent,
             scroll,
             focus == SessionFocus::Conversation,
         );
-        side_pane::render(frame, body[1], pane, focus == SessionFocus::SidePane);
+        side_pane::render(frame, body[idx + 1], pane, focus == SessionFocus::SidePane);
     } else {
-        conversation::render(frame, body_area, agent, scroll, true);
+        conversation::render(
+            frame,
+            body[idx],
+            agent,
+            scroll,
+            focus != SessionFocus::Explorer,
+        );
     }
 
     let following = scroll == usize::MAX;
@@ -155,5 +184,43 @@ mod tests {
         for letter in ["a", "b", "c", "d", "e"] {
             assert!(text.contains(letter), "missing '{letter}':\n{text}");
         }
+    }
+
+    #[test]
+    fn explorer_pane_appears_when_open() {
+        let mut app = test_app();
+        app.screen = Screen::AgentSession {
+            agent_id: "a1".into(),
+            focus: SessionFocus::Conversation,
+            side_pane: None,
+            scroll: 0,
+            input_mode: false,
+        };
+        app.explorer.open = true;
+        let text = render_to_string(&app, 100, 16);
+        assert!(
+            text.contains("Explorer:"),
+            "explorer title missing:\n{text}"
+        );
+        assert!(text.contains("Conversation"));
+    }
+
+    #[test]
+    fn explorer_hidden_when_closed() {
+        let app = test_app_in_session(SessionFocus::Conversation);
+        let text = render_to_string(&app, 100, 16);
+        assert!(!text.contains("Explorer:"));
+    }
+
+    fn test_app_in_session(focus: SessionFocus) -> crate::app::App {
+        let mut app = test_app();
+        app.screen = Screen::AgentSession {
+            agent_id: "a1".into(),
+            focus,
+            side_pane: None,
+            scroll: 0,
+            input_mode: false,
+        };
+        app
     }
 }

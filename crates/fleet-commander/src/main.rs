@@ -23,6 +23,7 @@ mod cli;
 mod completion;
 mod config;
 mod event;
+mod explorer;
 mod init;
 mod keybind;
 mod markdown;
