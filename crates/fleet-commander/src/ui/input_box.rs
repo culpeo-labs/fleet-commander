@@ -140,4 +140,26 @@ mod tests {
             "footer hint missing:\n{text}"
         );
     }
+
+    #[test]
+    fn buffer_taller_than_box_keeps_tail_visible() {
+        // When the buffer overflows the (capped) input-box height, the
+        // box should scroll so the most recent rows — and therefore the
+        // caret — stay in view.
+        let mut app = test_app();
+        app.screen = Screen::AgentSession {
+            agent_id: "a1".into(),
+            focus: SessionFocus::Conversation,
+            side_pane: None,
+            scroll: 0,
+            input_mode: true,
+        };
+        // 30 lines into a 12-row tall terminal; max_rows=clamp(12/3,3,12)=4.
+        let body: String = (0..30).map(|i| format!("row{i}\n")).collect();
+        app.input_buffer = body;
+        let text = render_to_string(&app, 80, 12);
+        // The freshest rows must appear; the oldest must have scrolled off.
+        assert!(text.contains("row29"), "tail missing:\n{text}");
+        assert!(!text.contains("row0\n"), "head leaked:\n{text}");
+    }
 }

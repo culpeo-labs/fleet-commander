@@ -102,4 +102,42 @@ mod tests {
             "branch missing from agent list:\n{text}"
         );
     }
+
+    #[test]
+    fn marks_the_currently_selected_agent_with_an_arrow() {
+        let app = test_app();
+        let text = render_to_string(&app, 60, 12);
+        let first_row = text
+            .lines()
+            .find(|l| l.contains("First"))
+            .expect("first agent row");
+        assert!(
+            first_row.contains('▶'),
+            "selection marker missing on first row: {first_row}"
+        );
+        let second_row = text
+            .lines()
+            .find(|l| l.contains("Second"))
+            .expect("second agent row");
+        assert!(
+            !second_row.contains('▶'),
+            "selection marker leaked onto second row: {second_row}"
+        );
+    }
+
+    #[test]
+    fn shows_status_label_next_to_agent_name() {
+        let app = test_app();
+        let text = render_to_string(&app, 60, 12);
+        // Default agent status is `Idle` and labels render as `[idle]`.
+        assert!(text.contains("[idle]"), "status label missing:\n{text}");
+    }
+
+    #[test]
+    fn footer_advertises_open_command_and_quit() {
+        let app = test_app();
+        let text = render_to_string(&app, 80, 12);
+        assert!(text.contains(":open <path>"), "open hint missing:\n{text}");
+        assert!(text.contains("q quit"), "quit hint missing:\n{text}");
+    }
 }

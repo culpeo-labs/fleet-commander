@@ -46,4 +46,31 @@ mod tests {
         assert!(!session_hint(false, false, true).contains("G follow"));
         assert!(session_hint(false, false, false).contains("G follow"));
     }
+
+    #[test]
+    fn side_pane_hints_mention_tab_and_dismiss() {
+        let with_side = session_hint(false, true, false);
+        assert!(
+            with_side.contains("Tab"),
+            "Tab focus toggle missing: {with_side}"
+        );
+        assert!(
+            with_side.contains("d dismiss"),
+            "dismiss missing: {with_side}"
+        );
+        // Without a side pane those affordances should disappear.
+        let no_side = session_hint(false, false, false);
+        assert!(!no_side.contains("Tab"));
+        assert!(!no_side.contains("dismiss"));
+    }
+
+    #[test]
+    fn input_mode_overrides_other_dimensions() {
+        // input_mode should produce the same hint regardless of side
+        // pane / follow state — those bindings aren't reachable from
+        // inside the input box.
+        let a = session_hint(true, false, false);
+        let b = session_hint(true, true, true);
+        assert_eq!(a, b);
+    }
 }

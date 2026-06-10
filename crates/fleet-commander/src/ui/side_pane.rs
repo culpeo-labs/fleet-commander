@@ -26,3 +26,55 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, pane: &SidePane, focused: bool)
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::app::{Screen, SessionFocus, SidePane};
+    use crate::ui::test_support::{render_to_string, test_app};
+    use std::path::PathBuf;
+
+    fn app_with_side_pane(pane: SidePane, focus: SessionFocus) -> crate::app::App {
+        let mut app = test_app();
+        app.screen = Screen::AgentSession {
+            agent_id: "a1".into(),
+            focus,
+            side_pane: Some(pane),
+            scroll: 0,
+            input_mode: false,
+        };
+        app
+    }
+
+    #[test]
+    fn diff_renders_path_in_title_and_content_in_body() {
+        let pane = SidePane::Diff {
+            path: PathBuf::from("src/lib.rs"),
+            content: "fn answer() -> i32 { 42 }\n".into(),
+        };
+        let app = app_with_side_pane(pane, SessionFocus::SidePane);
+        let text = render_to_string(&app, 100, 12);
+        assert!(text.contains("Diff:"), "Diff title missing:\n{text}");
+        assert!(text.contains("src/lib.rs"), "path missing:\n{text}");
+        assert!(text.contains("fn answer()"), "body missing:\n{text}");
+    }
+
+    #[test]
+    fn long_diff_lines_wrap_inside_pane() {
+        // Single long line should wrap within the side pane width
+        // rather than being truncated to one row.
+        let long = "x".repeat(80);
+        let pane = SidePane::Diff {
+            path: PathBuf::from("wide.txt"),
+            content: long,
+        };
+        let app = app_with_side_pane(pane, SessionFocus::SidePane);
+        // Side pane gets 45% of 80 cols = ~36 cols. A 80-char line must
+        // wrap onto multiple rows; both halves should still be present.
+        let text = render_to_string(&app, 80, 12);
+        let x_count = text.chars().filter(|&c| c == 'x').count();
+        assert!(
+            x_count >= 80,
+            "expected wrapped content (>=80 'x'): {x_count}"
+        );
+    }
+}
