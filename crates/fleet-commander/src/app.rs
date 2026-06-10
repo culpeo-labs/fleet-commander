@@ -11,7 +11,7 @@
 //! Input handling is dispatched per-screen so a keypress can never silently
 //! mutate a hidden buffer.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -350,6 +350,15 @@ impl App {
                     self.input_buffer.clear();
                 }
                 KeyCode::Enter => {
+                    // Alt+Enter / Shift+Enter insert a newline so the user
+                    // can compose multi-line messages. Plain Enter sends.
+                    if key
+                        .modifiers
+                        .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+                    {
+                        self.input_buffer.push('\n');
+                        return;
+                    }
                     let message = std::mem::take(&mut self.input_buffer);
                     if !message.is_empty() {
                         let agent_id = agent_id.clone();
@@ -1091,6 +1100,59 @@ mod tests {
             _ => panic!("expected AgentSession"),
         }
         assert!(app.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn alt_enter_inserts_newline_without_sending() {
+        let mut app = app_with_agents();
+        app.handle(press(KeyCode::Enter));
+        app.handle(press(KeyCode::Char('i')));
+        app.handle(AppEvent::Input(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+        app.handle(AppEvent::Input(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::ALT,
+        )));
+        app.handle(AppEvent::Input(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.input_buffer, "a\nb");
+        match &app.screen {
+            Screen::AgentSession { input_mode, .. } => assert!(*input_mode),
+            _ => panic!("expected AgentSession"),
+        }
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_without_sending() {
+        let mut app = app_with_agents();
+        app.handle(press(KeyCode::Enter));
+        app.handle(press(KeyCode::Char('i')));
+        app.handle(AppEvent::Input(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT,
+        )));
+        assert_eq!(app.input_buffer, "\n");
+    }
+
+    #[test]
+    fn plain_enter_sends_and_exits_input_mode() {
+        let mut app = app_with_agents();
+        app.handle(press(KeyCode::Enter));
+        app.handle(press(KeyCode::Char('i')));
+        app.handle(AppEvent::Input(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        app.handle(press(KeyCode::Enter));
+        assert!(app.input_buffer.is_empty());
+        match &app.screen {
+            Screen::AgentSession { input_mode, .. } => assert!(!*input_mode),
+            _ => panic!("expected AgentSession"),
+        }
     }
 
     #[test]
