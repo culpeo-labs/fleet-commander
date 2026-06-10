@@ -23,6 +23,7 @@
 pub mod agent_runtime;
 pub mod base_layer;
 pub mod container;
+pub mod git;
 pub mod session;
 
 mod session_state;
