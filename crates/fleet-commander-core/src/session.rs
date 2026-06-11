@@ -98,6 +98,20 @@ pub struct UserMessage {
     pub status: watch::Receiver<MessageStatus>,
 }
 
+/// A command advertised by the agent via ACP's `available_commands_update`
+/// notification. Kept independent of ACP schema types so consumers don't
+/// have to depend on `agent-client-protocol`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailableCommand {
+    /// Command name without the leading slash (e.g. `model`, `session`).
+    pub name: String,
+    /// Human-readable summary shown alongside the name in pickers.
+    pub description: String,
+    /// Optional placeholder shown when the command takes an argument
+    /// (e.g. "directory", "[on|off]"). `None` for argument-less commands.
+    pub hint: Option<String>,
+}
+
 /// Events emitted by the runtime. Streamed entities are delivered once via
 /// the `*Started` variants; their content updates through the handle's
 /// `watch` channels.
@@ -151,6 +165,13 @@ pub enum SessionEvent {
         agent_id: AgentId,
         code: Option<i32>,
     },
+    /// The agent has advertised the set of slash commands it supports
+    /// (via ACP `available_commands_update`). Sent once per update; the
+    /// agent may replace the list at any time.
+    AvailableCommands {
+        agent_id: AgentId,
+        commands: Vec<AvailableCommand>,
+    },
 }
 
 impl SessionEvent {
@@ -165,7 +186,8 @@ impl SessionEvent {
             | SessionEvent::AuthRequired { agent_id, .. }
             | SessionEvent::PermissionRequest { agent_id, .. }
             | SessionEvent::Error { agent_id, .. }
-            | SessionEvent::Exited { agent_id, .. } => agent_id,
+            | SessionEvent::Exited { agent_id, .. }
+            | SessionEvent::AvailableCommands { agent_id, .. } => agent_id,
         }
     }
 }
