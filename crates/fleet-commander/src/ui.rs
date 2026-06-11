@@ -16,6 +16,7 @@ mod keys_footer;
 mod overlay;
 mod session_header;
 mod side_pane;
+pub(crate) mod slash_popover;
 mod style;
 mod syntax;
 

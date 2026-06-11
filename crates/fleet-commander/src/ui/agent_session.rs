@@ -7,7 +7,9 @@ use ratatui::{
 };
 
 use crate::app::{App, SessionFocus, SidePane};
-use crate::ui::{conversation, explorer, input_box, keys_footer, session_header, side_pane};
+use crate::ui::{
+    conversation, explorer, input_box, keys_footer, session_header, side_pane, slash_popover,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub fn render(
@@ -105,6 +107,11 @@ pub fn render(
 
     if input_mode {
         input_box::render(frame, layout[2], input_buffer);
+        // Slash-command popover overlays the body just above the input
+        // box so the input cursor stays visible while the user picks.
+        if let Some(matches) = app.slash_matches_for(agent_id) {
+            slash_popover::render(frame, layout[2], &matches, app.slash_selected);
+        }
     }
 }
 
@@ -146,6 +153,72 @@ mod tests {
         assert!(text.contains("Diff:"));
         assert!(text.contains("foo.rs"));
         assert!(text.contains("Conversation"));
+    }
+
+    #[test]
+    fn slash_input_renders_command_popover() {
+        // When the buffer starts with `/`, the popover lists the agent's
+        // advertised commands so the user can pick one. Commands not
+        // matching the typed prefix are filtered out.
+        use crate::agent::AvailableCommand;
+        let mut app = test_app();
+        if let Some(agent) = app.agents.iter_mut().find(|a| a.id == "a1") {
+            agent.available_commands = vec![
+                AvailableCommand {
+                    name: "model".into(),
+                    description: "Select AI model".into(),
+                    hint: Some("model".into()),
+                },
+                AvailableCommand {
+                    name: "memory".into(),
+                    description: "Show memory status".into(),
+                    hint: None,
+                },
+                AvailableCommand {
+                    name: "plan".into(),
+                    description: "Create a plan".into(),
+                    hint: None,
+                },
+            ];
+        }
+        app.screen = Screen::AgentSession {
+            agent_id: "a1".into(),
+            focus: SessionFocus::Conversation,
+            side_pane: None,
+            scroll: 0,
+            input_mode: true,
+        };
+        app.input_buffer = "/me".into();
+        let text = render_to_string(&app, 100, 24);
+        assert!(text.contains("Commands"), "popover missing:\n{text}");
+        assert!(text.contains("/memory"), "matching cmd missing:\n{text}");
+        assert!(text.contains("Show memory status"));
+        assert!(!text.contains("/plan"), "non-matching cmd leaked:\n{text}");
+    }
+
+    #[test]
+    fn slash_popover_hidden_when_no_slash_or_argument_started() {
+        let mut app = test_app();
+        if let Some(agent) = app.agents.iter_mut().find(|a| a.id == "a1") {
+            agent.available_commands = vec![crate::agent::AvailableCommand {
+                name: "model".into(),
+                description: "Select AI model".into(),
+                hint: None,
+            }];
+        }
+        app.screen = Screen::AgentSession {
+            agent_id: "a1".into(),
+            focus: SessionFocus::Conversation,
+            side_pane: None,
+            scroll: 0,
+            input_mode: true,
+        };
+        // No leading slash → no popover.
+        app.input_buffer = "hello".into();
+        assert!(!render_to_string(&app, 100, 24).contains("Commands"));
+        // Slash but already typed an argument → popover closed.
+        app.input_buffer = "/model gpt-5".into();
+        assert!(!render_to_string(&app, 100, 24).contains("Commands"));
     }
 
     #[test]

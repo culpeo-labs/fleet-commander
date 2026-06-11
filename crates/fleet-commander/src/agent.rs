@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
 pub use fleet_commander_core::session::{
-    AgentId, AssistantMessage, Thought, ToolCall, UserMessage,
+    AgentId, AssistantMessage, AvailableCommand, Thought, ToolCall, UserMessage,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +90,10 @@ pub struct Agent {
     /// git working tree. Recomputed by [`Agent::git_branch`] when the
     /// cache is older than [`GIT_BRANCH_TTL`].
     git_branch_cache: RefCell<Option<(Instant, Option<String>)>>,
+    /// Slash commands advertised by the agent via ACP's
+    /// `available_commands_update` notification. Empty until the agent
+    /// publishes a list. The agent may replace the list at any time.
+    pub available_commands: Vec<AvailableCommand>,
 }
 
 const GIT_BRANCH_TTL: Duration = Duration::from_secs(2);
@@ -108,6 +112,7 @@ impl Agent {
             session_id: None,
             last_effective_top: Cell::new(0),
             git_branch_cache: RefCell::new(None),
+            available_commands: Vec::new(),
         }
     }
 

@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::container::{self, ContainerConfig};
-use crate::session::{AgentId, SessionEvent, ToolCallStatusKind};
+use crate::session::{AgentId, AvailableCommand, SessionEvent, ToolCallStatusKind};
 use crate::session_state::SessionStateMachine;
 
 /// Shared handle to the optional ACP wire-log file. Cloned cheaply across
@@ -285,7 +285,33 @@ async fn connect_and_run(
         .on_receive_notification(
             {
                 let state = state.clone();
+                let aid = aid.clone();
+                let tx = tx.clone();
                 async move |notification: SessionNotification, _cx| {
+                    // Available-commands updates are session metadata, not chat
+                    // history; route them straight to the consumer rather than
+                    // through the chat state machine.
+                    if let SessionUpdate::AvailableCommandsUpdate(ref upd) =
+                        notification.update
+                    {
+                        let commands = upd
+                            .available_commands
+                            .iter()
+                            .map(|c| AvailableCommand {
+                                name: c.name.clone(),
+                                description: c.description.clone(),
+                                hint: c.input.as_ref().and_then(|input| match input {
+                                    agent_client_protocol::schema::AvailableCommandInput::Unstructured(u) => Some(u.hint.clone()),
+                                    _ => None,
+                                }),
+                            })
+                            .collect::<Vec<_>>();
+                        let _ = tx.send(SessionEvent::AvailableCommands {
+                            agent_id: aid.clone(),
+                            commands,
+                        });
+                        return Ok(());
+                    }
                     let mut sm = state.lock().expect("session state lock poisoned");
                     apply_session_update(&mut sm, &notification.update);
                     Ok(())

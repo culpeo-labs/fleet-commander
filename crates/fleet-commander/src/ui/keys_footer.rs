@@ -18,7 +18,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, hint: &str) {
 /// can grep for them without reaching into private rendering code.
 pub fn session_hint(input_mode: bool, side_pane: bool, following: bool) -> &'static str {
     if input_mode {
-        return "Enter send  Alt/Shift+Enter newline  Esc cancel";
+        return "Enter send  Alt/Shift+Enter newline  / commands  Tab complete  Esc cancel";
     }
     match (side_pane, following) {
         (true, true) => {

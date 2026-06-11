@@ -56,7 +56,15 @@ pub enum SessionFocus {
 
 #[derive(Debug, Clone)]
 pub enum SidePane {
-    Diff { path: PathBuf, content: String },
+    Diff {
+        path: PathBuf,
+        content: String,
+    },
+    /// Browsable list of slash commands the active agent advertised
+    /// (via ACP `available_commands_update`). Opened with `:commands`.
+    Commands {
+        commands: Vec<crate::agent::AvailableCommand>,
+    },
 }
 
 pub struct App {
@@ -95,6 +103,11 @@ pub struct App {
     /// whenever the active workspace changes. Toggle visibility with
     /// `Ctrl+E`.
     pub explorer: ExplorerState,
+    /// Selected index in the slash-command autocomplete popover.
+    /// Re-clamped against the filtered list every time the buffer
+    /// changes. Meaningful only while [`ui::slash_popover::extract_prefix`]
+    /// returns `Some` for [`Self::input_buffer`].
+    pub slash_selected: usize,
 }
 
 /// A tool permission request waiting for the user's y/n decision.
@@ -136,6 +149,7 @@ impl App {
             acp_log,
             acp_log_filter,
             explorer: ExplorerState::default(),
+            slash_selected: 0,
         }
     }
 
@@ -284,6 +298,11 @@ impl App {
                 }
                 spawn_tool_tracker(call.title, call.status, self.tx.clone());
             }
+            SessionEvent::AvailableCommands { agent_id, commands } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    agent.available_commands = commands;
+                }
+            }
         }
     }
 
@@ -379,6 +398,36 @@ impl App {
                         *input_mode = false;
                     }
                     self.input_buffer.clear();
+                    self.slash_selected = 0;
+                }
+                KeyCode::Up => {
+                    if let Some(matches) = self.slash_matches_for(agent_id)
+                        && !matches.is_empty()
+                    {
+                        self.slash_selected = self
+                            .slash_selected
+                            .checked_sub(1)
+                            .unwrap_or(matches.len() - 1);
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(matches) = self.slash_matches_for(agent_id)
+                        && !matches.is_empty()
+                    {
+                        self.slash_selected = (self.slash_selected + 1) % matches.len();
+                    }
+                }
+                KeyCode::Tab => {
+                    // Tab-completion only fires while a slash command is
+                    // being typed; let other Tabs through (currently no-op
+                    // in input mode).
+                    if let Some(matches) = self.slash_matches_for(agent_id)
+                        && let Some(picked) =
+                            matches.get(self.slash_selected.min(matches.len().saturating_sub(1)))
+                    {
+                        self.input_buffer = crate::ui::slash_popover::completion_for(&picked.name);
+                        self.slash_selected = 0;
+                    }
                 }
                 KeyCode::Enter => {
                     // Alt+Enter / Shift+Enter insert a newline so the user
@@ -391,6 +440,7 @@ impl App {
                         return;
                     }
                     let message = std::mem::take(&mut self.input_buffer);
+                    self.slash_selected = 0;
                     if !message.is_empty() {
                         let agent_id = agent_id.clone();
                         if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
@@ -410,9 +460,11 @@ impl App {
                 }
                 KeyCode::Backspace => {
                     self.input_buffer.pop();
+                    self.slash_selected = 0;
                 }
                 KeyCode::Char(c) => {
                     self.input_buffer.push(c);
+                    self.slash_selected = 0;
                 }
                 _ => {}
             }
@@ -623,6 +675,25 @@ impl App {
         }
     }
 
+    /// Returns the (alphabetically-ordered) slash-command matches for the
+    /// current input buffer when the popover should be visible for
+    /// `agent_id`, or `None` when the popover is closed (buffer doesn't
+    /// look like a command, or the agent hasn't advertised any commands).
+    pub fn slash_matches_for(
+        &self,
+        agent_id: &str,
+    ) -> Option<Vec<&crate::agent::AvailableCommand>> {
+        let prefix = crate::ui::slash_popover::extract_prefix(&self.input_buffer)?;
+        let agent = self.agents.iter().find(|a| a.id == agent_id)?;
+        if agent.available_commands.is_empty() {
+            return None;
+        }
+        Some(crate::ui::slash_popover::filter(
+            &agent.available_commands,
+            prefix,
+        ))
+    }
+
     fn handle_change(&mut self, change: ChangeEvent) {
         if let Screen::AgentSession { side_pane, .. } = &mut self.screen {
             let content = std::fs::read_to_string(&change.path).unwrap_or_default();
@@ -687,6 +758,9 @@ impl App {
             "rebuild" => {
                 self.rebuild_current_container();
             }
+            "commands" | "cmds" => {
+                self.open_commands_view();
+            }
             "q" | "quit" => {
                 self.should_quit = true;
             }
@@ -741,6 +815,34 @@ impl App {
             input_mode: false,
         };
         self.ensure_agent_connected(agent_id);
+    }
+
+    /// Open the slash-commands browser in the right side pane.
+    ///
+    /// Snapshots the current agent's `available_commands`. If the agent
+    /// later updates them via ACP, the user can reopen with `:commands`
+    /// to refresh.
+    fn open_commands_view(&mut self) {
+        let agent_id = match &self.screen {
+            Screen::AgentSession { agent_id, .. } => agent_id.clone(),
+            _ => {
+                self.status_message =
+                    Some("No workspace open — :commands needs an agent session".into());
+                return;
+            }
+        };
+        let commands = match self.agents.iter().find(|a| a.id == agent_id) {
+            Some(a) if !a.available_commands.is_empty() => a.available_commands.clone(),
+            Some(_) => {
+                self.status_message =
+                    Some("Agent has not advertised any slash commands yet".into());
+                return;
+            }
+            None => return,
+        };
+        if let Screen::AgentSession { side_pane, .. } = &mut self.screen {
+            *side_pane = Some(SidePane::Commands { commands });
+        }
     }
 
     /// Remove the currently viewed workspace agent and go back to the list.
@@ -1767,5 +1869,93 @@ mod tests {
         // But a2's history must have grown.
         let a2 = app.agents.iter().find(|a| a.id == "a2").unwrap();
         assert_eq!(a2.history.len(), 2);
+    }
+
+    fn enter_input_mode(app: &mut App) {
+        // Activate first agent then enter insert mode.
+        app.handle(press(KeyCode::Enter));
+        app.handle(press(KeyCode::Char('i')));
+    }
+
+    fn seed_commands(app: &mut App, agent_id: &str) {
+        if let Some(agent) = app.agents.iter_mut().find(|a| a.id == agent_id) {
+            agent.available_commands = vec![
+                crate::agent::AvailableCommand {
+                    name: "model".into(),
+                    description: "Select AI model".into(),
+                    hint: Some("model".into()),
+                },
+                crate::agent::AvailableCommand {
+                    name: "memory".into(),
+                    description: "Show memory status".into(),
+                    hint: None,
+                },
+                crate::agent::AvailableCommand {
+                    name: "plan".into(),
+                    description: "Create a plan".into(),
+                    hint: None,
+                },
+            ];
+        }
+    }
+
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.handle(AppEvent::Input(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )));
+        }
+    }
+
+    #[test]
+    fn tab_completes_selected_slash_command_with_trailing_space() {
+        let mut app = app_with_agents();
+        seed_commands(&mut app, "a1");
+        enter_input_mode(&mut app);
+        type_str(&mut app, "/me");
+        // Selection defaults to 0 → "memory" (only match for "me").
+        app.handle(press(KeyCode::Tab));
+        assert_eq!(app.input_buffer, "/memory ");
+        // After completion, selection should reset.
+        assert_eq!(app.slash_selected, 0);
+    }
+
+    #[test]
+    fn down_and_up_navigate_slash_popover_with_wrap() {
+        let mut app = app_with_agents();
+        seed_commands(&mut app, "a1");
+        enter_input_mode(&mut app);
+        // Type just "/" → all three commands match.
+        type_str(&mut app, "/");
+        assert_eq!(app.slash_selected, 0);
+        app.handle(press(KeyCode::Down));
+        assert_eq!(app.slash_selected, 1);
+        app.handle(press(KeyCode::Down));
+        assert_eq!(app.slash_selected, 2);
+        // Wrap-around.
+        app.handle(press(KeyCode::Down));
+        assert_eq!(app.slash_selected, 0);
+        // Up from 0 wraps to last.
+        app.handle(press(KeyCode::Up));
+        assert_eq!(app.slash_selected, 2);
+    }
+
+    #[test]
+    fn typing_after_completion_does_not_reopen_popover_in_argument_mode() {
+        let mut app = app_with_agents();
+        seed_commands(&mut app, "a1");
+        enter_input_mode(&mut app);
+        type_str(&mut app, "/mo");
+        // Popover is open (matches: "model").
+        assert!(app.slash_matches_for("a1").is_some());
+        // After Tab, buffer is "/model " — popover closed because of the
+        // trailing space (argument mode).
+        app.handle(press(KeyCode::Tab));
+        assert_eq!(app.input_buffer, "/model ");
+        assert!(app.slash_matches_for("a1").is_none());
+        // Typing into the argument doesn't reopen.
+        type_str(&mut app, "gpt-5");
+        assert!(app.slash_matches_for("a1").is_none());
     }
 }
