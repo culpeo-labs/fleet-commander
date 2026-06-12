@@ -141,11 +141,17 @@ pub struct App {
     pub slash_selected: usize,
 }
 
-/// A tool permission request waiting for the user's y/n decision.
+/// A tool permission request waiting for the user's decision. Rendered
+/// as a centered modal popup that fully captures keyboard input while
+/// it's open (see [`ui::permission_popup`]).
 pub struct PendingPermission {
     pub tool_name: String,
+    /// Options offered by the agent as `(id, label, kind)`. `kind` is one
+    /// of `allow once`/`allow always`/`reject once`/`reject always`.
     pub options: Vec<(String, String, String)>,
     pub reply: crate::event::PermissionReply,
+    /// Highlighted option in the popup, navigated with Up/Down.
+    pub selected: usize,
 }
 
 impl App {
@@ -316,6 +322,7 @@ impl App {
                     tool_name,
                     options,
                     reply,
+                    selected: 0,
                 });
             }
             SessionEvent::AssistantMessage { agent_id, message } => {
@@ -351,34 +358,54 @@ impl App {
         }
     }
 
+    /// Answer the pending permission request and tear down the popup.
+    /// `choice` is `Some(index)` of the option to allow/select, or `None`
+    /// to reject (no option chosen). Sends the option id back through the
+    /// oneshot the runtime is awaiting.
+    fn resolve_permission(&mut self, choice: Option<usize>) {
+        let Some(perm) = self.permission_pending.take() else {
+            return;
+        };
+        let option_id = choice
+            .and_then(|idx| perm.options.get(idx))
+            .map(|(id, _, _)| id.clone());
+        if let Ok(mut guard) = perm.reply.lock()
+            && let Some(tx) = guard.take()
+        {
+            let _ = tx.send(option_id);
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         // Clear status message on any keypress.
         self.status_message = None;
 
-        // Permission prompt — intercept y/n/Esc before anything else.
-        if self.permission_pending.is_some() {
+        // Permission prompt — a modal popup that fully owns keyboard input
+        // while open. Up/Down (or j/k) move the highlight, Enter/Space picks
+        // the highlighted option, number keys 1-9 pick directly, and Esc (or
+        // 'n'/'q') rejects. Because this returns, no keystrokes can leak into
+        // the input box or any other handler while the popup is up.
+        if let Some(perm) = &mut self.permission_pending {
+            let count = perm.options.len();
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    let perm = self.permission_pending.take().unwrap();
-                    // Pick the first "allow" option.
-                    let allow_id = perm
-                        .options
-                        .iter()
-                        .find(|(_, _, kind)| kind.starts_with("allow"))
-                        .map(|(id, _, _)| id.clone());
-                    if let Ok(mut guard) = perm.reply.lock()
-                        && let Some(tx) = guard.take()
-                    {
-                        let _ = tx.send(allow_id);
+                KeyCode::Up | KeyCode::Char('k') if count > 0 => {
+                    perm.selected = perm.selected.checked_sub(1).unwrap_or(count - 1);
+                }
+                KeyCode::Down | KeyCode::Char('j') if count > 0 => {
+                    perm.selected = (perm.selected + 1) % count;
+                }
+                KeyCode::Char(c @ '1'..='9') => {
+                    let idx = (c as usize) - ('1' as usize);
+                    if idx < count {
+                        self.resolve_permission(Some(idx));
                     }
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    let perm = self.permission_pending.take().unwrap();
-                    if let Ok(mut guard) = perm.reply.lock()
-                        && let Some(tx) = guard.take()
-                    {
-                        let _ = tx.send(None);
-                    }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    let idx = perm.selected;
+                    self.resolve_permission(Some(idx));
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+                    self.resolve_permission(None);
                 }
                 _ => {}
             }
@@ -1475,6 +1502,85 @@ mod tests {
             } => assert_eq!(*pane.scroll_mut(), 1),
             _ => panic!("expected side pane"),
         }
+    }
+
+    fn permission_with_options(
+        opts: Vec<(&str, &str, &str)>,
+    ) -> (
+        PendingPermission,
+        tokio::sync::oneshot::Receiver<Option<String>>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let perm = PendingPermission {
+            tool_name: "write_file".into(),
+            options: opts
+                .into_iter()
+                .map(|(a, b, c)| (a.into(), b.into(), c.into()))
+                .collect(),
+            reply: Arc::new(Mutex::new(Some(tx))),
+            selected: 0,
+        };
+        (perm, rx)
+    }
+
+    #[test]
+    fn permission_enter_sends_highlighted_option() {
+        let mut app = app_with_agents();
+        app.handle(press(KeyCode::Enter)); // enter a session
+        let (perm, mut rx) = permission_with_options(vec![
+            ("id-allow", "Allow once", "allow once"),
+            ("id-reject", "Reject", "reject once"),
+        ]);
+        app.permission_pending = Some(perm);
+        // Move highlight to the second option, then confirm.
+        app.handle(press(KeyCode::Down));
+        app.handle(press(KeyCode::Enter));
+        assert!(app.permission_pending.is_none(), "popup should close");
+        assert_eq!(rx.try_recv().unwrap(), Some("id-reject".to_string()));
+    }
+
+    #[test]
+    fn permission_number_key_picks_option_directly() {
+        let mut app = app_with_agents();
+        app.handle(press(KeyCode::Enter));
+        let (perm, mut rx) = permission_with_options(vec![
+            ("id-allow", "Allow once", "allow once"),
+            ("id-always", "Allow always", "allow always"),
+        ]);
+        app.permission_pending = Some(perm);
+        app.handle(press(KeyCode::Char('2')));
+        assert!(app.permission_pending.is_none());
+        assert_eq!(rx.try_recv().unwrap(), Some("id-always".to_string()));
+    }
+
+    #[test]
+    fn permission_esc_rejects_with_no_option() {
+        let mut app = app_with_agents();
+        app.handle(press(KeyCode::Enter));
+        let (perm, mut rx) = permission_with_options(vec![("id", "Allow", "allow once")]);
+        app.permission_pending = Some(perm);
+        app.handle(press(KeyCode::Esc));
+        assert!(app.permission_pending.is_none());
+        assert_eq!(rx.try_recv().unwrap(), None);
+    }
+
+    #[test]
+    fn permission_popup_captures_input_no_leak_to_buffer() {
+        // While the popup is open, typing must not leak into the message
+        // input buffer behind it.
+        let mut app = app_with_agents();
+        app.handle(press(KeyCode::Enter));
+        app.handle(press(KeyCode::Char('i'))); // enter insert mode
+        let (perm, _rx) = permission_with_options(vec![("id", "Allow", "allow once")]);
+        app.permission_pending = Some(perm);
+        app.handle(press(KeyCode::Char('h')));
+        app.handle(press(KeyCode::Char('i')));
+        assert!(
+            app.input_buffer.is_empty(),
+            "keystrokes leaked into input buffer: {:?}",
+            app.input_buffer
+        );
+        assert!(app.permission_pending.is_some(), "popup should stay open");
     }
 
     #[test]
