@@ -56,15 +56,46 @@ pub enum SessionFocus {
 
 #[derive(Debug, Clone)]
 pub enum SidePane {
+    /// Auto-opened diff of a file the agent (or the fs watcher) just
+    /// changed. May be replaced whenever a fresh change event arrives.
     Diff {
         path: PathBuf,
         content: String,
+        scroll: u16,
+    },
+    /// A file the user explicitly opened from the explorer (Enter on a
+    /// file). Unlike [`SidePane::Diff`], this is **not** clobbered by
+    /// background change events — the user asked to read this file and
+    /// keeps looking at it until they dismiss it or open something else.
+    FileView {
+        path: PathBuf,
+        content: String,
+        scroll: u16,
     },
     /// Browsable list of slash commands the active agent advertised
     /// (via ACP `available_commands_update`). Opened with `:commands`.
     Commands {
         commands: Vec<crate::agent::AvailableCommand>,
+        scroll: u16,
     },
+}
+
+impl SidePane {
+    /// Mutable handle to the pane's scroll offset, for key handlers.
+    pub fn scroll_mut(&mut self) -> &mut u16 {
+        match self {
+            SidePane::Diff { scroll, .. }
+            | SidePane::FileView { scroll, .. }
+            | SidePane::Commands { scroll, .. } => scroll,
+        }
+    }
+
+    /// Whether a background change event is allowed to replace this pane
+    /// with an auto-diff. Only the auto-managed [`SidePane::Diff`] yields;
+    /// user-opened panes ([`FileView`], [`Commands`]) keep their place.
+    pub fn yields_to_auto_diff(&self) -> bool {
+        matches!(self, SidePane::Diff { .. })
+    }
 }
 
 pub struct App {
@@ -161,12 +192,26 @@ impl App {
                 agent_id,
                 path,
                 content,
-            } => self.handle_mcp_side_pane(agent_id, SidePane::Diff { path, content }),
+            } => self.handle_mcp_side_pane(
+                agent_id,
+                SidePane::Diff {
+                    path,
+                    content,
+                    scroll: 0,
+                },
+            ),
             AppEvent::McpShowFile {
                 agent_id,
                 path,
                 content,
-            } => self.handle_mcp_side_pane(agent_id, SidePane::Diff { path, content }),
+            } => self.handle_mcp_side_pane(
+                agent_id,
+                SidePane::FileView {
+                    path,
+                    content,
+                    scroll: 0,
+                },
+            ),
             AppEvent::McpNotify { agent_id, message } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.info(message);
@@ -696,11 +741,20 @@ impl App {
 
     fn handle_change(&mut self, change: ChangeEvent) {
         if let Screen::AgentSession { side_pane, .. } = &mut self.screen {
-            let content = std::fs::read_to_string(&change.path).unwrap_or_default();
-            *side_pane = Some(SidePane::Diff {
-                path: change.path,
-                content,
-            });
+            // Only auto-open / refresh the diff pane when it isn't already
+            // showing something the user explicitly opened (a FileView or
+            // the Commands browser). Clobbering those is the flicker bug:
+            // a background fs change would yank the user's file preview
+            // away and replace it with a diff.
+            let may_replace = side_pane.as_ref().is_none_or(SidePane::yields_to_auto_diff);
+            if may_replace {
+                let content = std::fs::read_to_string(&change.path).unwrap_or_default();
+                *side_pane = Some(SidePane::Diff {
+                    path: change.path,
+                    content,
+                    scroll: 0,
+                });
+            }
         }
         if self.explorer.fs.is_some() {
             self.request_explorer_refresh();
@@ -841,7 +895,10 @@ impl App {
             None => return,
         };
         if let Screen::AgentSession { side_pane, .. } = &mut self.screen {
-            *side_pane = Some(SidePane::Commands { commands });
+            *side_pane = Some(SidePane::Commands {
+                commands,
+                scroll: 0,
+            });
         }
     }
 
@@ -1081,10 +1138,26 @@ fn handle_session_action(
             None
         }
         Action::Down => {
+            // When the side pane is focused, Down/Up scroll the pane (diff,
+            // file preview, or commands browser) rather than the conversation.
+            if *focus == SessionFocus::SidePane
+                && let Some(pane) = side_pane.as_mut()
+            {
+                let s = pane.scroll_mut();
+                *s = s.saturating_add(1);
+                return None;
+            }
             *scroll = scroll.saturating_add(1);
             None
         }
         Action::Up => {
+            if *focus == SessionFocus::SidePane
+                && let Some(pane) = side_pane.as_mut()
+            {
+                let s = pane.scroll_mut();
+                *s = s.saturating_sub(1);
+                return None;
+            }
             if *scroll == usize::MAX {
                 // Currently following the bottom — break out of follow mode
                 // by anchoring at whatever line is currently at the top of
@@ -1172,9 +1245,10 @@ fn handle_explorer_action(
                 {
                     let content = String::from_utf8_lossy(&bytes).into_owned();
                     let full = fs.root_display().join(&entry.path);
-                    *side_pane = Some(SidePane::Diff {
+                    *side_pane = Some(SidePane::FileView {
                         path: full,
                         content,
+                        scroll: 0,
                     });
                 }
             }
@@ -1294,6 +1368,112 @@ mod tests {
                 assert_eq!(path, &PathBuf::from("/definitely/missing.rs"));
             }
             other => panic!("expected Diff side pane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn change_event_does_not_clobber_user_opened_file_view() {
+        // A FileView (user opened a file from the explorer) must survive a
+        // background fs change event — otherwise the preview flickers away
+        // and is replaced by an auto-diff.
+        let mut app = app_with_agents();
+        app.handle(press(KeyCode::Enter));
+        if let Screen::AgentSession { side_pane, .. } = &mut app.screen {
+            *side_pane = Some(SidePane::FileView {
+                path: PathBuf::from("/opened.rs"),
+                content: "fn main() {}\n".into(),
+                scroll: 0,
+            });
+        }
+        app.handle(AppEvent::Change(ChangeEvent {
+            path: PathBuf::from("/other/changed.rs"),
+            kind: ChangeKind::Modified,
+        }));
+        match &app.screen {
+            Screen::AgentSession {
+                side_pane: Some(SidePane::FileView { path, .. }),
+                ..
+            } => assert_eq!(path, &PathBuf::from("/opened.rs")),
+            other => panic!("expected FileView to survive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn change_event_does_not_clobber_commands_pane() {
+        let mut app = app_with_agents();
+        app.handle(press(KeyCode::Enter));
+        if let Screen::AgentSession { side_pane, .. } = &mut app.screen {
+            *side_pane = Some(SidePane::Commands {
+                commands: vec![],
+                scroll: 0,
+            });
+        }
+        app.handle(AppEvent::Change(ChangeEvent {
+            path: PathBuf::from("/x.rs"),
+            kind: ChangeKind::Modified,
+        }));
+        assert!(matches!(
+            &app.screen,
+            Screen::AgentSession {
+                side_pane: Some(SidePane::Commands { .. }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn change_event_replaces_an_existing_auto_diff() {
+        // The auto-diff pane is still allowed to refresh to the latest change.
+        let mut app = app_with_agents();
+        app.handle(press(KeyCode::Enter));
+        app.handle(AppEvent::Change(ChangeEvent {
+            path: PathBuf::from("/first.rs"),
+            kind: ChangeKind::Modified,
+        }));
+        app.handle(AppEvent::Change(ChangeEvent {
+            path: PathBuf::from("/second.rs"),
+            kind: ChangeKind::Modified,
+        }));
+        match &app.screen {
+            Screen::AgentSession {
+                side_pane: Some(SidePane::Diff { path, .. }),
+                ..
+            } => assert_eq!(path, &PathBuf::from("/second.rs")),
+            other => panic!("expected refreshed Diff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn down_up_scroll_the_focused_side_pane() {
+        let mut app = app_with_agents();
+        app.handle(press(KeyCode::Enter));
+        if let Screen::AgentSession {
+            side_pane, focus, ..
+        } = &mut app.screen
+        {
+            *side_pane = Some(SidePane::FileView {
+                path: PathBuf::from("/big.rs"),
+                content: "a\nb\nc\nd\n".into(),
+                scroll: 0,
+            });
+            *focus = SessionFocus::SidePane;
+        }
+        app.handle(press(KeyCode::Char('j')));
+        app.handle(press(KeyCode::Char('j')));
+        match &mut app.screen {
+            Screen::AgentSession {
+                side_pane: Some(pane),
+                ..
+            } => assert_eq!(*pane.scroll_mut(), 2),
+            _ => panic!("expected side pane"),
+        }
+        app.handle(press(KeyCode::Char('k')));
+        match &mut app.screen {
+            Screen::AgentSession {
+                side_pane: Some(pane),
+                ..
+            } => assert_eq!(*pane.scroll_mut(), 1),
+            _ => panic!("expected side pane"),
         }
     }
 
