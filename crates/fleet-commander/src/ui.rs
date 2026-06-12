@@ -14,6 +14,7 @@ mod explorer;
 mod input_box;
 mod keys_footer;
 mod overlay;
+mod permission_popup;
 mod session_header;
 mod side_pane;
 pub(crate) mod slash_popover;
@@ -54,4 +55,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
 
     // Bottom-row overlays sit on top of every screen.
     overlay::render(frame, area, app);
+
+    // The permission modal sits above everything else (including the
+    // input box) and owns input while it's open.
+    if let Some(perm) = &app.permission_pending {
+        permission_popup::render(frame, area, perm);
+    }
 }
