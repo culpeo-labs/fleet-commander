@@ -145,6 +145,7 @@ mod tests {
             side_pane: Some(SidePane::Diff {
                 path: PathBuf::from("foo.rs"),
                 content: "fn main() {}\n".into(),
+                scroll: 0,
             }),
             scroll: 0,
             input_mode: false,

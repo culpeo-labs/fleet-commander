@@ -15,18 +15,43 @@ use crate::ui::syntax::highlight_for_path;
 pub fn render(frame: &mut Frame<'_>, area: Rect, pane: &SidePane, focused: bool) {
     let style = border_style(focused);
     match pane {
-        SidePane::Diff { path, content } => {
+        SidePane::Diff {
+            path,
+            content,
+            scroll,
+        } => {
             let title = format!(" Diff: {} ", path.display());
             let lines = highlight_for_path(content, path);
-            let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .border_style(style),
-            );
+            let paragraph = Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((*scroll, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(title)
+                        .border_style(style),
+                );
             frame.render_widget(paragraph, area);
         }
-        SidePane::Commands { commands } => {
+        SidePane::FileView {
+            path,
+            content,
+            scroll,
+        } => {
+            let title = format!(" File: {} ", path.display());
+            let lines = highlight_for_path(content, path);
+            let paragraph = Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((*scroll, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(title)
+                        .border_style(style),
+                );
+            frame.render_widget(paragraph, area);
+        }
+        SidePane::Commands { commands, scroll } => {
             let title = format!(" Commands ({}) ", commands.len());
             // Two lines per entry: header (name + optional hint) and
             // description on the next, indented line.
@@ -52,12 +77,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, pane: &SidePane, focused: bool)
                     Span::styled(c.description.clone(), Style::default().fg(Color::Gray)),
                 ]));
             }
-            let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .border_style(style),
-            );
+            let paragraph = Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((*scroll, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(title)
+                        .border_style(style),
+                );
             frame.render_widget(paragraph, area);
         }
     }
@@ -82,10 +110,54 @@ mod tests {
     }
 
     #[test]
+    fn file_view_renders_file_title_and_content() {
+        let pane = SidePane::FileView {
+            path: PathBuf::from("src/main.rs"),
+            content: "fn greet() {}\n".into(),
+            scroll: 0,
+        };
+        let app = app_with_side_pane(pane, SessionFocus::SidePane);
+        let text = render_to_string(&app, 100, 12);
+        assert!(text.contains("File:"), "File title missing:\n{text}");
+        assert!(text.contains("src/main.rs"), "path missing:\n{text}");
+        assert!(text.contains("fn greet()"), "body missing:\n{text}");
+    }
+
+    #[test]
+    fn file_view_scroll_offset_hides_top_lines() {
+        // With a scroll offset the first lines should drop out of view.
+        let content = (0..30)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let unscrolled = SidePane::FileView {
+            path: PathBuf::from("f.txt"),
+            content: content.clone(),
+            scroll: 0,
+        };
+        let app = app_with_side_pane(unscrolled, SessionFocus::SidePane);
+        assert!(render_to_string(&app, 100, 12).contains("line0"));
+
+        let scrolled = SidePane::FileView {
+            path: PathBuf::from("f.txt"),
+            content,
+            scroll: 10,
+        };
+        let app = app_with_side_pane(scrolled, SessionFocus::SidePane);
+        let text = render_to_string(&app, 100, 12);
+        assert!(!text.contains("line0\n") && !text.contains("line0 "));
+        assert!(
+            text.contains("line10"),
+            "expected scrolled content:\n{text}"
+        );
+    }
+
+    #[test]
     fn diff_renders_path_in_title_and_content_in_body() {
         let pane = SidePane::Diff {
             path: PathBuf::from("src/lib.rs"),
             content: "fn answer() -> i32 { 42 }\n".into(),
+            scroll: 0,
         };
         let app = app_with_side_pane(pane, SessionFocus::SidePane);
         let text = render_to_string(&app, 100, 12);
@@ -102,6 +174,7 @@ mod tests {
         let pane = SidePane::Diff {
             path: PathBuf::from("wide.txt"),
             content: long,
+            scroll: 0,
         };
         let app = app_with_side_pane(pane, SessionFocus::SidePane);
         // Side pane gets 45% of 80 cols = ~36 cols. A 80-char line must
@@ -130,6 +203,7 @@ mod tests {
                     hint: Some("info|rename".into()),
                 },
             ],
+            scroll: 0,
         };
         let app = app_with_side_pane(pane, SessionFocus::SidePane);
         let text = render_to_string(&app, 100, 16);
