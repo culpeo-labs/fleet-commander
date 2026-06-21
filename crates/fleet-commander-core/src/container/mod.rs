@@ -14,9 +14,7 @@
 //! - [`image`] — resolving the container image (pull/build + features).
 //! - [`mounts`] — building env vars and bind mounts.
 //! - [`lifecycle`] — starting, stopping, and removing containers.
-//! - [`auth`] — resolving a host GitHub token for headless auth.
 
-mod auth;
 mod config;
 mod image;
 mod lifecycle;
@@ -24,7 +22,6 @@ mod mounts;
 
 use std::path::PathBuf;
 
-pub use auth::{agent_auth_env, command_env_prefix, docker_env_flags};
 pub use lifecycle::{remove_workspace_container, start_container, stop_workspace_container};
 
 /// Configuration for running an agent inside a dev container.

@@ -54,11 +54,6 @@ pub fn start_agent(
 
     let handle = tokio::spawn(async move {
         info!(agent_id = %agent_id, command = %acp_command, workspace = ?workspace_folder, "Starting agent");
-        // Resolve the host auth environment for the agent. The copilot CLI in
-        // --acp mode expects to already be authenticated; injecting
-        // COPILOT_GITHUB_TOKEN lets it work without a keychain or interactive
-        // login.
-        let auth_env = container::agent_auth_env();
 
         // If workspace_folder is set, start the dev container first.
         let (effective_command, session_cwd, container_info) =
@@ -92,12 +87,11 @@ pub fn start_agent(
                             ),
                         });
 
-                        // Wrap ACP command with docker exec to run inside the container.
-                        // Inject the host auth env via -e so the copilot CLI authenticates
-                        // without needing a keychain inside the container.
-                        let token_flag = container::docker_env_flags(&auth_env);
+                        // Wrap ACP command with docker exec to run inside the
+                        // container. Authentication is handled by the interactive
+                        // terminal login flow, so no env vars are injected here.
                         let exec_cmd = format!(
-                            "docker exec -i{token_flag} -u {} -w {} {} {}",
+                            "docker exec -i -u {} -w {} {} {}",
                             info.remote_user,
                             info.remote_workspace_folder,
                             info.container_id,
@@ -121,11 +115,10 @@ pub fn start_agent(
                     }
                 }
             } else {
-                // Running on the host — prepend the auth env vars to the ACP
-                // command string (the ACP crate parses NAME=value prefixes).
-                let cmd = format!("{}{acp_command}", container::command_env_prefix(&auth_env));
+                // Running on the host — authentication is handled by the
+                // interactive terminal login flow, so run the ACP command as-is.
                 let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
-                (cmd, cwd, None)
+                (acp_command, cwd, None)
             };
 
         if let Err(err) = run_persistent_connection(
