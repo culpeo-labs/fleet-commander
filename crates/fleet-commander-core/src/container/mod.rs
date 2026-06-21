@@ -24,7 +24,7 @@ mod mounts;
 
 use std::path::PathBuf;
 
-pub use auth::resolve_host_github_token;
+pub use auth::{agent_auth_env, command_env_prefix, docker_env_flags};
 pub use lifecycle::{remove_workspace_container, start_container, stop_workspace_container};
 
 /// Configuration for running an agent inside a dev container.

@@ -54,11 +54,11 @@ pub fn start_agent(
 
     let handle = tokio::spawn(async move {
         info!(agent_id = %agent_id, command = %acp_command, workspace = ?workspace_folder, "Starting agent");
-        // Resolve a host GitHub token for headless auth.
-        // The copilot CLI in --acp mode expects to already be authenticated;
-        // passing COPILOT_GITHUB_TOKEN lets it work without a keychain or
-        // interactive login.
-        let host_token = container::resolve_host_github_token();
+        // Resolve the host auth environment for the agent. The copilot CLI in
+        // --acp mode expects to already be authenticated; injecting
+        // COPILOT_GITHUB_TOKEN lets it work without a keychain or interactive
+        // login.
+        let auth_env = container::agent_auth_env();
 
         // If workspace_folder is set, start the dev container first.
         let (effective_command, session_cwd, container_info) =
@@ -93,12 +93,9 @@ pub fn start_agent(
                         });
 
                         // Wrap ACP command with docker exec to run inside the container.
-                        // Pass the host token via -e so the copilot CLI authenticates
+                        // Inject the host auth env via -e so the copilot CLI authenticates
                         // without needing a keychain inside the container.
-                        let token_flag = host_token
-                            .as_ref()
-                            .map(|t| format!(" -e COPILOT_GITHUB_TOKEN={t}"))
-                            .unwrap_or_default();
+                        let token_flag = container::docker_env_flags(&auth_env);
                         let exec_cmd = format!(
                             "docker exec -i{token_flag} -u {} -w {} {} {}",
                             info.remote_user,
@@ -124,13 +121,9 @@ pub fn start_agent(
                     }
                 }
             } else {
-                // Running on the host — prepend the token as an env var in the
-                // ACP command string (the ACP crate parses NAME=value prefixes).
-                let cmd = if let Some(ref token) = host_token {
-                    format!("COPILOT_GITHUB_TOKEN={token} {acp_command}")
-                } else {
-                    acp_command
-                };
+                // Running on the host — prepend the auth env vars to the ACP
+                // command string (the ACP crate parses NAME=value prefixes).
+                let cmd = format!("{}{acp_command}", container::command_env_prefix(&auth_env));
                 let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
                 (cmd, cwd, None)
             };
