@@ -1,0 +1,11 @@
+[package]
+name = "fleet-protocol"
+description = "Wire types and stdio framing for the Fleet Commander in-container service (fleet-agent)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
