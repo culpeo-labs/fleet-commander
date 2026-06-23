@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
+pub use fleet_commander_core::container::ContainerInfo;
 pub use fleet_commander_core::session::{
     AgentId, AssistantMessage, AvailableCommand, Thought, ToolCall, UserMessage,
 };
@@ -69,6 +70,11 @@ pub struct Agent {
     /// Optional repo path with `.devcontainer/` config.
     /// When set, the agent runs inside a dev container.
     pub workspace_folder: Option<PathBuf>,
+    /// Details of the running dev container, once it has come up
+    /// ([`fleet_commander_core::session::SessionEvent::ContainerReady`]).
+    /// `None` until the container is ready (or when the agent runs on the
+    /// host). Used to back the explorer with the in-container service.
+    pub container: Option<ContainerInfo>,
     /// Channel for sending prompts to the persistent ACP connection.
     /// `None` until the connection is established.
     pub prompt_tx: Option<mpsc::UnboundedSender<String>>,
@@ -107,6 +113,7 @@ impl Agent {
             history: Vec::new(),
             acp_command: String::new(),
             workspace_folder: None,
+            container: None,
             prompt_tx: None,
             task_handle: None,
             session_id: None,

@@ -17,7 +17,10 @@ use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -88,6 +91,27 @@ impl ServiceFs {
         Ok(Self::new(root, Box::new(transport)))
     }
 
+    /// Connect to a `fleet-agent` running **inside a container** via
+    /// `docker exec -i`, perform the `initialize` handshake, and return a
+    /// connected `ServiceFs`.
+    ///
+    /// `root_display` is the host-side path shown to the user (so the
+    /// explorer's root label stays stable across the `LocalFs` → `ServiceFs`
+    /// upgrade); `remote_root` is the in-container workspace the daemon
+    /// resolves paths against; `agent_path` is the in-container binary path
+    /// (typically [`crate::agent_bin::CONTAINER_AGENT_PATH`]).
+    pub fn connect_docker(
+        root_display: impl Into<PathBuf>,
+        remote_root: &str,
+        container_id: &str,
+        remote_user: &str,
+        agent_path: &str,
+    ) -> io::Result<Self> {
+        let transport =
+            ProcessTransport::docker_exec(container_id, remote_user, agent_path, remote_root)?;
+        Ok(Self::new(root_display, Box::new(transport)))
+    }
+
     fn call_typed<P, R>(&self, method: &str, params: P) -> Result<R, TransportError>
     where
         P: serde::Serialize,
@@ -135,6 +159,10 @@ fn rel_to_wire(rel: &Path) -> String {
 impl WorkspaceFs for ServiceFs {
     fn root_display(&self) -> &Path {
         &self.root
+    }
+
+    fn is_remote(&self) -> bool {
+        true
     }
 
     fn list_dir(&self, rel: &Path) -> io::Result<Vec<DirEntry>> {
@@ -204,31 +232,96 @@ impl WorkspaceFs for ServiceFs {
 
 // ─── Process transport ─────────────────────────────────────────────────
 
+/// How long a single RPC waits for the daemon to respond before the
+/// transport gives up, tears the child down, and marks itself unhealthy.
+/// Generous because operations like `git status` on a large repo are
+/// legitimately slow — and, since all `ServiceFs` calls run off the UI
+/// thread, a slow call delays only the explorer, never the TUI.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A [`Transport`] that talks to a spawned `fleet-agent` child over its
 /// stdio pipes.
+///
+/// A dedicated reader thread owns the child's stdout and forwards framed
+/// responses over a channel, so [`Transport::call`] can wait with a
+/// deadline ([`mpsc::Receiver::recv_timeout`]) instead of blocking
+/// forever on a read. On timeout, EOF, or IO error the transport is
+/// marked **unhealthy**: the child is killed and every subsequent call
+/// fails fast, so one wedged request can never permanently block the
+/// explorer or leak a blocking-pool thread.
 #[derive(Debug)]
 pub struct ProcessTransport {
-    inner: Mutex<Pipe>,
+    call: Mutex<CallChannel>,
+    child: Mutex<Child>,
+    reader: Mutex<Option<JoinHandle<()>>>,
     next_id: AtomicU64,
+    healthy: AtomicBool,
+    timeout: Duration,
 }
 
 #[derive(Debug)]
-struct Pipe {
-    child: Child,
+struct CallChannel {
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    rx: mpsc::Receiver<io::Result<Vec<u8>>>,
+}
+
+/// Read framed messages from the child's stdout until EOF or error,
+/// forwarding each to the call side. Exits when the receiver is dropped.
+fn reader_loop(mut stdout: BufReader<ChildStdout>, tx: mpsc::Sender<io::Result<Vec<u8>>>) {
+    loop {
+        match framing::read_frame(&mut stdout) {
+            Ok(Some(body)) => {
+                if tx.send(Ok(body)).is_err() {
+                    break;
+                }
+            }
+            Ok(None) => break, // EOF — the daemon closed stdout.
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                break;
+            }
+        }
+    }
 }
 
 impl ProcessTransport {
     /// Spawn `agent_bin serve --root <root>` and complete the `initialize`
     /// handshake, verifying the daemon speaks our protocol version.
     pub fn spawn(agent_bin: &Path, root: &Path) -> io::Result<Self> {
-        let mut child = Command::new(agent_bin)
-            .arg("serve")
-            .arg("--root")
-            .arg(root)
+        let mut cmd = Command::new(agent_bin);
+        cmd.arg("serve").arg("--root").arg(root);
+        Self::from_command(cmd)
+    }
+
+    /// Connect to a `fleet-agent` running inside a container by shelling
+    /// `docker exec -i …` and complete the `initialize` handshake.
+    ///
+    /// `agent_path` and `remote_root` are paths **inside** the container.
+    pub fn docker_exec(
+        container_id: &str,
+        remote_user: &str,
+        agent_path: &str,
+        remote_root: &str,
+    ) -> io::Result<Self> {
+        let argv = docker_exec_argv(container_id, remote_user, agent_path, remote_root);
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        Self::from_command(cmd)
+    }
+
+    fn from_command(cmd: Command) -> io::Result<Self> {
+        Self::from_command_with_timeout(cmd, REQUEST_TIMEOUT)
+    }
+
+    /// Spawn an already-configured command with piped stdio (stderr is
+    /// discarded so daemon logs never corrupt the framed protocol stream or
+    /// the host TUI), start the reader thread, then perform the `initialize`
+    /// handshake with the given per-call `timeout`.
+    fn from_command_with_timeout(mut cmd: Command, timeout: Duration) -> io::Result<Self> {
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()?;
         let stdin = child
             .stdin
@@ -238,13 +331,19 @@ impl ProcessTransport {
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("agent stdout not captured"))?;
+
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::Builder::new()
+            .name("fleet-agent-reader".into())
+            .spawn(move || reader_loop(BufReader::new(stdout), tx))?;
+
         let transport = Self {
-            inner: Mutex::new(Pipe {
-                child,
-                stdin,
-                stdout: BufReader::new(stdout),
-            }),
+            call: Mutex::new(CallChannel { stdin, rx }),
+            child: Mutex::new(child),
+            reader: Mutex::new(Some(reader)),
             next_id: AtomicU64::new(0),
+            healthy: AtomicBool::new(true),
+            timeout,
         };
 
         let init: InitializeResult = {
@@ -268,10 +367,51 @@ impl ProcessTransport {
         }
         Ok(transport)
     }
+
+    /// Mark the transport dead and tear down the child so no further call
+    /// can block on it. Idempotent.
+    fn mark_unhealthy(&self) {
+        self.healthy.store(false, Ordering::Release);
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Build the `docker exec -i` argv that launches the in-container agent.
+///
+/// The daemon resolves all paths against `--root`, so no working directory is
+/// set; `-i` keeps stdin open for the framed request/response stream.
+pub fn docker_exec_argv(
+    container_id: &str,
+    remote_user: &str,
+    agent_path: &str,
+    remote_root: &str,
+) -> Vec<String> {
+    vec![
+        "docker".into(),
+        "exec".into(),
+        "-i".into(),
+        "-u".into(),
+        remote_user.into(),
+        container_id.into(),
+        agent_path.into(),
+        "serve".into(),
+        "--root".into(),
+        remote_root.into(),
+    ]
 }
 
 impl Transport for ProcessTransport {
     fn call(&self, method: &str, params: Value) -> Result<Value, TransportError> {
+        if !self.healthy.load(Ordering::Acquire) {
+            return Err(TransportError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "agent transport is no longer healthy",
+            )));
+        }
+
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let request = Request {
             jsonrpc: "2.0".into(),
@@ -282,17 +422,45 @@ impl Transport for ProcessTransport {
         let body = serde_json::to_vec(&request)
             .map_err(|e| TransportError::Protocol(format!("encode request: {e}")))?;
 
-        let mut pipe = self
-            .inner
+        let mut chan = self
+            .call
             .lock()
             .map_err(|_| TransportError::Protocol("transport mutex poisoned".into()))?;
 
-        framing::write_frame(&mut pipe.stdin, &body).map_err(TransportError::Io)?;
-        pipe.stdin.flush().map_err(TransportError::Io)?;
+        if let Err(e) =
+            framing::write_frame(&mut chan.stdin, &body).and_then(|()| chan.stdin.flush())
+        {
+            drop(chan);
+            self.mark_unhealthy();
+            return Err(TransportError::Io(e));
+        }
 
-        let resp_body = framing::read_frame(&mut pipe.stdout)
-            .map_err(TransportError::Io)?
-            .ok_or_else(|| TransportError::Protocol("agent closed the connection".into()))?;
+        // Calls are serialized by the `call` mutex, so the next frame from
+        // the reader is unambiguously this request's response.
+        let resp_body = match chan.rx.recv_timeout(self.timeout) {
+            Ok(Ok(body)) => body,
+            Ok(Err(e)) => {
+                drop(chan);
+                self.mark_unhealthy();
+                return Err(TransportError::Io(e));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                drop(chan);
+                self.mark_unhealthy();
+                return Err(TransportError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("agent did not respond within {:?}", self.timeout),
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                drop(chan);
+                self.mark_unhealthy();
+                return Err(TransportError::Protocol(
+                    "agent closed the connection".into(),
+                ));
+            }
+        };
+
         let response: Response = serde_json::from_slice(&resp_body)
             .map_err(|e| TransportError::Protocol(format!("decode response: {e}")))?;
 
@@ -311,11 +479,18 @@ impl Transport for ProcessTransport {
 
 impl Drop for ProcessTransport {
     fn drop(&mut self) {
-        if let Ok(mut pipe) = self.inner.lock() {
-            // Best-effort shutdown: kill the child and reap it so we don't
-            // leak a process or a zombie.
-            let _ = pipe.child.kill();
-            let _ = pipe.child.wait();
+        // Best-effort shutdown. Drop only runs once every `Arc<ServiceFs>`
+        // clone (including any held by an in-flight `spawn_blocking` call)
+        // is gone, so no call can be holding the locks below.
+        self.healthy.store(false, Ordering::Release);
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Ok(mut reader) = self.reader.lock()
+            && let Some(handle) = reader.take()
+        {
+            let _ = handle.join();
         }
     }
 }
@@ -482,5 +657,47 @@ mod tests {
     fn rel_to_wire_uses_forward_slashes() {
         assert_eq!(rel_to_wire(Path::new("")), "");
         assert_eq!(rel_to_wire(Path::new("src/lib.rs")), "src/lib.rs");
+    }
+
+    #[test]
+    fn docker_exec_argv_shape() {
+        let argv = docker_exec_argv(
+            "abc123",
+            "vscode",
+            "/opt/fleet/bin/fleet-agent",
+            "/workspaces/repo",
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "docker",
+                "exec",
+                "-i",
+                "-u",
+                "vscode",
+                "abc123",
+                "/opt/fleet/bin/fleet-agent",
+                "serve",
+                "--root",
+                "/workspaces/repo",
+            ]
+        );
+    }
+
+    #[test]
+    fn transport_times_out_on_unresponsive_agent() {
+        // `sleep` ignores stdin and never writes a framed response, so the
+        // `initialize` handshake must hit the deadline and fail rather than
+        // block forever. The test completing quickly is itself the assertion
+        // that there's no indefinite hang.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let start = std::time::Instant::now();
+        let result = ProcessTransport::from_command_with_timeout(cmd, Duration::from_millis(300));
+        assert!(result.is_err(), "expected handshake to time out");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "transport hung instead of timing out"
+        );
     }
 }

@@ -86,6 +86,15 @@ pub fn start_agent(
                                 info.remote_user, info.remote_workspace_folder
                             ),
                         });
+                        // Tell the consumer where to reach the in-container
+                        // service so it can point the explorer at the
+                        // container's filesystem.
+                        let _ = event_tx.send(SessionEvent::ContainerReady {
+                            agent_id: agent_id.clone(),
+                            container_id: info.container_id.clone(),
+                            remote_user: info.remote_user.clone(),
+                            remote_workspace_folder: info.remote_workspace_folder.clone(),
+                        });
 
                         // Wrap ACP command with docker exec to run inside the
                         // container. Authentication is handled by the interactive

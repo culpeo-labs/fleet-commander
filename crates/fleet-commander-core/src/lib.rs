@@ -20,6 +20,7 @@
 //! `mpsc::UnboundedSender<session::SessionEvent>` plus an agent id +
 //! ACP command, and react to whatever comes back.
 
+pub mod agent_bin;
 pub mod agent_runtime;
 pub mod base_layer;
 pub mod container;

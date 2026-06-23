@@ -143,6 +143,15 @@ pub enum SessionEvent {
     /// Runtime status/log line: container progress, stderr, etc. Not part
     /// of the model's conversation.
     Output { agent_id: AgentId, line: String },
+    /// The agent's dev container is up and reachable. Carries the details
+    /// needed to reach the in-container `fleet-agent` service so the
+    /// consumer can point the explorer at the container's filesystem.
+    ContainerReady {
+        agent_id: AgentId,
+        container_id: String,
+        remote_user: String,
+        remote_workspace_folder: String,
+    },
     /// The agent needs interactive authentication (e.g. `copilot login`).
     /// The consumer should suspend its UI and run the command interactively.
     AuthRequired {
@@ -183,6 +192,7 @@ impl SessionEvent {
             | SessionEvent::Thought { agent_id, .. }
             | SessionEvent::UserMessage { agent_id, .. }
             | SessionEvent::Output { agent_id, .. }
+            | SessionEvent::ContainerReady { agent_id, .. }
             | SessionEvent::AuthRequired { agent_id, .. }
             | SessionEvent::PermissionRequest { agent_id, .. }
             | SessionEvent::Error { agent_id, .. }

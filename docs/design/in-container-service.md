@@ -76,9 +76,21 @@ Each phase ships value and de-risks the next.
   `fs.list`/`fs.read`/`fs.stat`/`git.status`/`git.branch` + `initialize`), and a
   `ServiceFs` client behind `WorkspaceFs` (generic over a `Transport`; `ProcessTransport`
   spawns the agent). Proven end-to-end across a real process boundary in tests.
-- **Phase 1 — inject into containers via the base-layer bind-mount.** Arch-selected
-  binary mounted by the merged devcontainer base layer + exec stdio. Delivers the
-  original correctness goal (the agent's real view).
+- **Phase 1 — inject into containers via the base-layer bind-mount.** ✅ *Done.*
+  A statically-linked (musl) `fleet-agent` is built via `scripts/build-fleet-agent.sh`
+  into `~/.local/share/fleet-commander/bin/fleet-agent-<arch>` (override with
+  `FLEET_AGENT_BIN`; see `core::agent_bin`). On fresh container create the base layer
+  bind-mounts it read-only at `/opt/fleet/bin/fleet-agent`; the commander connects over
+  `docker exec -i` stdio (`ServiceFs::connect_docker`) and the explorer/git pane is
+  upgraded from the host `LocalFs` to the container-backed `ServiceFs` once
+  `SessionEvent::ContainerReady` fires. Delivers the original correctness goal (the
+  agent's real view). Guardrails from the architecture review: remote fs calls are
+  served from a render-safe cache (background `spawn_blocking` loads); the transport has
+  a request deadline and marks itself unhealthy on hang/EOF; and the `ServiceFs` is tied
+  to the container generation (the `container_id` is validated on install, and a
+  `:rebuild`/`:close` drops the remote fs and its `docker exec` child).
+  *Caveat:* pre-existing containers created before Phase 1 lack the mount and silently
+  fall back to `LocalFs` until rebuilt (`:rebuild`).
 - **Phase 2 — file watching / push.** First thing exec fundamentally can't do; pushed
   as JSON-RPC notifications (`fs.didChange`).
 - **Phase 3 — search, streaming reads/diffs, git pane.** Streamed as notifications;

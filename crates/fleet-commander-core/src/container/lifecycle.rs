@@ -135,7 +135,21 @@ pub async fn start_container(
     debug!(remote_user = ?remote_user, "Resolved remote user");
 
     // Merge base credential layer into env/mounts.
-    let (env, mounts) = build_env_and_mounts(workspace, &dc_config, remote_user.as_deref());
+    let (env, mut mounts) = build_env_and_mounts(workspace, &dc_config, remote_user.as_deref());
+
+    // Inject the in-container service binary as a read-only bind mount so the
+    // explorer can serve files/git from inside the container. Best-effort:
+    // if no host binary for the container arch is available, the explorer
+    // falls back to the host-side filesystem.
+    match crate::agent_bin::host_arch_slug().and_then(crate::agent_bin::resolve_host_bin) {
+        Some(host_bin) => {
+            info!(path = %host_bin.display(), "Injecting fleet-agent binary mount");
+            mounts.push(super::mounts::agent_bind_mount(&host_bin));
+        }
+        None => {
+            debug!("No host fleet-agent binary found; explorer will use host filesystem");
+        }
+    }
     debug!(
         env_count = env.len(),
         mount_count = mounts.len(),
