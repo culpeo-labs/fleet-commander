@@ -24,6 +24,7 @@ pub mod agent_runtime;
 pub mod base_layer;
 pub mod container;
 pub mod git;
+pub mod service_fs;
 pub mod session;
 pub mod workspace_fs;
 

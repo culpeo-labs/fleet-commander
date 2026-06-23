@@ -70,10 +70,12 @@ additive behind a capability flag.
 
 Each phase ships value and de-risks the next.
 
-- **Phase 0 — protocol + daemon, run locally first.** `fleet-protocol` +
-  `fleet-agent` skeleton implementing `fs.list`/`fs.read`/`git.status`/`git.branch`
-  as JSON-RPC over stdio, launched as a host child process. New `ServiceFs` behind
-  `WorkspaceFs`. Proves the protocol end-to-end with zero injection complexity.
+- **Phase 0 — protocol + daemon, run locally first.** ✅ *Done.* `fleet-protocol`
+  (wire types + `Content-Length` stdio framing), `fleet-git` (extracted std-only git
+  helpers, shared with the daemon), `fleet-agent` (daemon serving
+  `fs.list`/`fs.read`/`fs.stat`/`git.status`/`git.branch` + `initialize`), and a
+  `ServiceFs` client behind `WorkspaceFs` (generic over a `Transport`; `ProcessTransport`
+  spawns the agent). Proven end-to-end across a real process boundary in tests.
 - **Phase 1 — inject into containers via the base-layer bind-mount.** Arch-selected
   binary mounted by the merged devcontainer base layer + exec stdio. Delivers the
   original correctness goal (the agent's real view).

@@ -1,0 +1,10 @@
+[package]
+name = "fleet-git"
+description = "Std-only git branch/status inspection helpers shared by Fleet Commander and fleet-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

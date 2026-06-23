@@ -1,0 +1,360 @@
+//! The `fleet-agent` daemon: serves filesystem and git inspection for a
+//! single workspace root over JSON-RPC 2.0 on stdio.
+//!
+//! Phase 0 runs this as a local host child process to prove the protocol
+//! end-to-end; Phase 1 bind-mounts the same binary into a dev container and
+//! drives it via `docker exec -i`. The serve loop is therefore written
+//! against generic [`BufRead`]/[`Write`] so the transport is interchangeable.
+
+use std::io::{self, BufRead, Write};
+use std::path::{Component, Path, PathBuf};
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use fleet_protocol::{
+    Capabilities, FsEntry, FsListParams, FsListResult, FsReadParams, FsReadResult, FsStatParams,
+    FsStatResult, GitBranchResult, GitStatusEntry, GitStatusParams, GitStatusResult,
+    InitializeResult, PROTOCOL_VERSION, Request, Response, RpcError, ServerInfo, WireStatus,
+    error_codes, framing, methods,
+};
+
+/// Serves requests against a fixed workspace `root`.
+pub struct Server {
+    root: PathBuf,
+}
+
+impl Server {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// Read framed requests from `reader` until EOF, dispatching each and
+    /// writing a framed response to `writer`. A frame that fails to parse as
+    /// a request yields a best-effort JSON-RPC parse error.
+    pub fn serve<R: BufRead, W: Write>(&self, reader: &mut R, writer: &mut W) -> io::Result<()> {
+        while let Some(body) = framing::read_frame(reader)? {
+            let response = match serde_json::from_slice::<Request>(&body) {
+                Ok(req) => self.handle(&req),
+                Err(e) => Response::err(
+                    0,
+                    RpcError::new(error_codes::PARSE_ERROR, format!("invalid request: {e}")),
+                ),
+            };
+            let out = serde_json::to_vec(&response)?;
+            framing::write_frame(writer, &out)?;
+        }
+        Ok(())
+    }
+
+    /// Dispatch a single request to its handler.
+    pub fn handle(&self, req: &Request) -> Response {
+        let result = match req.method.as_str() {
+            methods::INITIALIZE => self.initialize(),
+            methods::FS_LIST => self.fs_list(req),
+            methods::FS_READ => self.fs_read(req),
+            methods::FS_STAT => self.fs_stat(req),
+            methods::GIT_STATUS => self.git_status(req),
+            methods::GIT_BRANCH => self.git_branch(),
+            other => Err(RpcError::new(
+                error_codes::METHOD_NOT_FOUND,
+                format!("unknown method: {other}"),
+            )),
+        };
+        match result {
+            Ok(value) => Response::ok(req.id, value),
+            Err(error) => Response::err(req.id, error),
+        }
+    }
+
+    fn initialize(&self) -> Result<serde_json::Value, RpcError> {
+        ok(InitializeResult {
+            protocol_version: PROTOCOL_VERSION,
+            server_info: ServerInfo {
+                name: "fleet-agent".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+            },
+            capabilities: Capabilities {
+                fs: true,
+                git: true,
+            },
+        })
+    }
+
+    fn fs_list(&self, req: &Request) -> Result<serde_json::Value, RpcError> {
+        let params: FsListParams = parse_params(req)?;
+        let abs = self.resolve(&params.path)?;
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&abs).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            let is_dir = entry.file_type().map_err(io_error)?.is_dir();
+            entries.push(FsEntry {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                is_dir,
+            });
+        }
+        ok(FsListResult { entries })
+    }
+
+    fn fs_read(&self, req: &Request) -> Result<serde_json::Value, RpcError> {
+        let params: FsReadParams = parse_params(req)?;
+        let abs = self.resolve(&params.path)?;
+        let bytes = std::fs::read(&abs).map_err(io_error)?;
+        ok(FsReadResult {
+            content_base64: BASE64.encode(bytes),
+        })
+    }
+
+    fn fs_stat(&self, req: &Request) -> Result<serde_json::Value, RpcError> {
+        let params: FsStatParams = parse_params(req)?;
+        let abs = self.resolve(&params.path)?;
+        let meta = std::fs::metadata(&abs).map_err(io_error)?;
+        ok(FsStatResult {
+            is_dir: meta.is_dir(),
+            len: meta.len(),
+        })
+    }
+
+    fn git_status(&self, req: &Request) -> Result<serde_json::Value, RpcError> {
+        let params: GitStatusParams = parse_params(req)?;
+        let map = fleet_git::status(&self.root, params.include_ignored).map_err(git_error)?;
+        let entries = map
+            .into_iter()
+            .map(|(path, kind)| GitStatusEntry {
+                path: path.to_string_lossy().into_owned(),
+                status: to_wire(kind),
+            })
+            .collect();
+        ok(GitStatusResult { entries })
+    }
+
+    fn git_branch(&self) -> Result<serde_json::Value, RpcError> {
+        ok(GitBranchResult {
+            branch: fleet_git::current_branch(&self.root),
+        })
+    }
+
+    /// Resolve a workspace-relative request path to an absolute path under
+    /// `root`, rejecting anything that would escape it (absolute paths,
+    /// `..`, etc.). The server never trusts the client's path.
+    fn resolve(&self, rel: &str) -> Result<PathBuf, RpcError> {
+        let rel_path = Path::new(rel);
+        let mut safe = PathBuf::new();
+        for component in rel_path.components() {
+            match component {
+                Component::Normal(c) => safe.push(c),
+                Component::CurDir => {}
+                Component::RootDir | Component::Prefix(_) | Component::ParentDir => {
+                    return Err(RpcError::new(
+                        error_codes::FORBIDDEN_PATH,
+                        format!("path escapes workspace root: {rel}"),
+                    ));
+                }
+            }
+        }
+        Ok(self.root.join(safe))
+    }
+}
+
+fn ok(value: impl serde::Serialize) -> Result<serde_json::Value, RpcError> {
+    serde_json::to_value(value)
+        .map_err(|e| RpcError::new(error_codes::INTERNAL_ERROR, format!("serialize: {e}")))
+}
+
+fn parse_params<T: serde::de::DeserializeOwned>(req: &Request) -> Result<T, RpcError> {
+    let params = req
+        .params
+        .clone()
+        .ok_or_else(|| RpcError::new(error_codes::INVALID_PARAMS, "missing params"))?;
+    serde_json::from_value(params)
+        .map_err(|e| RpcError::new(error_codes::INVALID_PARAMS, format!("invalid params: {e}")))
+}
+
+fn io_error(e: io::Error) -> RpcError {
+    let code = if e.kind() == io::ErrorKind::NotFound {
+        error_codes::NOT_FOUND
+    } else {
+        error_codes::IO_ERROR
+    };
+    RpcError::new(code, e.to_string())
+}
+
+fn git_error(e: fleet_git::StatusError) -> RpcError {
+    let code = match e {
+        // A non-zero exit almost always means "not a git repo"; surface it
+        // as such so the client can fall back to showing no markers.
+        fleet_git::StatusError::NonZeroExit { .. } => error_codes::NOT_A_REPO,
+        fleet_git::StatusError::SpawnFailed(_) => error_codes::IO_ERROR,
+        fleet_git::StatusError::InvalidOutput => error_codes::INTERNAL_ERROR,
+    };
+    RpcError::new(code, e.to_string())
+}
+
+fn to_wire(kind: fleet_git::StatusKind) -> WireStatus {
+    use fleet_git::StatusKind as K;
+    match kind {
+        K::Modified => WireStatus::Modified,
+        K::Added => WireStatus::Added,
+        K::Deleted => WireStatus::Deleted,
+        K::Renamed => WireStatus::Renamed,
+        K::Untracked => WireStatus::Untracked,
+        K::Ignored => WireStatus::Ignored,
+        K::Conflicted => WireStatus::Conflicted,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fleet_protocol::{FsListResult, FsReadResult, GitBranchResult, InitializeResult};
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn fixture() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("README.md"), "hi").unwrap();
+        fs::write(tmp.path().join("src/lib.rs"), "fn a(){}").unwrap();
+        tmp
+    }
+
+    fn call(server: &Server, method: &str, params: serde_json::Value) -> Response {
+        server.handle(&Request {
+            jsonrpc: "2.0".into(),
+            id: 1,
+            method: method.into(),
+            params: Some(params),
+        })
+    }
+
+    #[test]
+    fn initialize_reports_version_and_capabilities() {
+        let tmp = fixture();
+        let server = Server::new(tmp.path());
+        let resp = call(&server, methods::INITIALIZE, serde_json::json!({}));
+        let result: InitializeResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(result.protocol_version, PROTOCOL_VERSION);
+        assert!(result.capabilities.fs && result.capabilities.git);
+        assert_eq!(result.server_info.name, "fleet-agent");
+    }
+
+    #[test]
+    fn fs_list_returns_children() {
+        let tmp = fixture();
+        let server = Server::new(tmp.path());
+        let resp = call(&server, methods::FS_LIST, serde_json::json!({ "path": "" }));
+        let mut result: FsListResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        result.entries.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(result.entries.len(), 2);
+        assert_eq!(result.entries[0].name, "README.md");
+        assert!(!result.entries[0].is_dir);
+        assert_eq!(result.entries[1].name, "src");
+        assert!(result.entries[1].is_dir);
+    }
+
+    #[test]
+    fn fs_read_returns_base64() {
+        let tmp = fixture();
+        let server = Server::new(tmp.path());
+        let resp = call(
+            &server,
+            methods::FS_READ,
+            serde_json::json!({ "path": "README.md" }),
+        );
+        let result: FsReadResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        let bytes = BASE64.decode(result.content_base64).unwrap();
+        assert_eq!(bytes, b"hi");
+    }
+
+    #[test]
+    fn fs_read_missing_file_is_not_found() {
+        let tmp = fixture();
+        let server = Server::new(tmp.path());
+        let resp = call(
+            &server,
+            methods::FS_READ,
+            serde_json::json!({ "path": "nope.txt" }),
+        );
+        assert_eq!(resp.error.unwrap().code, error_codes::NOT_FOUND);
+    }
+
+    #[test]
+    fn path_escape_is_forbidden() {
+        let tmp = fixture();
+        let server = Server::new(tmp.path());
+        for bad in ["../secret", "/etc/passwd", "src/../../oops"] {
+            let resp = call(
+                &server,
+                methods::FS_LIST,
+                serde_json::json!({ "path": bad }),
+            );
+            assert_eq!(
+                resp.error.expect("should be rejected").code,
+                error_codes::FORBIDDEN_PATH,
+                "path {bad} should be forbidden",
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_method_is_method_not_found() {
+        let tmp = fixture();
+        let server = Server::new(tmp.path());
+        let resp = call(&server, "bogus.method", serde_json::json!({}));
+        assert_eq!(resp.error.unwrap().code, error_codes::METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn git_branch_is_none_outside_repo() {
+        let tmp = fixture();
+        let server = Server::new(tmp.path());
+        let resp = call(&server, methods::GIT_BRANCH, serde_json::json!(null));
+        let result: GitBranchResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(result.branch, None);
+    }
+
+    #[test]
+    fn git_status_outside_repo_maps_to_not_a_repo() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not installed");
+            return;
+        }
+        let tmp = fixture();
+        let server = Server::new(tmp.path());
+        let resp = call(
+            &server,
+            methods::GIT_STATUS,
+            serde_json::json!({ "include_ignored": false }),
+        );
+        assert_eq!(resp.error.unwrap().code, error_codes::NOT_A_REPO);
+    }
+
+    #[test]
+    fn serve_processes_framed_requests() {
+        let tmp = fixture();
+        let server = Server::new(tmp.path());
+        let mut input = Vec::new();
+        let req = Request::new(
+            42,
+            methods::FS_READ,
+            FsReadParams {
+                path: "README.md".into(),
+            },
+        );
+        framing::write_frame(&mut input, &serde_json::to_vec(&req).unwrap()).unwrap();
+
+        let mut output = Vec::new();
+        let mut reader = io::Cursor::new(input);
+        server.serve(&mut reader, &mut output).unwrap();
+
+        let mut out_reader = io::Cursor::new(output);
+        let body = framing::read_frame(&mut out_reader).unwrap().unwrap();
+        let resp: Response = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.id, 42);
+        let result: FsReadResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(BASE64.decode(result.content_base64).unwrap(), b"hi");
+    }
+}
