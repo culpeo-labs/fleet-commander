@@ -4,3 +4,6 @@ Cargo.lock.bak
 .DS_Store
 *.swp
 vendor/
+
+# Local debug logs
+acp.log
