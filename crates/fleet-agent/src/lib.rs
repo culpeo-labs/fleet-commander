@@ -21,11 +21,20 @@ use fleet_protocol::{
 /// Serves requests against a fixed workspace `root`.
 pub struct Server {
     root: PathBuf,
+    /// `root` with all symlinks resolved, used to verify that a resolved
+    /// request path stays inside the workspace even when it traverses a
+    /// symlink. Falls back to `root` if the workspace can't be canonicalized.
+    canonical_root: PathBuf,
 }
 
 impl Server {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        let root = root.into();
+        let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        Self {
+            root,
+            canonical_root,
+        }
     }
 
     /// Read framed requests from `reader` until EOF, dispatching each and
@@ -134,8 +143,15 @@ impl Server {
     }
 
     /// Resolve a workspace-relative request path to an absolute path under
-    /// `root`, rejecting anything that would escape it (absolute paths,
-    /// `..`, etc.). The server never trusts the client's path.
+    /// `root`, rejecting anything that would escape it. Two layers of defence:
+    ///
+    /// 1. **Lexical:** reject absolute paths, `..`, and prefixes up front.
+    /// 2. **Symlink-aware:** canonicalize the result (resolving any symlinks
+    ///    along the way) and verify it still lives under the canonicalized
+    ///    workspace root. This stops an *in-workspace* symlink — e.g.
+    ///    `secrets -> /run/secrets` — from being followed out of the root.
+    ///
+    /// The server never trusts the client's path.
     fn resolve(&self, rel: &str) -> Result<PathBuf, RpcError> {
         let rel_path = Path::new(rel);
         let mut safe = PathBuf::new();
@@ -151,7 +167,37 @@ impl Server {
                 }
             }
         }
-        Ok(self.root.join(safe))
+        let candidate = self.root.join(safe);
+        // Resolve symlinks to a real path. The leaf may legitimately not exist
+        // (e.g. reading a missing file), so fall back to the nearest existing
+        // ancestor and re-append the remainder — this preserves NotFound
+        // semantics while still catching escapes via a symlinked ancestor.
+        let real = canonicalize_existing_prefix(&candidate).map_err(io_error)?;
+        if !real.starts_with(&self.canonical_root) {
+            return Err(RpcError::new(
+                error_codes::FORBIDDEN_PATH,
+                format!("path escapes workspace root: {rel}"),
+            ));
+        }
+        Ok(candidate)
+    }
+}
+
+/// Canonicalize `path`, tolerating a non-existent leaf: if the full path
+/// doesn't exist, resolve the nearest existing ancestor (expanding symlinks)
+/// and re-append the missing trailing components. Errors other than
+/// "not found" (e.g. a permission error) propagate unchanged.
+fn canonicalize_existing_prefix(path: &Path) -> io::Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(real) => Ok(real),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or(e)?;
+            let leaf = path
+                .file_name()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            Ok(canonicalize_existing_prefix(parent)?.join(leaf))
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -293,6 +339,58 @@ mod tests {
                 "path {bad} should be forbidden",
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_is_forbidden() {
+        // A symlink that lives *inside* the workspace but points outside it
+        // passes the lexical filter (all Normal components), so the resolver
+        // must catch it by canonicalizing and checking containment.
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("secret.txt"), "top secret").unwrap();
+
+        let tmp = fixture();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("escape")).unwrap();
+
+        // Reading through the symlink (a file under it) must be forbidden.
+        let resp = call(
+            &Server::new(tmp.path()),
+            methods::FS_READ,
+            serde_json::json!({ "path": "escape/secret.txt" }),
+        );
+        assert_eq!(
+            resp.error.expect("symlink escape should be rejected").code,
+            error_codes::FORBIDDEN_PATH,
+        );
+
+        // Listing the symlinked directory itself must also be forbidden.
+        let resp = call(
+            &Server::new(tmp.path()),
+            methods::FS_LIST,
+            serde_json::json!({ "path": "escape" }),
+        );
+        assert_eq!(
+            resp.error.expect("symlink escape should be rejected").code,
+            error_codes::FORBIDDEN_PATH,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_workspace_symlink_is_allowed() {
+        // A symlink pointing to another location *within* the workspace is
+        // legitimate and must still resolve.
+        let tmp = fixture();
+        std::os::unix::fs::symlink(tmp.path().join("README.md"), tmp.path().join("link.md"))
+            .unwrap();
+        let resp = call(
+            &Server::new(tmp.path()),
+            methods::FS_READ,
+            serde_json::json!({ "path": "link.md" }),
+        );
+        let result: FsReadResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(BASE64.decode(result.content_base64).unwrap(), b"hi");
     }
 
     #[test]

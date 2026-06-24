@@ -91,8 +91,17 @@ Each phase ships value and de-risks the next.
   `:rebuild`/`:close` drops the remote fs and its `docker exec` child). Git branch
   **and** status are both read from the container service (never the host bind-mount)
   so they can never disagree; branch is shown only while a container is started.
-  *Caveat:* pre-existing containers created before Phase 1 lack the mount and silently
-  fall back to `LocalFs` until rebuilt (`:rebuild`).
+  Arch selection happens **inside** the container: every available per-arch binary is
+  mounted at `/opt/fleet/bin/fleet-agent-<slug>` and a launcher at
+  `/opt/fleet/bin/fleet-agent` `exec`s the one matching `uname -m`, so it stays correct
+  under qemu emulation / `--platform` (not just the Docker host's arch). The daemon's
+  path resolver canonicalizes and re-checks containment, so an in-workspace symlink
+  can't escape the root. *Caveats:* pre-existing containers created before Phase 1 lack
+  the mount and silently fall back to `LocalFs` until rebuilt (`:rebuild`); the
+  emulation win only materializes once both musl arches are actually built (the build
+  script currently produces the host arch — dual-arch cross-compile is a follow-up); and
+  bind-mount delivery doesn't cover remote Docker (`DOCKER_HOST`), which would need
+  `docker cp` or a registry image.
 - **Phase 2 — file watching / push.** First thing exec fundamentally can't do; pushed
   as JSON-RPC notifications (`fs.didChange`).
 - **Phase 3 — search, streaming reads/diffs, git pane.** Streamed as notifications;

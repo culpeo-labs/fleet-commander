@@ -1,0 +1,25 @@
+# Sampo configuration — explicit-changeset release management.
+# See https://github.com/bruits/sampo/blob/main/crates/sampo/README.md
+version = 1
+
+[git]
+default_branch = "main"
+tag_format = "v{version}"
+
+[github]
+repository = "culpeo-labs/fleet-commander"
+
+[changelog]
+show_commit_hash = true
+show_acknowledgments = true
+
+[packages]
+# fleet-commander is the only user-facing release artifact; the other crates
+# are internal and share the workspace version, so changesets only ever target
+# `cargo/fleet-commander`.
+ignore = [
+  "cargo/fleet-commander-core",
+  "cargo/fleet-agent",
+  "cargo/fleet-protocol",
+  "cargo/fleet-git",
+]

@@ -137,17 +137,38 @@ pub async fn start_container(
     // Merge base credential layer into env/mounts.
     let (env, mut mounts) = build_env_and_mounts(workspace, &dc_config, remote_user.as_deref());
 
-    // Inject the in-container service binary as a read-only bind mount so the
-    // explorer can serve files/git from inside the container. Best-effort:
-    // if no host binary for the container arch is available, the explorer
-    // falls back to the host-side filesystem.
-    match crate::agent_bin::host_arch_slug().and_then(crate::agent_bin::resolve_host_bin) {
-        Some(host_bin) => {
-            info!(path = %host_bin.display(), "Injecting fleet-agent binary mount");
-            mounts.push(super::mounts::agent_bind_mount(&host_bin));
-        }
-        None => {
-            debug!("No host fleet-agent binary found; explorer will use host filesystem");
+    // Inject the in-container service so the explorer can serve files/git from
+    // inside the container. Best-effort: if no suitable host binary exists, the
+    // explorer falls back to the host-side filesystem.
+    //
+    // `FLEET_AGENT_BIN` overrides everything with a single binary (dev path).
+    // Otherwise we mount every per-arch binary we have plus a tiny launcher
+    // that `exec`s the one matching the container's `uname -m` — so selection
+    // is correct even under emulation or an explicit `--platform`.
+    if let Some(override_bin) = crate::agent_bin::agent_override_bin() {
+        info!(path = %override_bin.display(), "Injecting fleet-agent binary mount (override)");
+        mounts.push(super::mounts::agent_bind_mount(&override_bin));
+    } else {
+        let bins = crate::agent_bin::resolve_all_host_bins();
+        if bins.is_empty() {
+            debug!("No host fleet-agent binaries found; explorer will use host filesystem");
+        } else {
+            match crate::agent_bin::ensure_launcher_script() {
+                Ok(launcher) => {
+                    for (slug, host_bin) in &bins {
+                        let target = crate::agent_bin::container_agent_path_for(slug);
+                        info!(arch = slug, path = %host_bin.display(), "Injecting fleet-agent binary mount");
+                        mounts.push(super::mounts::read_only_mount(host_bin, &target));
+                    }
+                    mounts.push(super::mounts::read_only_mount(
+                        &launcher,
+                        crate::agent_bin::CONTAINER_AGENT_PATH,
+                    ));
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to materialize fleet-agent launcher; explorer will use host filesystem");
+                }
+            }
         }
     }
     debug!(
