@@ -323,6 +323,24 @@ impl App {
                     });
                 }
             }
+            AppEvent::AgentBranchReady {
+                agent_id,
+                container_id,
+                branch,
+            } => {
+                // Only apply if the agent still has the same container the
+                // branch was read from (a `:rebuild` swaps containers and
+                // clears the branch; a stale read must not resurrect it).
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id)
+                    && agent
+                        .container
+                        .as_ref()
+                        .map(|c| c.container_id == container_id)
+                        .unwrap_or(false)
+                {
+                    agent.git_branch = branch;
+                }
+            }
             AppEvent::Session(event) => self.handle_session_event(event),
         }
         self.sync_explorer();
@@ -372,6 +390,45 @@ impl App {
         });
     }
 
+    /// Read the agent's git branch from inside its container on a background
+    /// thread (a one-shot `docker exec` via the same `fleet-agent` service the
+    /// explorer uses) and deliver it as [`AppEvent::AgentBranchReady`].
+    ///
+    /// No-op if the agent has no started container — we deliberately never read
+    /// the host bind-mount, so the header/list branch and the explorer's git
+    /// status always reflect the same (container) filesystem.
+    fn refresh_agent_branch(&self, agent_id: AgentId) {
+        let Some((info, workspace)) = self.agents.iter().find(|a| a.id == agent_id).and_then(|a| {
+            let info = a.container.clone()?;
+            let ws = a.workspace_folder.clone()?;
+            Some((info, ws))
+        }) else {
+            return;
+        };
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let container_id = info.container_id.clone();
+            let branch = match ServiceFs::connect_docker(
+                workspace,
+                &info.remote_workspace_folder,
+                &info.container_id,
+                &info.remote_user,
+                fleet_commander_core::agent_bin::CONTAINER_AGENT_PATH,
+            ) {
+                Ok(fs) => fs.git_branch(),
+                Err(e) => {
+                    info!(error = %e, "Branch fetch failed; container service unavailable");
+                    return;
+                }
+            };
+            let _ = tx.send(AppEvent::AgentBranchReady {
+                agent_id,
+                container_id,
+                branch,
+            });
+        });
+    }
+
     fn handle_session_event(&mut self, event: SessionEvent) {
         match event {
             SessionEvent::Output { agent_id, line } => {
@@ -394,6 +451,9 @@ impl App {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.container = Some(info.clone());
                 }
+                // Fetch the branch from inside the new container (covers both
+                // the viewed agent's header and any other agent's list row).
+                self.refresh_agent_branch(agent_id.clone());
                 // If this agent's explorer is on screen, upgrade it from the
                 // host filesystem to the in-container service.
                 if self.viewed_agent_id().as_ref() == Some(&agent_id)
@@ -1219,6 +1279,9 @@ impl App {
         // also makes a stale in-flight `ExplorerFsReady` install fail the
         // container-id check once the new container comes up.
         agent.container = None;
+        // The branch came from that container; drop it until the rebuilt
+        // container reports a fresh one (no host fallback).
+        agent.git_branch = None;
         agent.info("🔄 Rebuilding container...");
 
         // Downgrade the explorer off the soon-to-be-dead container's service
@@ -2528,8 +2591,8 @@ mod tests {
         App::new(Config::default(), vec![agent], tx)
     }
 
-    #[test]
-    fn container_ready_stores_info_on_agent() {
+    #[tokio::test]
+    async fn container_ready_stores_info_on_agent() {
         let mut app = app_with_container_agent("/ws/repo");
         app.handle(AppEvent::Session(SessionEvent::ContainerReady {
             agent_id: "a1".into(),
@@ -2621,6 +2684,43 @@ mod tests {
             !app.explorer.fs.as_ref().unwrap().is_remote(),
             "a fs bound to a stale container must be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_branch_ready_applies_for_matching_container() {
+        let mut app = app_with_container_agent("/ws/repo");
+        app.handle(AppEvent::Session(SessionEvent::ContainerReady {
+            agent_id: "a1".into(),
+            container_id: "cid".into(),
+            remote_user: "vscode".into(),
+            remote_workspace_folder: "/workspaces/repo".into(),
+        }));
+        app.handle(AppEvent::AgentBranchReady {
+            agent_id: "a1".into(),
+            container_id: "cid".into(),
+            branch: Some("feat/x".into()),
+        });
+        let agent = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        assert_eq!(agent.git_branch.as_deref(), Some("feat/x"));
+    }
+
+    #[tokio::test]
+    async fn agent_branch_ready_rejected_for_stale_container() {
+        let mut app = app_with_container_agent("/ws/repo");
+        app.handle(AppEvent::Session(SessionEvent::ContainerReady {
+            agent_id: "a1".into(),
+            container_id: "new".into(),
+            remote_user: "vscode".into(),
+            remote_workspace_folder: "/workspaces/repo".into(),
+        }));
+        // A branch read from the OLD container must not be applied.
+        app.handle(AppEvent::AgentBranchReady {
+            agent_id: "a1".into(),
+            container_id: "old".into(),
+            branch: Some("stale".into()),
+        });
+        let agent = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        assert_eq!(agent.git_branch, None);
     }
 
     #[tokio::test]

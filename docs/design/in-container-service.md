@@ -88,7 +88,9 @@ Each phase ships value and de-risks the next.
   served from a render-safe cache (background `spawn_blocking` loads); the transport has
   a request deadline and marks itself unhealthy on hang/EOF; and the `ServiceFs` is tied
   to the container generation (the `container_id` is validated on install, and a
-  `:rebuild`/`:close` drops the remote fs and its `docker exec` child).
+  `:rebuild`/`:close` drops the remote fs and its `docker exec` child). Git branch
+  **and** status are both read from the container service (never the host bind-mount)
+  so they can never disagree; branch is shown only while a container is started.
   *Caveat:* pre-existing containers created before Phase 1 lack the mount and silently
   fall back to `LocalFs` until rebuilt (`:rebuild`).
 - **Phase 2 — file watching / push.** First thing exec fundamentally can't do; pushed

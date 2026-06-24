@@ -4,9 +4,8 @@
 //! what command to launch (e.g. "copilot --acp --stdio"). When `workspace_folder`
 //! is set, the agent runs inside a dev container for that repo.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -91,18 +90,17 @@ pub struct Agent {
     ///
     /// `Cell` because `render_conversation` only has `&Agent`.
     pub last_effective_top: Cell<usize>,
-    /// Cached current git branch for the workspace, with the
-    /// [`Instant`] it was last read. `None` if the workspace isn't a
-    /// git working tree. Recomputed by [`Agent::git_branch`] when the
-    /// cache is older than [`GIT_BRANCH_TTL`].
-    git_branch_cache: RefCell<Option<(Instant, Option<String>)>>,
+    /// Current git branch of the agent's workspace **as seen inside its
+    /// container**, or `None` when no container is started (we only surface
+    /// git for a live container, never the host bind-mount, so branch and
+    /// the explorer's git status always come from the same filesystem).
+    /// Refreshed by [`crate::app::App::refresh_agent_branch`].
+    pub git_branch: Option<String>,
     /// Slash commands advertised by the agent via ACP's
     /// `available_commands_update` notification. Empty until the agent
     /// publishes a list. The agent may replace the list at any time.
     pub available_commands: Vec<AvailableCommand>,
 }
-
-const GIT_BRANCH_TTL: Duration = Duration::from_secs(2);
 
 impl Agent {
     pub fn new(id: impl Into<AgentId>, name: impl Into<String>) -> Self {
@@ -118,7 +116,7 @@ impl Agent {
             task_handle: None,
             session_id: None,
             last_effective_top: Cell::new(0),
-            git_branch_cache: RefCell::new(None),
+            git_branch: None,
             available_commands: Vec::new(),
         }
     }
@@ -130,7 +128,6 @@ impl Agent {
 
     pub fn with_workspace(mut self, path: impl Into<PathBuf>) -> Self {
         self.workspace_folder = Some(path.into());
-        self.git_branch_cache.replace(None);
         self
     }
 
@@ -142,23 +139,6 @@ impl Agent {
     /// runtime handles exec via the container ID.
     pub fn effective_acp_command(&self) -> String {
         self.acp_command.clone()
-    }
-
-    /// Current git branch of [`workspace_folder`], if any. Cached for
-    /// [`GIT_BRANCH_TTL`] so renders don't hit the filesystem on every
-    /// frame; the value still updates promptly if the user checks out
-    /// another branch from outside the TUI.
-    pub fn git_branch(&self) -> Option<String> {
-        let workspace = self.workspace_folder.as_ref()?;
-        let now = Instant::now();
-        if let Some((at, value)) = self.git_branch_cache.borrow().as_ref()
-            && now.duration_since(*at) < GIT_BRANCH_TTL
-        {
-            return value.clone();
-        }
-        let value = fleet_commander_core::git::current_branch(workspace);
-        self.git_branch_cache.replace(Some((now, value.clone())));
-        value
     }
 
     /// Append an informational line.

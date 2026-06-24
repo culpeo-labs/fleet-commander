@@ -93,6 +93,16 @@ pub enum AppEvent {
         full_path: std::path::PathBuf,
         result: std::result::Result<String, String>,
     },
+    /// A background fetch of an agent's in-container git branch finished.
+    /// `branch` is `None` when the workspace isn't a git tree (or the read
+    /// failed). The app stores it on the agent so the header/list reflect the
+    /// container's branch — the same filesystem the explorer's git status
+    /// comes from.
+    AgentBranchReady {
+        agent_id: AgentId,
+        container_id: String,
+        branch: Option<String>,
+    },
     /// Nudge from a per-handle tracker task to redraw because one of its
     /// handles' `watch` channels ticked. Carries no state — the renderer
     /// reads the handle directly. (The redraw itself is performed by the

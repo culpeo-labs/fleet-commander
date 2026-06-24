@@ -30,7 +30,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, agents: &[Agent], selected: usi
                     Style::default().fg(status_color(&agent.status)),
                 ),
             ];
-            if let Some(branch) = agent.git_branch() {
+            if let Some(branch) = &agent.git_branch {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
                     format!("⎇ {branch}"),
@@ -85,16 +85,12 @@ mod tests {
         use crate::config::Config;
         use tokio::sync::mpsc;
 
-        let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join(".git").join("HEAD");
-        std::fs::create_dir_all(head.parent().unwrap()).unwrap();
-        std::fs::write(head, "ref: refs/heads/topic/widgets\n").unwrap();
-
         let (tx, _rx) = mpsc::unbounded_channel();
-        let agents = vec![
-            Agent::new("a1", "First").with_workspace(tmp.path()),
-            Agent::new("a2", "Second"),
-        ];
+        let mut first = Agent::new("a1", "First");
+        // Branch reflects the container, set directly rather than read from a
+        // host workspace.
+        first.git_branch = Some("topic/widgets".into());
+        let agents = vec![first, Agent::new("a2", "Second")];
         let app = App::new(Config::default(), agents, tx);
         let text = render_to_string(&app, 80, 12);
         assert!(
