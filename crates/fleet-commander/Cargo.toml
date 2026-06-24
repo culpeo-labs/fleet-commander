@@ -7,10 +7,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# Distributed as a prebuilt binary via GitHub Releases (see release workflow),
+# not crates.io. Sampo still versions, changelogs, tags, and releases it.
+publish = false
 
 [[bin]]
 name = "fleet-commander"
 path = "src/main.rs"
+
+[features]
+# Release-only: bake the static-musl `fleet-agent` binaries (built first by
+# CI for each arch) into the commander so they ship in lockstep with the
+# protocol version. `build.rs` reads FLEET_AGENT_X86_64 / FLEET_AGENT_AARCH64.
+# Off by default so a plain `cargo build` needs no musl toolchains.
+embed-agent = []
 
 [dependencies]
 fleet-commander-core = { path = "../fleet-commander-core" }

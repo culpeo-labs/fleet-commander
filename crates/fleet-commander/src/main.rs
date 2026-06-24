@@ -22,6 +22,7 @@ mod change_source;
 mod cli;
 mod completion;
 mod config;
+mod embedded_agent;
 mod event;
 mod explorer;
 mod init;
@@ -84,6 +85,9 @@ fn init_logging() {
 async fn run_tui(acp_log_path: Option<PathBuf>, acp_log_filter: Option<String>) -> Result<()> {
     let config = load_config_or_default();
     install_panic_hook();
+    // Write any embedded (release-bundled) fleet-agent binaries to disk so the
+    // container mount + launcher can pick the right arch. No-op otherwise.
+    embedded_agent::install_embedded_agents();
     let mut terminal = setup_terminal()?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();

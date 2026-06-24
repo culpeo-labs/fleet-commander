@@ -54,11 +54,47 @@ Inspired by [Norton Commander](https://en.wikipedia.org/wiki/Norton_Commander).
 
 ### Install
 
+#### Developer build (default)
+
 ```bash
 git clone https://github.com/culpeo-labs/fleet-commander.git
 cd fleet-commander
 cargo install --path crates/fleet-commander
 ```
+
+This is the contributor/dev path: it needs no extra cross-toolchains. It
+does **not** bundle the in-container file/git daemon (`fleet-agent`), so the
+explorer reflects the **host** filesystem (`LocalFs`) rather than the
+container's. For local, same-host Docker that's usually fine. To build the
+daemon for your host and have the explorer track the container instead, run
+`scripts/build-fleet-agent.sh` and point `FLEET_AGENT_BIN` at the result.
+
+#### Release build (embedded agent)
+
+Real installs ship the `fleet-agent` daemon **inside** the commander so its
+protocol version can never skew from the client, and so the explorer reflects
+the container's filesystem out of the box — including across architectures
+(`x86_64` / `aarch64`) and under emulation. This is what the `embed-agent`
+feature does.
+
+The simplest way to get an embedded build is to download the artifact from the
+[Release workflow](.github/workflows/release.yml) (CI builds both static-musl
+agents and bakes them in). To produce one yourself:
+
+```bash
+cargo install cargo-zigbuild
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+cargo zigbuild --release -p fleet-agent --target x86_64-unknown-linux-musl
+cargo zigbuild --release -p fleet-agent --target aarch64-unknown-linux-musl
+
+FLEET_AGENT_X86_64=target/x86_64-unknown-linux-musl/release/fleet-agent \
+FLEET_AGENT_AARCH64=target/aarch64-unknown-linux-musl/release/fleet-agent \
+cargo install --path crates/fleet-commander --features embed-agent
+```
+
+On first run the commander writes the embedded binaries to its data dir; the
+container mount + a `uname -m` launcher pick the right arch at exec time.
 
 ### Initialize a workspace
 
@@ -224,6 +260,46 @@ RUST_LOG=debug cargo run -p fleet-commander
 
 CI runs `check`, `test`, `clippy`, and `fmt` against the entire workspace
 on every push and PR — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+### Releasing
+
+Releases are automated with [Sampo](https://github.com/bruits/sampo) using
+**explicit changesets** (Changeset-style markdown files — no conventional
+commits required).
+
+When your change is user-facing, add a changeset to your PR:
+
+```bash
+cargo install sampo   # or: npm i -g sampo
+sampo add             # pick a bump level + describe the change
+```
+
+This writes a markdown file under `.sampo/changesets/`, e.g.:
+
+```markdown
+---
+cargo/fleet-commander: minor
+---
+
+A user-facing description of what changed.
+```
+
+Only `cargo/fleet-commander` is releasable — the other crates are internal and
+share the workspace version, so changesets always target the commander.
+
+On merge to `main`, the [release workflow](.github/workflows/release.yml) runs
+Sampo in `auto` mode: it opens a **Release PR** that bumps the workspace version
+and updates `crates/fleet-commander/CHANGELOG.md`. Merging that PR tags the
+commit, creates a GitHub Release, and attaches the embedded-agent commander
+binary — no crates.io publishing (`fleet-commander` is `publish = false`).
+
+> Repo setup: install your org's GitHub App on this repo with **contents:
+> write** + **pull-requests: write**, and expose its credentials as the
+> `RELEASE_APP_ID` / `RELEASE_APP_PRIVATE_KEY` secrets. The workflow mints an
+> installation token from the App (via `actions/create-github-app-token`) so
+> the Release PR triggers CI and is mergeable under branch protection. Sampo
+> builds, tags, releases, and uploads the asset in a single workflow — no PAT
+> or downstream tag workflow needed.
 
 ## License
 

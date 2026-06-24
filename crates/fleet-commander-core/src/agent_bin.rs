@@ -126,6 +126,39 @@ pub fn ensure_launcher_script() -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Install an embedded agent binary (shipped inside the commander via the
+/// `embed-agent` build feature) into [`host_bin_dir`] as `fleet-agent-<slug>`,
+/// returning its host path.
+///
+/// Idempotent: if an identical file already exists it's left untouched.
+/// Otherwise the bytes are written to a temp file and atomically renamed over
+/// the destination, so a container currently `exec`ing the old inode keeps
+/// running (and we avoid `ETXTBSY` on the bind-mounted binary).
+pub fn install_embedded_binary(slug: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let dir =
+        host_bin_dir().ok_or_else(|| std::io::Error::other("no host data dir for agent binary"))?;
+    install_embedded_binary_in(&dir, slug, bytes)
+}
+
+/// [`install_embedded_binary`] against an explicit directory (testable).
+fn install_embedded_binary_in(dir: &Path, slug: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let dest = dir.join(format!("fleet-agent-{slug}"));
+    if let Ok(existing) = std::fs::read(&dest)
+        && existing == bytes
+    {
+        return Ok(dest);
+    }
+    let tmp = dir.join(format!(".fleet-agent-{slug}.tmp"));
+    std::fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(&tmp, &dest)?;
+    Ok(dest)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +209,30 @@ mod tests {
     fn host_arch_slug_is_some_on_supported_targets() {
         // CI runs on x86_64/aarch64, both of which we ship.
         assert!(host_arch_slug().is_some());
+    }
+
+    #[test]
+    fn install_embedded_binary_writes_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = install_embedded_binary_in(dir.path(), "x86_64", b"BINARY").unwrap();
+        assert_eq!(path, dir.path().join("fleet-agent-x86_64"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"BINARY");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        // Re-installing identical bytes is a no-op that still returns the path.
+        let again = install_embedded_binary_in(dir.path(), "x86_64", b"BINARY").unwrap();
+        assert_eq!(again, path);
+        // New bytes replace the file.
+        install_embedded_binary_in(dir.path(), "x86_64", b"NEWER").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"NEWER");
+        // No temp file is left behind.
+        assert!(!dir.path().join(".fleet-agent-x86_64.tmp").exists());
     }
 
     #[test]

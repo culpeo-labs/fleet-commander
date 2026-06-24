@@ -1,0 +1,84 @@
+name: Release
+
+# Changeset-driven release automation via Sampo (https://github.com/bruits/sampo).
+#
+# On every push to main, Sampo runs in `auto` mode:
+#   - If unreleased changesets exist, it opens/refreshes a "Release" PR that
+#     bumps the workspace version and updates the changelog.
+#   - When that PR is merged, this run instead tags the commit and creates a
+#     GitHub Release, attaching the embedded-agent commander binary built below.
+#
+# Because Sampo builds, tags, releases, and uploads assets in this single
+# workflow, no downstream tag-triggered workflow is needed. We authenticate as
+# the org GitHub App (not the default GITHUB_TOKEN) so the Release PR triggers
+# CI and is mergeable under branch protection, and so its commits are attributed
+# to the app. `fleet-commander` is `publish = false`, so nothing hits crates.io.
+#
+# Requires: the App installed on this repo with `contents: write` +
+# `pull-requests: write`, and its credentials available as the secrets below
+# (set RELEASE_APP_ID / RELEASE_APP_PRIVATE_KEY as org or repo secrets).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # create tags + releases, upload assets
+  pull-requests: write # open/update the release PR
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Sampo release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # full history for changelog links + acknowledgments
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+
+      # cargo-zigbuild is the most reliable way to cross-compile static-musl
+      # binaries for both arches from a single x86_64 runner.
+      - name: Install zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild
+
+      # Built unconditionally so the asset is ready when the release PR merge is
+      # the push being processed. On non-release pushes the binary is unused.
+      - name: Build fleet-agent (static musl, both arches)
+        run: |
+          cargo zigbuild --release --locked -p fleet-agent --target x86_64-unknown-linux-musl
+          cargo zigbuild --release --locked -p fleet-agent --target aarch64-unknown-linux-musl
+
+      - name: Build commander with embedded agents
+        env:
+          FLEET_AGENT_X86_64: target/x86_64-unknown-linux-musl/release/fleet-agent
+          FLEET_AGENT_AARCH64: target/aarch64-unknown-linux-musl/release/fleet-agent
+        run: cargo build --release --locked -p fleet-commander --features embed-agent
+
+      - name: Mint a token from the org GitHub App
+        uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Sampo (prepare release PR / publish)
+        uses: bruits/sampo/crates/sampo-github-action@main
+        with:
+          command: auto
+          github-token: ${{ steps.app-token.outputs.token }}
+          create-github-release: true
+          release-assets: |
+            target/release/fleet-commander => fleet-commander-{{tag}}-x86_64-linux
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
