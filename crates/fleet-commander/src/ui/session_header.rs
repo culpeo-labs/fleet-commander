@@ -14,7 +14,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, agent: Option<&Agent>, agent_id
     let title = agent
         .map(|a| {
             let branch = a
-                .git_branch()
+                .git_branch
+                .as_ref()
                 .map(|b| format!(" ⎇ {b} "))
                 .unwrap_or_default();
             format!(" {} [{}]{branch} ", a.name, a.status.label())
@@ -67,7 +68,9 @@ mod tests {
     #[test]
     fn shows_git_branch() {
         let tmp = make_repo("main");
-        let app = app_in_session(Some(tmp.path()));
+        let mut app = app_in_session(Some(tmp.path()));
+        // Branch is sourced from the container, not the host workspace.
+        app.agents[0].git_branch = Some("main".into());
         let text = render_to_string(&app, 90, 20);
         assert!(text.contains("⎇ main"), "branch missing:\n{text}");
     }

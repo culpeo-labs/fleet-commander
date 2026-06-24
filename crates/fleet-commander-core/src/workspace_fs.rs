@@ -59,6 +59,13 @@ pub trait WorkspaceFs: Send + Sync + Debug {
         &self,
         include_ignored: bool,
     ) -> Result<HashMap<PathBuf, StatusKind>, StatusError>;
+
+    /// Whether this filesystem reaches a remote/container target (as
+    /// opposed to the host filesystem). Used by the UI to avoid
+    /// needlessly downgrading a container-backed view to the host one.
+    fn is_remote(&self) -> bool {
+        false
+    }
 }
 
 /// Backed by the local filesystem and the host's `git` binary.

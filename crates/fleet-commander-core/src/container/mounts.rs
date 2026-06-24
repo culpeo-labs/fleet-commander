@@ -9,6 +9,8 @@ use devcontainer_lib::devcontainer::variables::{
 };
 use devcontainer_lib::runtime::BindMount;
 
+use crate::agent_bin::CONTAINER_AGENT_PATH;
+
 /// Build the environment variables and bind mounts for a container,
 /// merging the base credential layer with the project's devcontainer config.
 pub(super) fn build_env_and_mounts(
@@ -46,6 +48,17 @@ pub(super) fn build_env_and_mounts(
         .collect();
 
     (env, mounts)
+}
+
+/// Build the read-only bind mount that injects the host-built `fleet-agent`
+/// binary into the container at [`CONTAINER_AGENT_PATH`], where it is launched
+/// over `docker exec` to serve the explorer's filesystem/git requests.
+pub(super) fn agent_bind_mount(host_bin: &Path) -> BindMount {
+    BindMount {
+        source: host_bin.to_path_buf(),
+        target: CONTAINER_AGENT_PATH.to_string(),
+        readonly: true,
+    }
 }
 
 /// Parse a mount string like "source=/a,target=/b,type=bind,readonly" into a BindMount.
@@ -96,5 +109,18 @@ mod tests {
     #[test]
     fn parse_mount_string_missing_source() {
         assert!(parse_mount_string("target=/b,type=bind").is_none());
+    }
+
+    #[test]
+    fn agent_bind_mount_is_readonly_at_fixed_target() {
+        let m = agent_bind_mount(Path::new(
+            "/home/u/.local/share/fleet-commander/bin/fleet-agent-x86_64",
+        ));
+        assert_eq!(
+            m.source,
+            PathBuf::from("/home/u/.local/share/fleet-commander/bin/fleet-agent-x86_64")
+        );
+        assert_eq!(m.target, CONTAINER_AGENT_PATH);
+        assert!(m.readonly);
     }
 }

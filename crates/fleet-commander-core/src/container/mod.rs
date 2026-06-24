@@ -32,7 +32,7 @@ pub struct ContainerConfig {
 }
 
 /// Result of starting a container.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ContainerInfo {
     pub container_id: String,
     pub workspace_folder: PathBuf,

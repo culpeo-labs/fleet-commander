@@ -62,6 +62,47 @@ pub enum AppEvent {
             String,
         >,
     },
+    /// A container-backed [`fleet_commander_core::workspace_fs::WorkspaceFs`]
+    /// finished connecting on a background thread (the `connect_docker`
+    /// handshake is blocking). The app installs it on the explorer if the
+    /// agent is still the one being viewed; otherwise it's dropped (which
+    /// tears down the underlying `docker exec` process).
+    ExplorerFsReady {
+        agent_id: AgentId,
+        /// The container the `fs` is bound to. Used to reject stale installs:
+        /// if the agent's current container has changed (e.g. a `:rebuild`
+        /// happened while this handshake was in flight) the fs is dropped.
+        container_id: String,
+        fs: std::sync::Arc<dyn fleet_commander_core::workspace_fs::WorkspaceFs>,
+    },
+    /// A background remote directory listing completed. The app installs
+    /// it into the explorer's cache if it still matches the active
+    /// workspace root. `result` is `Err` on a transport failure (the
+    /// in-flight marker is then cleared so it can be retried).
+    ExplorerDirReady {
+        root: std::path::PathBuf,
+        rel: std::path::PathBuf,
+        result: std::result::Result<Vec<fleet_commander_core::workspace_fs::DirEntry>, String>,
+    },
+    /// A background file read (for the explorer's side-pane preview)
+    /// completed. Opened in the side pane if the agent is still viewed
+    /// and the workspace root still matches.
+    ExplorerFileReady {
+        agent_id: AgentId,
+        root: std::path::PathBuf,
+        full_path: std::path::PathBuf,
+        result: std::result::Result<String, String>,
+    },
+    /// A background fetch of an agent's in-container git branch finished.
+    /// `branch` is `None` when the workspace isn't a git tree (or the read
+    /// failed). The app stores it on the agent so the header/list reflect the
+    /// container's branch — the same filesystem the explorer's git status
+    /// comes from.
+    AgentBranchReady {
+        agent_id: AgentId,
+        container_id: String,
+        branch: Option<String>,
+    },
     /// Nudge from a per-handle tracker task to redraw because one of its
     /// handles' `watch` channels ticked. Carries no state — the renderer
     /// reads the handle directly. (The redraw itself is performed by the

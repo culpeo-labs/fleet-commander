@@ -18,11 +18,12 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use fleet_commander_core::service_fs::ServiceFs;
 use fleet_commander_core::session::{MessageStatus, SessionEvent, ToolCallStatusKind};
-use fleet_commander_core::workspace_fs::LocalFs;
+use fleet_commander_core::workspace_fs::{LocalFs, WorkspaceFs};
 use fleet_commander_core::{agent_runtime, container};
 
-use crate::agent::{Agent, AgentId, AgentStatus, HistoryEntry};
+use crate::agent::{Agent, AgentId, AgentStatus, ContainerInfo, HistoryEntry};
 use crate::agent_kind::AgentKind;
 use crate::change_source::ChangeEvent;
 use crate::completion::{PathCompleter, split_command_and_path};
@@ -257,8 +258,175 @@ impl App {
                     self.request_explorer_refresh();
                 }
             }
+            AppEvent::ExplorerFsReady {
+                agent_id,
+                container_id,
+                fs,
+            } => {
+                // Install only if this agent is still the one on screen, the
+                // explorer is pointed at the same workspace root (the user may
+                // have navigated away while we connected), and the agent is
+                // still backed by the *same* container this fs was bound to.
+                // The container check rejects a stale install whose handshake
+                // raced a `:rebuild` (which swaps in a new container).
+                let same_root = self
+                    .explorer
+                    .fs
+                    .as_ref()
+                    .map(|cur| cur.root_display() == fs.root_display())
+                    .unwrap_or(false);
+                let same_container = self
+                    .agents
+                    .iter()
+                    .find(|a| a.id == agent_id)
+                    .and_then(|a| a.container.as_ref())
+                    .map(|c| c.container_id == container_id)
+                    .unwrap_or(false);
+                if self.viewed_agent_id().as_ref() == Some(&agent_id) && same_root && same_container
+                {
+                    self.explorer.set_fs(Some(fs));
+                    self.request_explorer_refresh();
+                }
+            }
+            AppEvent::ExplorerDirReady { root, rel, result } => {
+                let root_matches = self
+                    .explorer
+                    .fs
+                    .as_ref()
+                    .map(|fs| fs.root_display() == root)
+                    .unwrap_or(false);
+                if root_matches {
+                    self.explorer.apply_dir(rel, result);
+                }
+            }
+            AppEvent::ExplorerFileReady {
+                agent_id,
+                root,
+                full_path,
+                result,
+            } => {
+                let root_matches = self
+                    .explorer
+                    .fs
+                    .as_ref()
+                    .map(|fs| fs.root_display() == root)
+                    .unwrap_or(false);
+                if let Ok(content) = result
+                    && root_matches
+                    && self.viewed_agent_id().as_ref() == Some(&agent_id)
+                    && let Screen::AgentSession { side_pane, .. } = &mut self.screen
+                {
+                    *side_pane = Some(SidePane::FileView {
+                        path: full_path,
+                        content,
+                        scroll: 0,
+                    });
+                }
+            }
+            AppEvent::AgentBranchReady {
+                agent_id,
+                container_id,
+                branch,
+            } => {
+                // Only apply if the agent still has the same container the
+                // branch was read from (a `:rebuild` swaps containers and
+                // clears the branch; a stale read must not resurrect it).
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id)
+                    && agent
+                        .container
+                        .as_ref()
+                        .map(|c| c.container_id == container_id)
+                        .unwrap_or(false)
+                {
+                    agent.git_branch = branch;
+                }
+            }
             AppEvent::Session(event) => self.handle_session_event(event),
         }
+        self.sync_explorer();
+    }
+
+    /// The agent currently shown in the immersive session screen, if any.
+    fn viewed_agent_id(&self) -> Option<AgentId> {
+        match &self.screen {
+            Screen::AgentSession { agent_id, .. } => Some(agent_id.clone()),
+            _ => None,
+        }
+    }
+
+    /// Connect to the in-container `fleet-agent` on a background thread and,
+    /// once the (blocking) handshake completes, hand the resulting
+    /// [`ServiceFs`] back to the event loop via [`AppEvent::ExplorerFsReady`].
+    ///
+    /// On failure (no binary mounted, container gone, …) the explorer simply
+    /// stays on the host-side [`LocalFs`].
+    fn request_service_fs_upgrade(
+        &self,
+        agent_id: AgentId,
+        info: ContainerInfo,
+        workspace: PathBuf,
+    ) {
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let container_id = info.container_id.clone();
+            match ServiceFs::connect_docker(
+                workspace,
+                &info.remote_workspace_folder,
+                &info.container_id,
+                &info.remote_user,
+                fleet_commander_core::agent_bin::CONTAINER_AGENT_PATH,
+            ) {
+                Ok(fs) => {
+                    let _ = tx.send(AppEvent::ExplorerFsReady {
+                        agent_id,
+                        container_id,
+                        fs: Arc::new(fs) as Arc<dyn WorkspaceFs>,
+                    });
+                }
+                Err(e) => {
+                    info!(error = %e, "Container service unavailable; explorer stays on host filesystem");
+                }
+            }
+        });
+    }
+
+    /// Read the agent's git branch from inside its container on a background
+    /// thread (a one-shot `docker exec` via the same `fleet-agent` service the
+    /// explorer uses) and deliver it as [`AppEvent::AgentBranchReady`].
+    ///
+    /// No-op if the agent has no started container — we deliberately never read
+    /// the host bind-mount, so the header/list branch and the explorer's git
+    /// status always reflect the same (container) filesystem.
+    fn refresh_agent_branch(&self, agent_id: AgentId) {
+        let Some((info, workspace)) = self.agents.iter().find(|a| a.id == agent_id).and_then(|a| {
+            let info = a.container.clone()?;
+            let ws = a.workspace_folder.clone()?;
+            Some((info, ws))
+        }) else {
+            return;
+        };
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let container_id = info.container_id.clone();
+            let branch = match ServiceFs::connect_docker(
+                workspace,
+                &info.remote_workspace_folder,
+                &info.container_id,
+                &info.remote_user,
+                fleet_commander_core::agent_bin::CONTAINER_AGENT_PATH,
+            ) {
+                Ok(fs) => fs.git_branch(),
+                Err(e) => {
+                    info!(error = %e, "Branch fetch failed; container service unavailable");
+                    return;
+                }
+            };
+            let _ = tx.send(AppEvent::AgentBranchReady {
+                agent_id,
+                container_id,
+                branch,
+            });
+        });
     }
 
     fn handle_session_event(&mut self, event: SessionEvent) {
@@ -266,6 +434,36 @@ impl App {
             SessionEvent::Output { agent_id, line } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.info(line);
+                }
+            }
+            SessionEvent::ContainerReady {
+                agent_id,
+                container_id,
+                remote_user,
+                remote_workspace_folder,
+            } => {
+                let info = ContainerInfo {
+                    container_id,
+                    workspace_folder: PathBuf::new(),
+                    remote_workspace_folder,
+                    remote_user,
+                };
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    agent.container = Some(info.clone());
+                }
+                // Fetch the branch from inside the new container (covers both
+                // the viewed agent's header and any other agent's list row).
+                self.refresh_agent_branch(agent_id.clone());
+                // If this agent's explorer is on screen, upgrade it from the
+                // host filesystem to the in-container service.
+                if self.viewed_agent_id().as_ref() == Some(&agent_id)
+                    && let Some(ws) = self
+                        .agents
+                        .iter()
+                        .find(|a| a.id == agent_id)
+                        .and_then(|a| a.workspace_folder.clone())
+                {
+                    self.request_service_fs_upgrade(agent_id, info, ws);
                 }
             }
             SessionEvent::Exited { agent_id, .. } => {
@@ -553,7 +751,13 @@ impl App {
                 && !key.modifiers.contains(KeyModifiers::CONTROL)
             {
                 match c {
-                    'r' => self.request_explorer_refresh(),
+                    'r' => {
+                        // Manual refresh: also drop the remote directory
+                        // cache so the tree re-lists (picking up files
+                        // created/removed inside the container).
+                        self.explorer.invalidate_dirs();
+                        self.request_explorer_refresh();
+                    }
                     '.' => {
                         self.explorer.show_ignored = !self.explorer.show_ignored;
                         // Re-query because the include_ignored flag changes
@@ -627,6 +831,63 @@ impl App {
         }
     }
 
+    /// Keep the explorer's remote view consistent after any event:
+    /// schedule background fetches for directories the current tree
+    /// needs but hasn't cached, and service a pending file-open. Cheap
+    /// no-op for a closed explorer or a local (synchronous) filesystem.
+    fn sync_explorer(&mut self) {
+        if !self.explorer.open {
+            return;
+        }
+        if let Some(rel) = self.explorer.pending_open.take() {
+            self.open_explorer_file(rel);
+        }
+        let Some(fs) = self.explorer.fs.clone() else {
+            return;
+        };
+        if !fs.is_remote() {
+            return;
+        }
+        let root = fs.root_display().to_path_buf();
+        for rel in self.explorer.missing_dirs() {
+            self.explorer.mark_dir_loading(rel.clone());
+            let fs = fs.clone();
+            let root = root.clone();
+            let tx = self.tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let result = fs.list_dir(&rel).map_err(|e| e.to_string());
+                let _ = tx.send(AppEvent::ExplorerDirReady { root, rel, result });
+            });
+        }
+    }
+
+    /// Read a file for the explorer's side-pane preview off the UI
+    /// thread (the read may be a remote RPC) and deliver it as
+    /// [`AppEvent::ExplorerFileReady`].
+    fn open_explorer_file(&self, rel: PathBuf) {
+        let Some(fs) = self.explorer.fs.clone() else {
+            return;
+        };
+        let Some(agent_id) = self.viewed_agent_id() else {
+            return;
+        };
+        let root = fs.root_display().to_path_buf();
+        let full_path = root.join(&rel);
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = fs
+                .read_file(&rel)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::ExplorerFileReady {
+                agent_id,
+                root,
+                full_path,
+                result,
+            });
+        });
+    }
+
     /// Spawn a background `git status` for the active workspace and
     /// pump the result back into the event loop as
     /// [`AppEvent::ExplorerStatusReady`]. Coalesces bursty callers:
@@ -671,16 +932,30 @@ impl App {
         // when the agent is already connected, so the explorer always reflects
         // the currently-viewed agent.
         if let Some(agent) = self.agents.iter().find(|a| a.id == agent_id) {
-            let fs = agent.workspace_folder.as_ref().map(|ws| {
-                Arc::new(LocalFs::new(ws))
-                    as Arc<dyn fleet_commander_core::workspace_fs::WorkspaceFs>
-            });
-            let had_fs = self.explorer.fs.is_some();
-            self.explorer.set_fs(fs);
-            // Refresh status when the workspace is set for the first time
-            // (or when switching to a new agent's workspace cleared state).
-            if self.explorer.fs.is_some() && (!had_fs || self.explorer.status.is_empty()) {
-                self.request_explorer_refresh();
+            let ws = agent.workspace_folder.clone();
+            let container = agent.container.clone();
+            let local = ws
+                .as_ref()
+                .map(|w| Arc::new(LocalFs::new(w)) as Arc<dyn WorkspaceFs>);
+            // If the explorer already shows a container-backed fs for this
+            // same root, don't downgrade it to LocalFs (and don't re-spawn
+            // the upgrade) on a repeat entry into the session screen.
+            let already_remote = match (&self.explorer.fs, &local) {
+                (Some(cur), Some(l)) => cur.is_remote() && cur.root_display() == l.root_display(),
+                _ => false,
+            };
+            if !already_remote {
+                let had_fs = self.explorer.fs.is_some();
+                self.explorer.set_fs(local);
+                // Refresh status when the workspace is set for the first time
+                // (or when switching to a new agent's workspace cleared state).
+                if self.explorer.fs.is_some() && (!had_fs || self.explorer.status.is_empty()) {
+                    self.request_explorer_refresh();
+                }
+                // Upgrade to the in-container service if the container is up.
+                if let (Some(info), Some(w)) = (container, ws) {
+                    self.request_service_fs_upgrade(agent_id.clone(), info, w);
+                }
             }
         }
         let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) else {
@@ -941,6 +1216,18 @@ impl App {
 
         self.agents.retain(|a| a.id != agent_id);
 
+        // Drop any container-backed explorer fs so its `docker exec` child is
+        // torn down rather than leaked once we leave the session screen.
+        if self
+            .explorer
+            .fs
+            .as_ref()
+            .map(|f| f.is_remote())
+            .unwrap_or(false)
+        {
+            self.explorer.set_fs(None);
+        }
+
         // Persist removal.
         if let Err(err) = workspace::save(&workspace::from_agents(&self.agents)) {
             self.status_message = Some(format!("Warning: {err}"));
@@ -987,7 +1274,30 @@ impl App {
         agent.prompt_tx = None;
         agent.status = AgentStatus::Stopped;
         agent.session_id = None;
+        // The container is about to be removed, so the in-container service
+        // (and any ServiceFs bound to it) is no longer valid. Clearing this
+        // also makes a stale in-flight `ExplorerFsReady` install fail the
+        // container-id check once the new container comes up.
+        agent.container = None;
+        // The branch came from that container; drop it until the rebuilt
+        // container reports a fresh one (no host fallback).
+        agent.git_branch = None;
         agent.info("🔄 Rebuilding container...");
+
+        // Downgrade the explorer off the soon-to-be-dead container's service
+        // back to the host filesystem (dropping the old `docker exec` child),
+        // if this agent's explorer is the one on screen.
+        if self.viewed_agent_id().as_ref() == Some(&agent_id)
+            && self
+                .explorer
+                .fs
+                .as_ref()
+                .map(|f| f.is_remote())
+                .unwrap_or(false)
+        {
+            let local = Some(Arc::new(LocalFs::new(&workspace)) as Arc<dyn WorkspaceFs>);
+            self.explorer.set_fs(local);
+        }
 
         // Regenerate base layer with latest mount config.
         if let Err(err) = init::generate_workspace_layer(&workspace, AgentKind::Copilot) {
@@ -1267,16 +1577,10 @@ fn handle_explorer_action(
             if let Some(entry) = explorer.selected_entry() {
                 if entry.is_dir {
                     explorer.toggle_selected_dir();
-                } else if let Some(fs) = explorer.fs.clone()
-                    && let Ok(bytes) = fs.read_file(&entry.path)
-                {
-                    let content = String::from_utf8_lossy(&bytes).into_owned();
-                    let full = fs.root_display().join(&entry.path);
-                    *side_pane = Some(SidePane::FileView {
-                        path: full,
-                        content,
-                        scroll: 0,
-                    });
+                } else {
+                    // Defer the (possibly remote) read to the app, which
+                    // runs it off the UI thread. See `App::sync_explorer`.
+                    explorer.pending_open = Some(entry.path);
                 }
             }
             // Touch agents/agent_id to keep the signature usable for future
@@ -2243,5 +2547,215 @@ mod tests {
         // Typing into the argument doesn't reopen.
         type_str(&mut app, "gpt-5");
         assert!(app.slash_matches_for("a1").is_none());
+    }
+
+    /// A minimal remote [`WorkspaceFs`] double for the explorer-upgrade tests.
+    #[derive(Debug)]
+    struct FakeRemoteFs {
+        root: PathBuf,
+    }
+
+    impl WorkspaceFs for FakeRemoteFs {
+        fn root_display(&self) -> &std::path::Path {
+            &self.root
+        }
+        fn list_dir(
+            &self,
+            _rel: &std::path::Path,
+        ) -> std::io::Result<Vec<fleet_commander_core::workspace_fs::DirEntry>> {
+            Ok(Vec::new())
+        }
+        fn read_file(&self, _rel: &std::path::Path) -> std::io::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn git_branch(&self) -> Option<String> {
+            None
+        }
+        fn git_status(
+            &self,
+            _include_ignored: bool,
+        ) -> Result<
+            std::collections::HashMap<PathBuf, fleet_commander_core::git::StatusKind>,
+            fleet_commander_core::git::StatusError,
+        > {
+            Ok(std::collections::HashMap::new())
+        }
+        fn is_remote(&self) -> bool {
+            true
+        }
+    }
+
+    fn app_with_container_agent(ws: &str) -> App {
+        let agent = Agent::new("a1", "First").with_workspace(PathBuf::from(ws));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        App::new(Config::default(), vec![agent], tx)
+    }
+
+    #[tokio::test]
+    async fn container_ready_stores_info_on_agent() {
+        let mut app = app_with_container_agent("/ws/repo");
+        app.handle(AppEvent::Session(SessionEvent::ContainerReady {
+            agent_id: "a1".into(),
+            container_id: "cid".into(),
+            remote_user: "vscode".into(),
+            remote_workspace_folder: "/workspaces/repo".into(),
+        }));
+        let agent = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        let info = agent.container.as_ref().expect("container info stored");
+        assert_eq!(info.container_id, "cid");
+        assert_eq!(info.remote_user, "vscode");
+        assert_eq!(info.remote_workspace_folder, "/workspaces/repo");
+    }
+
+    #[tokio::test]
+    async fn explorer_fs_ready_upgrades_viewed_agent_to_remote() {
+        let mut app = app_with_container_agent("/ws/repo");
+        // Enter the session so the explorer is on screen and points at the
+        // host LocalFs for /ws/repo.
+        app.handle(press(KeyCode::Enter));
+        app.explorer.open = true;
+        assert!(!app.explorer.fs.as_ref().unwrap().is_remote());
+
+        // The container comes up; the agent records its id.
+        app.handle(AppEvent::Session(SessionEvent::ContainerReady {
+            agent_id: "a1".into(),
+            container_id: "cid".into(),
+            remote_user: "vscode".into(),
+            remote_workspace_folder: "/workspaces/repo".into(),
+        }));
+
+        // The background connect lands with a remote fs for the same root and
+        // the same container.
+        app.handle(AppEvent::ExplorerFsReady {
+            agent_id: "a1".into(),
+            container_id: "cid".into(),
+            fs: Arc::new(FakeRemoteFs {
+                root: PathBuf::from("/ws/repo"),
+            }) as Arc<dyn WorkspaceFs>,
+        });
+        assert!(
+            app.explorer.fs.as_ref().unwrap().is_remote(),
+            "explorer should now be backed by the container service"
+        );
+    }
+
+    #[test]
+    fn explorer_fs_ready_ignored_for_different_root() {
+        let mut app = app_with_container_agent("/ws/repo");
+        app.handle(press(KeyCode::Enter));
+        app.explorer.open = true;
+
+        // A stale upgrade for a different workspace must not clobber the view.
+        app.handle(AppEvent::ExplorerFsReady {
+            agent_id: "a1".into(),
+            container_id: "cid".into(),
+            fs: Arc::new(FakeRemoteFs {
+                root: PathBuf::from("/ws/other"),
+            }) as Arc<dyn WorkspaceFs>,
+        });
+        assert!(!app.explorer.fs.as_ref().unwrap().is_remote());
+    }
+
+    #[tokio::test]
+    async fn explorer_fs_ready_rejected_for_stale_container() {
+        let mut app = app_with_container_agent("/ws/repo");
+        app.handle(press(KeyCode::Enter));
+        app.explorer.open = true;
+
+        // Agent is currently backed by container "new".
+        app.handle(AppEvent::Session(SessionEvent::ContainerReady {
+            agent_id: "a1".into(),
+            container_id: "new".into(),
+            remote_user: "vscode".into(),
+            remote_workspace_folder: "/workspaces/repo".into(),
+        }));
+
+        // A handshake that started against the OLD container finally lands.
+        // It must be dropped, not installed, to avoid binding the explorer to
+        // a dead container.
+        app.handle(AppEvent::ExplorerFsReady {
+            agent_id: "a1".into(),
+            container_id: "old".into(),
+            fs: Arc::new(FakeRemoteFs {
+                root: PathBuf::from("/ws/repo"),
+            }) as Arc<dyn WorkspaceFs>,
+        });
+        assert!(
+            !app.explorer.fs.as_ref().unwrap().is_remote(),
+            "a fs bound to a stale container must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_branch_ready_applies_for_matching_container() {
+        let mut app = app_with_container_agent("/ws/repo");
+        app.handle(AppEvent::Session(SessionEvent::ContainerReady {
+            agent_id: "a1".into(),
+            container_id: "cid".into(),
+            remote_user: "vscode".into(),
+            remote_workspace_folder: "/workspaces/repo".into(),
+        }));
+        app.handle(AppEvent::AgentBranchReady {
+            agent_id: "a1".into(),
+            container_id: "cid".into(),
+            branch: Some("feat/x".into()),
+        });
+        let agent = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        assert_eq!(agent.git_branch.as_deref(), Some("feat/x"));
+    }
+
+    #[tokio::test]
+    async fn agent_branch_ready_rejected_for_stale_container() {
+        let mut app = app_with_container_agent("/ws/repo");
+        app.handle(AppEvent::Session(SessionEvent::ContainerReady {
+            agent_id: "a1".into(),
+            container_id: "new".into(),
+            remote_user: "vscode".into(),
+            remote_workspace_folder: "/workspaces/repo".into(),
+        }));
+        // A branch read from the OLD container must not be applied.
+        app.handle(AppEvent::AgentBranchReady {
+            agent_id: "a1".into(),
+            container_id: "old".into(),
+            branch: Some("stale".into()),
+        });
+        let agent = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        assert_eq!(agent.git_branch, None);
+    }
+
+    #[tokio::test]
+    async fn rebuild_downgrades_explorer_off_remote_fs() {
+        let mut app = app_with_container_agent("/ws/repo");
+        app.handle(press(KeyCode::Enter));
+        app.explorer.open = true;
+
+        // Bring the container up and install a remote fs for it.
+        app.handle(AppEvent::Session(SessionEvent::ContainerReady {
+            agent_id: "a1".into(),
+            container_id: "cid".into(),
+            remote_user: "vscode".into(),
+            remote_workspace_folder: "/workspaces/repo".into(),
+        }));
+        app.handle(AppEvent::ExplorerFsReady {
+            agent_id: "a1".into(),
+            container_id: "cid".into(),
+            fs: Arc::new(FakeRemoteFs {
+                root: PathBuf::from("/ws/repo"),
+            }) as Arc<dyn WorkspaceFs>,
+        });
+        assert!(app.explorer.fs.as_ref().unwrap().is_remote());
+
+        // Rebuilding clears the container and drops the remote fs back to the
+        // host filesystem.
+        app.rebuild_current_container();
+        assert!(
+            !app.explorer.fs.as_ref().unwrap().is_remote(),
+            "rebuild must downgrade the explorer off the dead container"
+        );
+        let agent = app.agents.iter().find(|a| a.id == "a1").unwrap();
+        assert!(
+            agent.container.is_none(),
+            "rebuild must clear the agent's container handle"
+        );
     }
 }

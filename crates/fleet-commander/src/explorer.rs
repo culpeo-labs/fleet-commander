@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fleet_commander_core::git::StatusKind;
-use fleet_commander_core::workspace_fs::WorkspaceFs;
+use fleet_commander_core::workspace_fs::{DirEntry, WorkspaceFs};
 
 /// One visible entry in the rendered tree, after applying the
 /// expansion state.
@@ -65,6 +65,19 @@ pub struct ExplorerState {
     /// Last error from a status fetch, surfaced once via the status
     /// bar.
     pub last_error: Option<String>,
+    /// Cached directory listings (`rel -> children`) for **remote**
+    /// filesystems, where `list_dir` is a blocking RPC that must never
+    /// run on the render path. Populated by background loads delivered
+    /// as `AppEvent::ExplorerDirReady`. Unused for `LocalFs`, which is
+    /// cheap enough to list synchronously during the walk.
+    dir_cache: HashMap<PathBuf, Vec<DirEntry>>,
+    /// Directories with a background listing in flight, so the app
+    /// doesn't enqueue duplicate fetches for the same path.
+    dir_loading: HashSet<PathBuf>,
+    /// A file the user activated (Enter) that should be opened in the
+    /// side pane. Read (and cleared) by the app, which performs the
+    /// actual — possibly remote, hence backgrounded — read.
+    pub pending_open: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for ExplorerState {
@@ -100,7 +113,53 @@ impl ExplorerState {
         self.expanded.clear();
         self.status.clear();
         self.dir_status.clear();
+        self.dir_cache.clear();
+        self.dir_loading.clear();
+        self.pending_open = None;
         self.last_error = None;
+    }
+
+    /// Drop cached directory listings so a remote tree is re-fetched
+    /// from scratch (e.g. on a manual refresh, when files may have been
+    /// created/deleted inside the container). Expansion/selection state
+    /// is preserved.
+    pub fn invalidate_dirs(&mut self) {
+        self.dir_cache.clear();
+        self.dir_loading.clear();
+    }
+
+    /// Directories that the current view needs but that aren't cached
+    /// yet (and aren't already being fetched). Only meaningful for a
+    /// remote filesystem; empty otherwise. The app turns each into a
+    /// background `list_dir` and feeds the result back via
+    /// [`Self::apply_dir`].
+    pub fn missing_dirs(&self) -> Vec<PathBuf> {
+        let Some(fs) = &self.fs else {
+            return Vec::new();
+        };
+        if !fs.is_remote() {
+            return Vec::new();
+        }
+        let mut missing = Vec::new();
+        collect_missing_dirs(self, Path::new(""), &mut missing);
+        missing
+            .into_iter()
+            .filter(|p| !self.dir_loading.contains(p))
+            .collect()
+    }
+
+    /// Mark a directory as having a background listing in flight.
+    pub fn mark_dir_loading(&mut self, rel: PathBuf) {
+        self.dir_loading.insert(rel);
+    }
+
+    /// Install a freshly-fetched directory listing into the cache (or,
+    /// on error, just clear the in-flight marker so it can be retried).
+    pub fn apply_dir(&mut self, rel: PathBuf, result: Result<Vec<DirEntry>, String>) {
+        self.dir_loading.remove(&rel);
+        if let Ok(entries) = result {
+            self.dir_cache.insert(rel, entries);
+        }
     }
 
     /// Re-read git status via the workspace FS *synchronously*. Sets
@@ -188,19 +247,22 @@ impl ExplorerState {
     }
 }
 
-/// Recursive directory walker honouring `expanded`. Directories
-/// first (alphabetical, case-insensitive) then files. Children of a
-/// non-expanded directory are not listed.
-fn walk_dir(
+/// Sorted, filtered children of `rel` for the walk, or `None` when the
+/// listing isn't available yet.
+///
+/// For a remote filesystem the listing comes from [`ExplorerState::dir_cache`]
+/// (a miss returns `None`, signalling the caller to schedule a background
+/// fetch rather than block the render path). For a local filesystem it's a
+/// cheap synchronous `list_dir`.
+fn children_of(
+    state: &ExplorerState,
     fs: &dyn WorkspaceFs,
     rel: &Path,
-    depth: usize,
-    state: &ExplorerState,
-    out: &mut Vec<EntryRow>,
-) {
-    let read = match fs.list_dir(rel) {
-        Ok(v) => v,
-        Err(_) => return,
+) -> Option<Vec<(PathBuf, String, bool)>> {
+    let read: Vec<DirEntry> = if fs.is_remote() {
+        state.dir_cache.get(rel)?.clone()
+    } else {
+        fs.list_dir(rel).ok()?
     };
 
     let mut children: Vec<(PathBuf, String, bool)> = Vec::new();
@@ -226,6 +288,24 @@ fn walk_dir(
         (false, true) => std::cmp::Ordering::Greater,
         _ => a.1.to_lowercase().cmp(&b.1.to_lowercase()),
     });
+    Some(children)
+}
+
+/// Recursive directory walker honouring `expanded`. Directories
+/// first (alphabetical, case-insensitive) then files. Children of a
+/// non-expanded directory are not listed. A remote directory that
+/// isn't cached yet contributes no rows (its fetch is scheduled
+/// separately via [`ExplorerState::missing_dirs`]).
+fn walk_dir(
+    fs: &dyn WorkspaceFs,
+    rel: &Path,
+    depth: usize,
+    state: &ExplorerState,
+    out: &mut Vec<EntryRow>,
+) {
+    let Some(children) = children_of(state, fs, rel) else {
+        return;
+    };
 
     for (child_rel, name, is_dir) in children {
         let expanded = is_dir && state.expanded.contains(&child_rel);
@@ -240,6 +320,30 @@ fn walk_dir(
         });
         if expanded {
             walk_dir(fs, &child_rel, depth + 1, state, out);
+        }
+    }
+}
+
+/// Collect remote directories the current view needs but that aren't
+/// cached. Mirrors [`walk_dir`]'s traversal: an uncached directory is
+/// recorded (and its subtree pruned, since we can't know its children
+/// until it loads); a cached one recurses into its expanded subdirs.
+fn collect_missing_dirs(state: &ExplorerState, rel: &Path, missing: &mut Vec<PathBuf>) {
+    let Some(entries) = state.dir_cache.get(rel) else {
+        missing.push(rel.to_path_buf());
+        return;
+    };
+    for entry in entries {
+        if !entry.is_dir {
+            continue;
+        }
+        let child_rel = if rel.as_os_str().is_empty() {
+            PathBuf::from(&entry.name)
+        } else {
+            rel.join(&entry.name)
+        };
+        if state.expanded.contains(&child_rel) {
+            collect_missing_dirs(state, &child_rel, missing);
         }
     }
 }
@@ -471,5 +575,105 @@ mod tests {
         state.set_fs(Some(Arc::new(LocalFs::new(tmp2.path()))));
         assert!(state.expanded.is_empty());
         assert!(state.selected.is_none());
+    }
+
+    /// A remote [`WorkspaceFs`] double whose `list_dir` panics — proving the
+    /// render walk never calls it for a remote backend (it reads the cache).
+    #[derive(Debug)]
+    struct PanicRemoteFs {
+        root: PathBuf,
+    }
+
+    impl WorkspaceFs for PanicRemoteFs {
+        fn root_display(&self) -> &Path {
+            &self.root
+        }
+        fn list_dir(&self, _rel: &Path) -> std::io::Result<Vec<DirEntry>> {
+            panic!("remote list_dir must not run on the render path");
+        }
+        fn read_file(&self, _rel: &Path) -> std::io::Result<Vec<u8>> {
+            panic!("remote read_file must not run on the render path");
+        }
+        fn git_branch(&self) -> Option<String> {
+            None
+        }
+        fn git_status(
+            &self,
+            _include_ignored: bool,
+        ) -> Result<HashMap<PathBuf, StatusKind>, fleet_commander_core::git::StatusError> {
+            Ok(HashMap::new())
+        }
+        fn is_remote(&self) -> bool {
+            true
+        }
+    }
+
+    fn remote_state() -> ExplorerState {
+        let mut state = ExplorerState::default();
+        state.set_fs(Some(Arc::new(PanicRemoteFs {
+            root: PathBuf::from("/workspaces/repo"),
+        })));
+        state
+    }
+
+    fn dir(name: &str) -> DirEntry {
+        DirEntry {
+            name: name.into(),
+            is_dir: true,
+        }
+    }
+    fn file(name: &str) -> DirEntry {
+        DirEntry {
+            name: name.into(),
+            is_dir: false,
+        }
+    }
+
+    #[test]
+    fn remote_render_uses_cache_not_list_dir() {
+        let mut state = remote_state();
+        // Nothing cached yet: the walk must not touch the (panicking) fs,
+        // and the root is reported as needing a fetch.
+        assert!(state.visible_entries().is_empty());
+        assert_eq!(state.missing_dirs(), vec![PathBuf::from("")]);
+
+        // Once the root listing lands, it renders from the cache.
+        state.apply_dir(PathBuf::from(""), Ok(vec![dir("src"), file("README.md")]));
+        let entries = state.visible_entries();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["src", "README.md"]);
+        // Root is satisfied; nothing expanded, so nothing else is missing.
+        assert!(state.missing_dirs().is_empty());
+    }
+
+    #[test]
+    fn remote_expanded_dir_is_reported_missing_then_renders() {
+        let mut state = remote_state();
+        state.apply_dir(PathBuf::from(""), Ok(vec![dir("src")]));
+        state.expanded.insert(PathBuf::from("src"));
+        // The expanded but uncached subdir is the next fetch target.
+        assert_eq!(state.missing_dirs(), vec![PathBuf::from("src")]);
+
+        // While loading, it isn't re-reported.
+        state.mark_dir_loading(PathBuf::from("src"));
+        assert!(state.missing_dirs().is_empty());
+
+        state.apply_dir(PathBuf::from("src"), Ok(vec![file("lib.rs")]));
+        assert!(
+            state
+                .visible_entries()
+                .iter()
+                .any(|e| e.name == "lib.rs" && e.depth == 1)
+        );
+    }
+
+    #[test]
+    fn invalidate_dirs_forces_remote_refetch() {
+        let mut state = remote_state();
+        state.apply_dir(PathBuf::from(""), Ok(vec![file("a.txt")]));
+        assert!(!state.visible_entries().is_empty());
+        state.invalidate_dirs();
+        assert!(state.visible_entries().is_empty());
+        assert_eq!(state.missing_dirs(), vec![PathBuf::from("")]);
     }
 }
