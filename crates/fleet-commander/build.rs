@@ -43,6 +43,22 @@ fn main() {
         let src = PathBuf::from(src);
         println!("cargo:rerun-if-changed={}", src.display());
 
+        if src.is_relative() {
+            panic!(
+                "{env_key}={} is a relative path; build scripts run with CWD set \
+                 to the crate dir, so it must be absolute (e.g. \
+                 \"$GITHUB_WORKSPACE/target/.../fleet-agent\")",
+                src.display()
+            );
+        }
+        if !src.exists() {
+            panic!(
+                "{env_key} points at {}, which does not exist — build the {slug} \
+                 static-musl fleet-agent binary before the commander",
+                src.display()
+            );
+        }
+
         // Stage into OUT_DIR so `include_bytes!` references a stable path.
         let staged = out_dir.join(format!("fleet-agent-{slug}"));
         fs::copy(&src, &staged)
