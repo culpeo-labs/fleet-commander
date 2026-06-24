@@ -61,8 +61,10 @@ jobs:
 
       - name: Build commander with embedded agents
         env:
-          FLEET_AGENT_X86_64: target/x86_64-unknown-linux-musl/release/fleet-agent
-          FLEET_AGENT_AARCH64: target/aarch64-unknown-linux-musl/release/fleet-agent
+          # Absolute paths: build scripts run with CWD set to the crate dir,
+          # so workspace-relative paths would not resolve.
+          FLEET_AGENT_X86_64: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/fleet-agent
+          FLEET_AGENT_AARCH64: ${{ github.workspace }}/target/aarch64-unknown-linux-musl/release/fleet-agent
         run: cargo build --release --locked -p fleet-commander --features embed-agent
 
       - name: Mint a token from the org GitHub App
