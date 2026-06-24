@@ -5,10 +5,15 @@
 #
 #     ${XDG_DATA_HOME:-$HOME/.local/share}/fleet-commander/bin/fleet-agent-<arch>
 #
-# Fleet Commander bind-mounts this binary read-only into each dev container at
-# /opt/fleet/bin/fleet-agent (see crates/fleet-commander-core/src/agent_bin.rs).
+# Fleet Commander bind-mounts every per-arch binary it finds in this dir into the
+# container and a launcher at /opt/fleet/bin/fleet-agent picks the one matching
+# the container's `uname -m` (see crates/fleet-commander-core/src/agent_bin.rs).
 # A static musl build runs on any Linux distro regardless of the container's
-# glibc; only the architecture must match the container.
+# glibc. Build BOTH arches (run this twice) to support running an emulated /
+# `--platform` container whose arch differs from the Docker host:
+#
+#   scripts/build-fleet-agent.sh x86_64
+#   scripts/build-fleet-agent.sh aarch64   # needs an aarch64-musl cross linker
 #
 # Usage:
 #   scripts/build-fleet-agent.sh [<arch>]

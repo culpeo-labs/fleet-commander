@@ -50,15 +50,20 @@ pub(super) fn build_env_and_mounts(
     (env, mounts)
 }
 
+/// Build a read-only bind mount of a host file/dir at a fixed container path.
+pub(super) fn read_only_mount(source: &Path, target: &str) -> BindMount {
+    BindMount {
+        source: source.to_path_buf(),
+        target: target.to_string(),
+        readonly: true,
+    }
+}
+
 /// Build the read-only bind mount that injects the host-built `fleet-agent`
 /// binary into the container at [`CONTAINER_AGENT_PATH`], where it is launched
 /// over `docker exec` to serve the explorer's filesystem/git requests.
 pub(super) fn agent_bind_mount(host_bin: &Path) -> BindMount {
-    BindMount {
-        source: host_bin.to_path_buf(),
-        target: CONTAINER_AGENT_PATH.to_string(),
-        readonly: true,
-    }
+    read_only_mount(host_bin, CONTAINER_AGENT_PATH)
 }
 
 /// Parse a mount string like "source=/a,target=/b,type=bind,readonly" into a BindMount.
@@ -121,6 +126,15 @@ mod tests {
             PathBuf::from("/home/u/.local/share/fleet-commander/bin/fleet-agent-x86_64")
         );
         assert_eq!(m.target, CONTAINER_AGENT_PATH);
+        assert!(m.readonly);
+    }
+
+    #[test]
+    fn read_only_mount_targets_arbitrary_container_path() {
+        let target = crate::agent_bin::container_agent_path_for("aarch64");
+        let m = read_only_mount(Path::new("/host/fleet-agent-aarch64"), &target);
+        assert_eq!(m.source, PathBuf::from("/host/fleet-agent-aarch64"));
+        assert_eq!(m.target, "/opt/fleet/bin/fleet-agent-aarch64");
         assert!(m.readonly);
     }
 }
