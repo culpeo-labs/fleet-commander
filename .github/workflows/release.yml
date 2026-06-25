@@ -42,6 +42,14 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Don't cache `~/.cargo/bin`: it persists cargo-binstall's install
+          # manifest, which makes the Sampo action's `cargo binstall` report
+          # `sampo-github-action` as "already installed" and skip it — while
+          # the actual binary isn't restored to PATH, so the run dies with
+          # `sampo-github-action: command not found`. Caching only the
+          # registry/build artifacts avoids that stale-manifest trap.
+          cache-bin: false
 
       # cargo-zigbuild is the most reliable way to cross-compile static-musl
       # binaries for both arches from a single x86_64 runner.
