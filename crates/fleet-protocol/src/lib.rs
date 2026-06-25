@@ -27,6 +27,10 @@ pub mod methods {
     pub const FS_STAT: &str = "fs.stat";
     pub const GIT_STATUS: &str = "git.status";
     pub const GIT_BRANCH: &str = "git.branch";
+    /// Request: start or stop watching the workspace for changes.
+    pub const FS_WATCH: &str = "fs.watch";
+    /// Server→client notification: the workspace changed (Phase 2).
+    pub const FS_DID_CHANGE: &str = "fs.didChange";
 }
 
 /// JSON-RPC + application error codes.
@@ -108,6 +112,53 @@ impl Response {
     }
 }
 
+/// A JSON-RPC notification: a `method`/`params` message with **no `id`**,
+/// so it is never matched to a request. The daemon uses these for
+/// server-initiated pushes (e.g. [`methods::FS_DID_CHANGE`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Notification {
+    pub jsonrpc: String,
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+}
+
+impl Notification {
+    /// Build a `"2.0"` notification with the given method and typed params.
+    pub fn new(method: impl Into<String>, params: impl Serialize) -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            method: method.into(),
+            params: Some(serde_json::to_value(params).expect("params serialize")),
+        }
+    }
+}
+
+/// A message received from the peer on a shared channel: either a
+/// [`Response`] to one of our requests, or a server-initiated
+/// [`Notification`]. Lets a single reader demultiplex the two without
+/// guessing — the discriminator is the presence of an `id` field.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Incoming {
+    Response(Response),
+    Notification(Notification),
+}
+
+impl Incoming {
+    /// Classify and parse a single JSON-RPC frame body. A message carrying
+    /// an `id` is a [`Response`]; one with a `method` and no `id` is a
+    /// [`Notification`].
+    pub fn from_slice(body: &[u8]) -> serde_json::Result<Self> {
+        let value: Value = serde_json::from_slice(body)?;
+        let has_id = value.get("id").is_some_and(|v| !v.is_null());
+        if has_id {
+            Ok(Incoming::Response(serde_json::from_value(value)?))
+        } else {
+            Ok(Incoming::Notification(serde_json::from_value(value)?))
+        }
+    }
+}
+
 /// A JSON-RPC error object.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RpcError {
@@ -151,6 +202,11 @@ pub struct ServerInfo {
 pub struct Capabilities {
     pub fs: bool,
     pub git: bool,
+    /// The server can push [`methods::FS_DID_CHANGE`] notifications after an
+    /// [`methods::FS_WATCH`] request (Phase 2). Defaults to `false` so an
+    /// older daemon that omits the field is treated as non-watching.
+    #[serde(default)]
+    pub watch: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -226,6 +282,30 @@ pub enum WireStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GitBranchResult {
     pub branch: Option<String>,
+}
+
+/// Params for [`methods::FS_WATCH`]: start (`true`) or stop (`false`)
+/// watching the workspace root for changes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FsWatchParams {
+    pub enable: bool,
+}
+
+/// Result of [`methods::FS_WATCH`]: whether the server is now watching.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FsWatchResult {
+    pub watching: bool,
+}
+
+/// Params for the [`methods::FS_DID_CHANGE`] notification: the set of
+/// workspace-relative paths that changed since the last notification.
+///
+/// The list is coalesced and best-effort: an empty list means "something
+/// changed but the precise paths are unknown — refresh". Clients should
+/// treat it as a hint to re-fetch, not an authoritative diff.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct FsDidChangeParams {
+    pub paths: Vec<String>,
 }
 
 // ─── Framing ───────────────────────────────────────────────────────────
@@ -404,5 +484,54 @@ mod tests {
         assert_eq!(json, "\"untracked\"");
         let back: WireStatus = serde_json::from_str("\"conflicted\"").unwrap();
         assert_eq!(back, WireStatus::Conflicted);
+    }
+
+    #[test]
+    fn notification_serializes_without_an_id() {
+        let note = Notification::new(
+            methods::FS_DID_CHANGE,
+            FsDidChangeParams {
+                paths: vec!["src/lib.rs".into()],
+            },
+        );
+        let value: serde_json::Value = serde_json::to_value(&note).unwrap();
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["method"], methods::FS_DID_CHANGE);
+        assert!(value.get("id").is_none(), "notifications carry no id");
+        let back: Notification = serde_json::from_value(value).unwrap();
+        assert_eq!(back, note);
+    }
+
+    #[test]
+    fn incoming_classifies_response_vs_notification() {
+        let resp = Response::ok(7, GitBranchResult { branch: None });
+        let resp_bytes = serde_json::to_vec(&resp).unwrap();
+        match Incoming::from_slice(&resp_bytes).unwrap() {
+            Incoming::Response(r) => assert_eq!(r.id, 7),
+            other => panic!("expected response, got {other:?}"),
+        }
+
+        let note = Notification::new(methods::FS_DID_CHANGE, FsDidChangeParams::default());
+        let note_bytes = serde_json::to_vec(&note).unwrap();
+        match Incoming::from_slice(&note_bytes).unwrap() {
+            Incoming::Notification(n) => assert_eq!(n.method, methods::FS_DID_CHANGE),
+            other => panic!("expected notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capabilities_watch_defaults_to_false_when_absent() {
+        // An older daemon that predates the `watch` field must deserialize
+        // as non-watching rather than failing.
+        let caps: Capabilities = serde_json::from_str(r#"{"fs":true,"git":true}"#).unwrap();
+        assert!(caps.fs && caps.git && !caps.watch);
+    }
+
+    #[test]
+    fn fs_watch_params_round_trip() {
+        let p = FsWatchParams { enable: true };
+        let back: FsWatchParams =
+            serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
     }
 }

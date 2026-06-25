@@ -97,13 +97,23 @@ Each phase ships value and de-risks the next.
   under qemu emulation / `--platform` (not just the Docker host's arch). The daemon's
   path resolver canonicalizes and re-checks containment, so an in-workspace symlink
   can't escape the root. *Caveats:* pre-existing containers created before Phase 1 lack
-  the mount and silently fall back to `LocalFs` until rebuilt (`:rebuild`); the
-  emulation win only materializes once both musl arches are actually built (the build
-  script currently produces the host arch — dual-arch cross-compile is a follow-up); and
+  the mount and silently fall back to `LocalFs` until rebuilt (`:rebuild`); and
   bind-mount delivery doesn't cover remote Docker (`DOCKER_HOST`), which would need
-  `docker cp` or a registry image.
-- **Phase 2 — file watching / push.** First thing exec fundamentally can't do; pushed
-  as JSON-RPC notifications (`fs.didChange`).
+  `docker cp` or a registry image. *(Resolved:* the dual-arch cross-compile is now
+  done — the release workflow `cargo-zigbuild`s both `x86_64`/`aarch64` musl agents and
+  embeds them via the `embed-agent` feature, so the emulation win materializes in
+  release builds.*)*
+- **Phase 2 — file watching / push.** ✅ *Done.* The daemon advertises a `watch`
+  capability; when the client connects with a notification sink
+  (`ServiceFs::connect_docker_watched`) it sends `fs.watch { enable: true }`, and the
+  daemon uses `notify` (inotify) to watch the workspace root recursively, coalesces
+  bursts over a short window, and pushes `fs.didChange` notifications carrying
+  workspace-relative paths. `ProcessTransport`'s reader thread demultiplexes responses
+  from notifications (`Incoming::from_slice`), routing pushes to the sink; the TUI maps
+  them to `AppEvent::ExplorerFsChanged`, which (when the agent is still viewed and on
+  the same container) re-lists the tree and refreshes git status. Notifications are
+  treated as refresh hints, not authoritative diffs; the non-watched `connect_docker`
+  path and `LocalFs` fallback remain available.
 - **Phase 3 — search, streaming reads/diffs, git pane.** Streamed as notifications;
   large reads chunked. (Re-evaluate CulpeoStream here if binary throughput hurts.)
 - **Phase 4 — PTY/terminal multiplexing.** First strong case for binary streams —

@@ -5,8 +5,6 @@ directory of repos, spin up dev containers, and command a fleet of agents —
 Copilot, Claude, or any [ACP](https://agentclientprotocol.com)-compatible
 agent — from a single keyboard-driven interface.
 
-Inspired by [Norton Commander](https://en.wikipedia.org/wiki/Norton_Commander).
-
 ![Rust](https://img.shields.io/badge/rust-2024_edition-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![CI](https://github.com/culpeo-labs/fleet-commander/actions/workflows/ci.yml/badge.svg)](https://github.com/culpeo-labs/fleet-commander/actions/workflows/ci.yml)

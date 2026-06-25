@@ -25,9 +25,9 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use fleet_protocol::{
-    FsListParams, FsListResult, FsReadParams, FsReadResult, GitBranchResult, GitStatusParams,
-    GitStatusResult, InitializeParams, InitializeResult, PROTOCOL_VERSION, Request, Response,
-    RpcError, WireStatus, error_codes, framing, methods,
+    FsListParams, FsListResult, FsReadParams, FsReadResult, FsWatchParams, GitBranchResult,
+    GitStatusParams, GitStatusResult, Incoming, InitializeParams, InitializeResult, Notification,
+    PROTOCOL_VERSION, Request, Response, RpcError, WireStatus, error_codes, framing, methods,
 };
 use serde_json::Value;
 
@@ -86,8 +86,20 @@ impl ServiceFs {
     /// Spawn `agent_bin serve --root <root>` as a child process, perform the
     /// `initialize` handshake, and return a connected `ServiceFs`.
     pub fn spawn(root: impl Into<PathBuf>, agent_bin: impl AsRef<Path>) -> io::Result<Self> {
+        Self::spawn_watched(root, agent_bin, None)
+    }
+
+    /// Like [`spawn`](Self::spawn), but installs a live `fs.watch`
+    /// subscription delivering [`Notification`]s to `sink` (see
+    /// [`connect_docker_watched`](Self::connect_docker_watched)). Mainly used
+    /// for the host-local transport in tests; production uses the docker path.
+    pub fn spawn_watched(
+        root: impl Into<PathBuf>,
+        agent_bin: impl AsRef<Path>,
+        sink: Option<NotificationSink>,
+    ) -> io::Result<Self> {
         let root = root.into();
-        let transport = ProcessTransport::spawn(agent_bin.as_ref(), &root)?;
+        let transport = ProcessTransport::spawn(agent_bin.as_ref(), &root, sink)?;
         Ok(Self::new(root, Box::new(transport)))
     }
 
@@ -107,8 +119,36 @@ impl ServiceFs {
         remote_user: &str,
         agent_path: &str,
     ) -> io::Result<Self> {
-        let transport =
-            ProcessTransport::docker_exec(container_id, remote_user, agent_path, remote_root)?;
+        Self::connect_docker_watched(
+            root_display,
+            remote_root,
+            container_id,
+            remote_user,
+            agent_path,
+            None,
+        )
+    }
+
+    /// Like [`connect_docker`](Self::connect_docker), but installs a live
+    /// `fs.watch` subscription: when the daemon advertises the capability,
+    /// `sink` is invoked (on the transport's reader thread) for every
+    /// [`Notification`] it pushes — primarily `fs.didChange`. Used by the
+    /// explorer to refresh in response to in-container filesystem changes.
+    pub fn connect_docker_watched(
+        root_display: impl Into<PathBuf>,
+        remote_root: &str,
+        container_id: &str,
+        remote_user: &str,
+        agent_path: &str,
+        sink: Option<NotificationSink>,
+    ) -> io::Result<Self> {
+        let transport = ProcessTransport::docker_exec(
+            container_id,
+            remote_user,
+            agent_path,
+            remote_root,
+            sink,
+        )?;
         Ok(Self::new(root_display, Box::new(transport)))
     }
 
@@ -257,6 +297,8 @@ pub struct ProcessTransport {
     next_id: AtomicU64,
     healthy: AtomicBool,
     timeout: Duration,
+    /// Whether a [`NotificationSink`] was installed on the reader thread.
+    has_sink: bool,
 }
 
 #[derive(Debug)]
@@ -265,16 +307,40 @@ struct CallChannel {
     rx: mpsc::Receiver<io::Result<Vec<u8>>>,
 }
 
-/// Read framed messages from the child's stdout until EOF or error,
-/// forwarding each to the call side. Exits when the receiver is dropped.
-fn reader_loop(mut stdout: BufReader<ChildStdout>, tx: mpsc::Sender<io::Result<Vec<u8>>>) {
+/// A callback invoked for every server-initiated notification (e.g.
+/// [`methods::FS_DID_CHANGE`]). Runs on the transport's reader thread, so it
+/// must not block; the App uses it to post a non-blocking refresh event.
+pub type NotificationSink = Box<dyn Fn(Notification) + Send>;
+
+/// Read framed messages from the child's stdout until EOF or error. Each
+/// frame is classified ([`Incoming::from_slice`]): **responses** are
+/// forwarded to the call side (`tx`), while server-initiated
+/// **notifications** are handed to `sink` (if any). This demux is what lets
+/// the daemon push `fs.didChange` while requests are in flight without
+/// breaking the "next frame is my response" invariant on the call side.
+fn reader_loop(
+    mut stdout: BufReader<ChildStdout>,
+    tx: mpsc::Sender<io::Result<Vec<u8>>>,
+    sink: Option<NotificationSink>,
+) {
     loop {
         match framing::read_frame(&mut stdout) {
-            Ok(Some(body)) => {
-                if tx.send(Ok(body)).is_err() {
-                    break;
+            Ok(Some(body)) => match Incoming::from_slice(&body) {
+                Ok(Incoming::Notification(note)) => {
+                    if let Some(sink) = &sink {
+                        sink(note);
+                    }
                 }
-            }
+                // Responses (and anything we can't classify as a
+                // notification) go to the call side, which decodes and
+                // validates the id. Forwarding the raw body keeps the
+                // existing error handling unchanged.
+                Ok(Incoming::Response(_)) | Err(_) => {
+                    if tx.send(Ok(body)).is_err() {
+                        break;
+                    }
+                }
+            },
             Ok(None) => break, // EOF — the daemon closed stdout.
             Err(e) => {
                 let _ = tx.send(Err(e));
@@ -286,38 +352,54 @@ fn reader_loop(mut stdout: BufReader<ChildStdout>, tx: mpsc::Sender<io::Result<V
 
 impl ProcessTransport {
     /// Spawn `agent_bin serve --root <root>` and complete the `initialize`
-    /// handshake, verifying the daemon speaks our protocol version.
-    pub fn spawn(agent_bin: &Path, root: &Path) -> io::Result<Self> {
+    /// handshake, verifying the daemon speaks our protocol version. When
+    /// `sink` is provided and the daemon advertises the `watch` capability,
+    /// a live `fs.watch` subscription is started (see
+    /// [`from_command_with_timeout`](Self::from_command_with_timeout)).
+    pub fn spawn(
+        agent_bin: &Path,
+        root: &Path,
+        sink: Option<NotificationSink>,
+    ) -> io::Result<Self> {
         let mut cmd = Command::new(agent_bin);
         cmd.arg("serve").arg("--root").arg(root);
-        Self::from_command(cmd)
+        Self::from_command(cmd, sink)
     }
 
     /// Connect to a `fleet-agent` running inside a container by shelling
     /// `docker exec -i …` and complete the `initialize` handshake.
     ///
     /// `agent_path` and `remote_root` are paths **inside** the container.
+    /// When `sink` is provided and the daemon advertises the `watch`
+    /// capability, a live `fs.watch` subscription is started and its
+    /// `fs.didChange` notifications are delivered to `sink`.
     pub fn docker_exec(
         container_id: &str,
         remote_user: &str,
         agent_path: &str,
         remote_root: &str,
+        sink: Option<NotificationSink>,
     ) -> io::Result<Self> {
         let argv = docker_exec_argv(container_id, remote_user, agent_path, remote_root);
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
-        Self::from_command(cmd)
+        Self::from_command(cmd, sink)
     }
 
-    fn from_command(cmd: Command) -> io::Result<Self> {
-        Self::from_command_with_timeout(cmd, REQUEST_TIMEOUT)
+    fn from_command(cmd: Command, sink: Option<NotificationSink>) -> io::Result<Self> {
+        Self::from_command_with_timeout(cmd, REQUEST_TIMEOUT, sink)
     }
 
     /// Spawn an already-configured command with piped stdio (stderr is
     /// discarded so daemon logs never corrupt the framed protocol stream or
     /// the host TUI), start the reader thread, then perform the `initialize`
-    /// handshake with the given per-call `timeout`.
-    fn from_command_with_timeout(mut cmd: Command, timeout: Duration) -> io::Result<Self> {
+    /// handshake with the given per-call `timeout`. When `sink` is set and
+    /// the daemon supports it, also activate a live `fs.watch` subscription.
+    fn from_command_with_timeout(
+        mut cmd: Command,
+        timeout: Duration,
+        sink: Option<NotificationSink>,
+    ) -> io::Result<Self> {
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -333,9 +415,10 @@ impl ProcessTransport {
             .ok_or_else(|| io::Error::other("agent stdout not captured"))?;
 
         let (tx, rx) = mpsc::channel();
+        let has_sink = sink.is_some();
         let reader = std::thread::Builder::new()
             .name("fleet-agent-reader".into())
-            .spawn(move || reader_loop(BufReader::new(stdout), tx))?;
+            .spawn(move || reader_loop(BufReader::new(stdout), tx, sink))?;
 
         let transport = Self {
             call: Mutex::new(CallChannel { stdin, rx }),
@@ -344,6 +427,7 @@ impl ProcessTransport {
             next_id: AtomicU64::new(0),
             healthy: AtomicBool::new(true),
             timeout,
+            has_sink,
         };
 
         let init: InitializeResult = {
@@ -365,7 +449,26 @@ impl ProcessTransport {
                 init.protocol_version
             )));
         }
+
+        // If the caller wants live updates and the daemon can watch, start
+        // the subscription now. Best-effort: a watch failure must not sink
+        // the whole connection (the explorer still works via polling).
+        if transport.has_notification_sink() && init.capabilities.watch {
+            let params = serde_json::to_value(FsWatchParams { enable: true })
+                .expect("serialize fs.watch params");
+            if let Err(e) = transport.call(methods::FS_WATCH, params) {
+                tracing::warn!(error = %e, "fs.watch subscription failed; explorer falls back to polling");
+            }
+        }
+
         Ok(transport)
+    }
+
+    /// Whether a notification sink was wired in (i.e. the reader thread will
+    /// deliver `fs.didChange`). Tracked separately because the sink itself is
+    /// owned by the reader thread.
+    fn has_notification_sink(&self) -> bool {
+        self.has_sink
     }
 
     /// Mark the transport dead and tear down the child so no further call
@@ -693,7 +796,8 @@ mod tests {
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
         let start = std::time::Instant::now();
-        let result = ProcessTransport::from_command_with_timeout(cmd, Duration::from_millis(300));
+        let result =
+            ProcessTransport::from_command_with_timeout(cmd, Duration::from_millis(300), None);
         assert!(result.is_err(), "expected handshake to time out");
         assert!(
             start.elapsed() < Duration::from_secs(5),

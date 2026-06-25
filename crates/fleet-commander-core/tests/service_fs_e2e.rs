@@ -54,3 +54,36 @@ fn service_fs_drives_a_real_agent_process() {
     // Path traversal is rejected by the daemon and surfaces as an error.
     assert!(fs.read_file(std::path::Path::new("../escape")).is_err());
 }
+
+#[test]
+fn service_fs_delivers_live_fs_did_change_notifications() {
+    use std::sync::mpsc;
+
+    let Some(agent) = agent_binary() else {
+        eprintln!("skipping: fleet-agent binary not built");
+        return;
+    };
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("seed.txt"), b"seed").unwrap();
+
+    // The sink runs on the transport's reader thread; forward each
+    // notification's method name over a channel so the test can await it.
+    let (tx, rx) = mpsc::channel::<String>();
+    let sink: fleet_commander_core::service_fs::NotificationSink = Box::new(move |note| {
+        let _ = tx.send(note.method);
+    });
+
+    // Keep the connection alive for the duration of the test; dropping it
+    // would tear down the watch.
+    let _fs = ServiceFs::spawn_watched(tmp.path(), &agent, Some(sink)).expect("spawn + watch");
+
+    // Mutate the workspace; the daemon should push an fs.didChange that the
+    // sink forwards to us.
+    std::fs::write(tmp.path().join("created.txt"), b"new").unwrap();
+
+    let method = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("expected an fs.didChange notification");
+    assert_eq!(method, "fs.didChange");
+}

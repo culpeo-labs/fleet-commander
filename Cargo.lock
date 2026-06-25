@@ -1191,6 +1191,7 @@ dependencies = [
  "base64 0.22.1",
  "fleet-git",
  "fleet-protocol",
+ "notify",
  "serde",
  "serde_json",
  "tempfile",

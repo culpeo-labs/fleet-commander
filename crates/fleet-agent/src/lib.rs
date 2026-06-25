@@ -6,17 +6,23 @@
 //! drives it via `docker exec -i`. The serve loop is therefore written
 //! against generic [`BufRead`]/[`Write`] so the transport is interchangeable.
 
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use fleet_protocol::{
-    Capabilities, FsEntry, FsListParams, FsListResult, FsReadParams, FsReadResult, FsStatParams,
-    FsStatResult, GitBranchResult, GitStatusEntry, GitStatusParams, GitStatusResult,
-    InitializeResult, PROTOCOL_VERSION, Request, Response, RpcError, ServerInfo, WireStatus,
-    error_codes, framing, methods,
+    Capabilities, FsDidChangeParams, FsEntry, FsListParams, FsListResult, FsReadParams,
+    FsReadResult, FsStatParams, FsStatResult, FsWatchParams, FsWatchResult, GitBranchResult,
+    GitStatusEntry, GitStatusParams, GitStatusResult, InitializeResult, Notification,
+    PROTOCOL_VERSION, Request, Response, RpcError, ServerInfo, WireStatus, error_codes, framing,
+    methods,
 };
+use notify::{RecursiveMode, Watcher};
 
 /// Serves requests against a fixed workspace `root`.
 pub struct Server {
@@ -55,6 +61,99 @@ impl Server {
         Ok(())
     }
 
+    /// Like [`serve`](Self::serve) but watch-aware: outbound frames
+    /// (responses **and** server-initiated notifications) are serialized
+    /// through a dedicated writer thread, so an [`methods::FS_WATCH`]
+    /// subscription can push [`methods::FS_DID_CHANGE`] notifications
+    /// concurrently with request handling. This is the production entry
+    /// point (stdio over `docker exec -i`); [`serve`](Self::serve) remains
+    /// the simple synchronous path for the no-watch case.
+    pub fn serve_stdio<R, W>(&self, reader: &mut R, writer: W) -> io::Result<()>
+    where
+        R: BufRead,
+        W: Write + Send + 'static,
+    {
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
+        let writer_handle = thread::Builder::new()
+            .name("fleet-agent-writer".into())
+            .spawn(move || {
+                let mut writer = writer;
+                while let Ok(frame) = out_rx.recv() {
+                    if framing::write_frame(&mut writer, &frame).is_err() {
+                        break;
+                    }
+                }
+            })?;
+
+        let mut watch: Option<WatchHandle> = None;
+        let result = self.dispatch_loop(reader, &out_tx, &mut watch);
+
+        // Tear down in order: stop the watcher (closes its path channel and
+        // exits the coalescer), then drop our sender so the writer thread
+        // sees the channel close and exits, then join it.
+        drop(watch);
+        drop(out_tx);
+        let _ = writer_handle.join();
+        result
+    }
+
+    /// Read framed requests, dispatching each and sending its response (and,
+    /// for `fs.watch`, managing the subscription) to the outbound `out`
+    /// channel. Returns on clean EOF or a transport error.
+    fn dispatch_loop<R: BufRead>(
+        &self,
+        reader: &mut R,
+        out: &mpsc::Sender<Vec<u8>>,
+        watch: &mut Option<WatchHandle>,
+    ) -> io::Result<()> {
+        while let Some(body) = framing::read_frame(reader)? {
+            let response = match serde_json::from_slice::<Request>(&body) {
+                Ok(req) if req.method == methods::FS_WATCH => self.handle_watch(&req, out, watch),
+                Ok(req) => self.handle(&req),
+                Err(e) => Response::err(
+                    0,
+                    RpcError::new(error_codes::PARSE_ERROR, format!("invalid request: {e}")),
+                ),
+            };
+            send_body(out, &serde_json::to_vec(&response)?)?;
+        }
+        Ok(())
+    }
+
+    /// Start or stop the workspace watcher per [`FsWatchParams`].
+    fn handle_watch(
+        &self,
+        req: &Request,
+        out: &mpsc::Sender<Vec<u8>>,
+        watch: &mut Option<WatchHandle>,
+    ) -> Response {
+        let params: FsWatchParams = match parse_params(req) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, e),
+        };
+        if params.enable {
+            if watch.is_none() {
+                match WatchHandle::start(self.canonical_root.clone(), out.clone()) {
+                    Ok(handle) => *watch = Some(handle),
+                    Err(e) => {
+                        return Response::err(
+                            req.id,
+                            RpcError::new(error_codes::IO_ERROR, format!("watch failed: {e}")),
+                        );
+                    }
+                }
+            }
+        } else {
+            *watch = None; // dropping the handle stops watching.
+        }
+        Response::ok(
+            req.id,
+            FsWatchResult {
+                watching: watch.is_some(),
+            },
+        )
+    }
+
     /// Dispatch a single request to its handler.
     pub fn handle(&self, req: &Request) -> Response {
         let result = match req.method.as_str() {
@@ -85,6 +184,7 @@ impl Server {
             capabilities: Capabilities {
                 fs: true,
                 git: true,
+                watch: true,
             },
         })
     }
@@ -205,7 +305,6 @@ fn ok(value: impl serde::Serialize) -> Result<serde_json::Value, RpcError> {
     serde_json::to_value(value)
         .map_err(|e| RpcError::new(error_codes::INTERNAL_ERROR, format!("serialize: {e}")))
 }
-
 fn parse_params<T: serde::de::DeserializeOwned>(req: &Request) -> Result<T, RpcError> {
     let params = req
         .params
@@ -213,6 +312,117 @@ fn parse_params<T: serde::de::DeserializeOwned>(req: &Request) -> Result<T, RpcE
         .ok_or_else(|| RpcError::new(error_codes::INVALID_PARAMS, "missing params"))?;
     serde_json::from_value(params)
         .map_err(|e| RpcError::new(error_codes::INVALID_PARAMS, format!("invalid params: {e}")))
+}
+
+/// How long the coalescer batches incoming change events before emitting a
+/// single `fs.didChange`. Smooths bursts (a `git checkout` or editor save
+/// touches many files) into one client refresh.
+const WATCH_COALESCE_WINDOW: Duration = Duration::from_millis(150);
+
+/// Encode `body` as a frame and hand it to the writer thread. A send error
+/// means the writer thread is gone (broken transport), surfaced as EOF-ish.
+fn send_body(out: &mpsc::Sender<Vec<u8>>, body: &[u8]) -> io::Result<()> {
+    out.send(body.to_vec())
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer thread ended"))
+}
+
+/// Owns an active filesystem watch: the `notify` watcher plus the coalescer
+/// thread that turns raw events into `fs.didChange` notifications. Dropping
+/// it drops the watcher (which closes the path channel and lets the
+/// coalescer exit), so a watch is torn down simply by dropping the handle.
+struct WatchHandle {
+    watcher: Option<notify::RecommendedWatcher>,
+    coalescer: Option<JoinHandle<()>>,
+}
+
+impl WatchHandle {
+    /// Start watching `canonical_root` recursively, emitting coalesced
+    /// `fs.didChange` notifications (paths relative to the root) to `out`.
+    fn start(canonical_root: PathBuf, out: mpsc::Sender<Vec<u8>>) -> notify::Result<Self> {
+        let (path_tx, path_rx) = mpsc::channel::<PathBuf>();
+        let mut watcher =
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if let Ok(event) = res {
+                    for path in event.paths {
+                        // A closed receiver (watch stopped) just means we stop
+                        // forwarding; nothing to do.
+                        let _ = path_tx.send(path);
+                    }
+                }
+            })?;
+        watcher.watch(&canonical_root, RecursiveMode::Recursive)?;
+
+        let coalescer = thread::Builder::new()
+            .name("fleet-agent-watch".into())
+            .spawn(move || coalesce_loop(&path_rx, &canonical_root, &out))
+            .ok();
+
+        Ok(Self {
+            watcher: Some(watcher),
+            coalescer,
+        })
+    }
+}
+
+impl Drop for WatchHandle {
+    fn drop(&mut self) {
+        // Drop the watcher *first* so its closure (which owns `path_tx`) is
+        // released, closing the path channel; the coalescer then sees
+        // `Disconnected` and returns. Only then can we join it without
+        // deadlocking. Doing this in field-drop order would join while the
+        // watcher is still alive and block forever.
+        self.watcher.take();
+        if let Some(handle) = self.coalescer.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Batch raw changed paths over [`WATCH_COALESCE_WINDOW`] and emit one
+/// `fs.didChange` notification per batch. Exits when the watcher is dropped
+/// (the path channel disconnects).
+fn coalesce_loop(rx: &mpsc::Receiver<PathBuf>, canonical_root: &Path, out: &mpsc::Sender<Vec<u8>>) {
+    while let Ok(first) = rx.recv() {
+        let mut batch = BTreeSet::new();
+        push_relative(&mut batch, canonical_root, first);
+
+        let deadline = Instant::now() + WATCH_COALESCE_WINDOW;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining) {
+                Ok(path) => push_relative(&mut batch, canonical_root, path),
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    emit_did_change(out, &batch);
+                    return;
+                }
+            }
+        }
+        emit_did_change(out, &batch);
+    }
+}
+
+/// Insert `path` into `batch` as a workspace-relative, forward-slash string.
+/// Paths outside the root are dropped (the recursive watch shouldn't produce
+/// them, but a coalesced empty batch still reads as a generic "refresh").
+fn push_relative(batch: &mut BTreeSet<String>, canonical_root: &Path, path: PathBuf) {
+    if let Ok(rel) = path.strip_prefix(canonical_root) {
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        batch.insert(rel);
+    }
+}
+
+/// Emit a single `fs.didChange` notification for `batch` to the writer.
+fn emit_did_change(out: &mpsc::Sender<Vec<u8>>, batch: &BTreeSet<String>) {
+    let note = Notification::new(
+        methods::FS_DID_CHANGE,
+        FsDidChangeParams {
+            paths: batch.iter().cloned().collect(),
+        },
+    );
+    if let Ok(body) = serde_json::to_vec(&note) {
+        let _ = out.send(body);
+    }
 }
 
 fn io_error(e: io::Error) -> RpcError {

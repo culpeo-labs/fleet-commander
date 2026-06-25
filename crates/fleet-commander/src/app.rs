@@ -288,6 +288,31 @@ impl App {
                     self.request_explorer_refresh();
                 }
             }
+            AppEvent::ExplorerFsChanged {
+                agent_id,
+                container_id,
+            } => {
+                // A live filesystem change inside the container. Re-list (the
+                // set of files may have changed) and refresh git status, but
+                // only while this agent is still on screen and still backed by
+                // the same container the watch was bound to — a stale push
+                // from a torn-down container must not disturb the new view.
+                let same_container = self
+                    .agents
+                    .iter()
+                    .find(|a| a.id == agent_id)
+                    .and_then(|a| a.container.as_ref())
+                    .map(|c| c.container_id == container_id)
+                    .unwrap_or(false);
+                if self.viewed_agent_id().as_ref() == Some(&agent_id)
+                    && same_container
+                    && self.explorer.open
+                    && self.explorer.fs.is_some()
+                {
+                    self.explorer.invalidate_dirs();
+                    self.request_explorer_refresh();
+                }
+            }
             AppEvent::ExplorerDirReady { root, rel, result } => {
                 let root_matches = self
                     .explorer
@@ -369,12 +394,30 @@ impl App {
         let tx = self.tx.clone();
         tokio::task::spawn_blocking(move || {
             let container_id = info.container_id.clone();
-            match ServiceFs::connect_docker(
+            // Route live `fs.didChange` pushes back into the event loop so the
+            // explorer refreshes itself when files change inside the container.
+            // The sink runs on the transport's reader thread, so it only does
+            // a cheap non-blocking channel send.
+            let sink: fleet_commander_core::service_fs::NotificationSink = {
+                let tx = tx.clone();
+                let agent_id = agent_id.clone();
+                let container_id = container_id.clone();
+                Box::new(move |note| {
+                    if note.method == fleet_commander_core::fleet_protocol::methods::FS_DID_CHANGE {
+                        let _ = tx.send(AppEvent::ExplorerFsChanged {
+                            agent_id: agent_id.clone(),
+                            container_id: container_id.clone(),
+                        });
+                    }
+                })
+            };
+            match ServiceFs::connect_docker_watched(
                 workspace,
                 &info.remote_workspace_folder,
                 &info.container_id,
                 &info.remote_user,
                 fleet_commander_core::agent_bin::CONTAINER_AGENT_PATH,
+                Some(sink),
             ) {
                 Ok(fs) => {
                     let _ = tx.send(AppEvent::ExplorerFsReady {

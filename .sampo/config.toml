@@ -11,7 +11,8 @@ repository = "culpeo-labs/fleet-commander"
 
 [changelog]
 show_commit_hash = true
-show_acknowledgments = true
+# No author acknowledgments — keep changelog entries terse, no "Thanks @user".
+show_acknowledgments = false
 
 [packages]
 # fleet-commander is the only user-facing release artifact; the other crates
