@@ -3,17 +3,26 @@
 //! `ServiceFs` will. Proves framing + dispatch across a process boundary.
 
 use std::io::{BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread;
+use std::time::Duration;
 
 use fleet_protocol::{
-    FsListParams, FsListResult, FsReadParams, FsReadResult, GitBranchResult, InitializeParams,
-    InitializeResult, PROTOCOL_VERSION, Request, Response, framing, methods,
+    FsDidChangeParams, FsListParams, FsListResult, FsReadParams, FsReadResult, FsWatchParams,
+    FsWatchResult, GitBranchResult, Incoming, InitializeParams, InitializeResult, Notification,
+    PROTOCOL_VERSION, Request, Response, framing, methods,
 };
+
+/// Generous ceiling for any single blocking read so a protocol regression
+/// fails the test instead of hanging CI.
+const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct AgentProcess {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    rx: Receiver<Incoming>,
+    pending: Vec<Notification>,
     next_id: u64,
 }
 
@@ -28,25 +37,73 @@ impl AgentProcess {
             .spawn()
             .expect("spawn fleet-agent");
         let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        // Reader thread: classify every inbound frame and forward it. This
+        // mirrors the client's response/notification demux and means the
+        // test never blocks directly on the child's pipe.
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok(Some(body)) = framing::read_frame(&mut stdout) {
+                match Incoming::from_slice(&body) {
+                    Ok(incoming) => {
+                        if tx.send(incoming).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
         Self {
             child,
             stdin,
-            stdout,
+            rx,
+            pending: Vec::new(),
             next_id: 0,
         }
     }
 
-    fn call(&mut self, method: &str, params: impl serde::Serialize) -> Response {
+    fn send(&mut self, method: &str, params: impl serde::Serialize) -> u64 {
         self.next_id += 1;
         let req = Request::new(self.next_id, method, params);
         let body = serde_json::to_vec(&req).unwrap();
         framing::write_frame(&mut self.stdin, &body).unwrap();
         self.stdin.flush().unwrap();
-        let resp_body = framing::read_frame(&mut self.stdout)
-            .unwrap()
-            .expect("expected a response frame");
-        serde_json::from_slice(&resp_body).unwrap()
+        self.next_id
+    }
+
+    /// Send a request and wait for its response, buffering any notifications
+    /// that arrive in the meantime.
+    fn call(&mut self, method: &str, params: impl serde::Serialize) -> Response {
+        self.send(method, params);
+        loop {
+            match self.rx.recv_timeout(RECV_TIMEOUT) {
+                Ok(Incoming::Response(resp)) => return resp,
+                Ok(Incoming::Notification(note)) => self.pending.push(note),
+                Err(RecvTimeoutError::Timeout) => panic!("timed out waiting for response"),
+                Err(RecvTimeoutError::Disconnected) => panic!("agent stdout closed"),
+            }
+        }
+    }
+
+    /// Wait for the next server-initiated notification of `method`.
+    fn next_notification(&mut self, method: &str) -> Notification {
+        if let Some(pos) = self.pending.iter().position(|n| n.method == method) {
+            return self.pending.remove(pos);
+        }
+        loop {
+            match self.rx.recv_timeout(RECV_TIMEOUT) {
+                Ok(Incoming::Notification(note)) if note.method == method => return note,
+                Ok(Incoming::Notification(note)) => self.pending.push(note),
+                Ok(Incoming::Response(_)) => {} // unexpected stray response; ignore
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("timed out waiting for {method} notification")
+                }
+                Err(RecvTimeoutError::Disconnected) => panic!("agent stdout closed"),
+            }
+        }
     }
 }
 
@@ -77,6 +134,7 @@ fn full_protocol_round_trip_over_process_stdio() {
     let init: InitializeResult = serde_json::from_value(resp.result.unwrap()).unwrap();
     assert_eq!(init.protocol_version, PROTOCOL_VERSION);
     assert!(init.capabilities.fs && init.capabilities.git);
+    assert!(init.capabilities.watch);
 
     // fs.list root
     let resp = agent.call(methods::FS_LIST, FsListParams { path: "".into() });
@@ -103,4 +161,33 @@ fn full_protocol_round_trip_over_process_stdio() {
     let resp = agent.call(methods::GIT_BRANCH, serde_json::Value::Null);
     let branch: GitBranchResult = serde_json::from_value(resp.result.unwrap()).unwrap();
     assert_eq!(branch.branch, None);
+}
+
+#[test]
+fn fs_watch_pushes_did_change_on_filesystem_mutation() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("seed.txt"), b"seed").unwrap();
+
+    let mut agent = AgentProcess::spawn(tmp.path());
+
+    // Subscribe to watch notifications.
+    let resp = agent.call(methods::FS_WATCH, FsWatchParams { enable: true });
+    let watch: FsWatchResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert!(watch.watching);
+
+    // Mutate the workspace; the daemon should push an fs.didChange.
+    std::fs::write(tmp.path().join("created.txt"), b"new").unwrap();
+
+    let note = agent.next_notification(methods::FS_DID_CHANGE);
+    let params: FsDidChangeParams = serde_json::from_value(note.params.unwrap()).unwrap();
+    assert!(
+        params.paths.iter().any(|p| p == "created.txt"),
+        "expected created.txt in changed paths, got {:?}",
+        params.paths
+    );
+
+    // Unsubscribe; the server reports it is no longer watching.
+    let resp = agent.call(methods::FS_WATCH, FsWatchParams { enable: false });
+    let watch: FsWatchResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert!(!watch.watching);
 }

@@ -31,11 +31,11 @@ fn run(args: &[String]) -> Result<(), String> {
             let root = parse_root(iter)?;
             let server = Server::new(root);
             let stdin = io::stdin();
-            let stdout = io::stdout();
             let mut reader = BufReader::new(stdin.lock());
-            let mut writer = stdout.lock();
+            // Pass owned `Stdout` (which is `Send + 'static`) so the watch
+            // writer thread can own the sink; `StdoutLock` is not `'static`.
             server
-                .serve(&mut reader, &mut writer)
+                .serve_stdio(&mut reader, io::stdout())
                 .map_err(|e| format!("serve loop failed: {e}"))
         }
         Some("--help") | Some("-h") | None => {

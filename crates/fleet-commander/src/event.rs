@@ -103,6 +103,15 @@ pub enum AppEvent {
         container_id: String,
         branch: Option<String>,
     },
+    /// The in-container filesystem changed (a coalesced `fs.didChange` push
+    /// from the live `fs.watch` subscription on the explorer's `ServiceFs`).
+    /// The app re-lists the explorer tree and refreshes git status — but only
+    /// while this agent is still viewed and still backed by the same
+    /// container the watch was established on (mirrors `ExplorerFsReady`).
+    ExplorerFsChanged {
+        agent_id: AgentId,
+        container_id: String,
+    },
     /// Nudge from a per-handle tracker task to redraw because one of its
     /// handles' `watch` channels ticked. Carries no state — the renderer
     /// reads the handle directly. (The redraw itself is performed by the

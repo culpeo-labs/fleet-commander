@@ -29,4 +29,9 @@ pub mod service_fs;
 pub mod session;
 pub mod workspace_fs;
 
+// Re-exported so downstream crates (the TUI) can name protocol constants
+// (e.g. notification method names) without depending on `fleet-protocol`
+// directly.
+pub use fleet_protocol;
+
 mod session_state;
