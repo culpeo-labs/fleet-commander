@@ -5,5 +5,10 @@ Cargo.lock.bak
 *.swp
 vendor/
 
+# Zig cross-compile cache, created by `cargo zigbuild` in the release
+# workflow. Must be ignored so the Sampo release commit (which `git add -A`s
+# the tree) never sweeps its thousands of files into the Release PR.
+.zig-cache/
+
 # Local debug logs
 acp.log
