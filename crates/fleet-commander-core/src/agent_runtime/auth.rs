@@ -1,6 +1,6 @@
 //! Parsing and building the interactive login command.
 
-use agent_client_protocol::schema::AuthMethod;
+use agent_client_protocol::schema::v1::AuthMethod;
 
 pub(super) fn terminal_auth_command(method: &AuthMethod) -> Option<(String, Vec<String>)> {
     let terminal_auth = method.meta()?.get("terminal-auth")?;

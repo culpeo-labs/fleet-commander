@@ -1,6 +1,6 @@
 //! Applying ACP `SessionUpdate`s to the per-session state machine.
 
-use agent_client_protocol::schema::{ContentBlock, SessionUpdate, ToolCallStatus};
+use agent_client_protocol::schema::v1::{ContentBlock, SessionUpdate, ToolCallStatus};
 
 use crate::session::ToolCallStatusKind;
 use crate::session_state::SessionStateMachine;

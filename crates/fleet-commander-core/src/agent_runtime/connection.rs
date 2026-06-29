@@ -4,11 +4,11 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1::{
     AuthenticateRequest, ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind,
-    PromptRequest, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
-    TextContent,
+    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, TextContent,
 };
 use agent_client_protocol::{AcpAgent, Agent as AcpAgentRole, ConnectionTo, LineDirection};
 use tokio::sync::mpsc;
@@ -135,7 +135,7 @@ async fn connect_and_run(
                                 name: c.name.clone(),
                                 description: c.description.clone(),
                                 hint: c.input.as_ref().and_then(|input| match input {
-                                    agent_client_protocol::schema::AvailableCommandInput::Unstructured(u) => Some(u.hint.clone()),
+                                    agent_client_protocol::schema::v1::AvailableCommandInput::Unstructured(u) => Some(u.hint.clone()),
                                     _ => None,
                                 }),
                             })
