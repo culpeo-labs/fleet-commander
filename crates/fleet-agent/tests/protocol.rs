@@ -148,6 +148,8 @@ fn full_protocol_round_trip_over_process_stdio() {
         methods::FS_READ,
         FsReadParams {
             path: "hello.txt".into(),
+            offset: 0,
+            len: None,
         },
     );
     let read: FsReadResult = serde_json::from_value(resp.result.unwrap()).unwrap();

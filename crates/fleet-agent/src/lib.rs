@@ -207,9 +207,28 @@ impl Server {
     fn fs_read(&self, req: &Request) -> Result<serde_json::Value, RpcError> {
         let params: FsReadParams = parse_params(req)?;
         let abs = self.resolve(&params.path)?;
-        let bytes = std::fs::read(&abs).map_err(io_error)?;
+        let total_size = std::fs::metadata(&abs).map_err(io_error)?.len();
+
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(&abs).map_err(io_error)?;
+        if params.offset > 0 {
+            file.seek(SeekFrom::Start(params.offset))
+                .map_err(io_error)?;
+        }
+        let mut buf = Vec::new();
+        match params.len {
+            Some(len) => {
+                file.take(len).read_to_end(&mut buf).map_err(io_error)?;
+            }
+            None => {
+                file.read_to_end(&mut buf).map_err(io_error)?;
+            }
+        }
+        let eof = params.offset.saturating_add(buf.len() as u64) >= total_size;
         ok(FsReadResult {
-            content_base64: BASE64.encode(bytes),
+            content_base64: BASE64.encode(&buf),
+            eof,
+            total_size,
         })
     }
 
@@ -519,6 +538,36 @@ mod tests {
         let result: FsReadResult = serde_json::from_value(resp.result.unwrap()).unwrap();
         let bytes = BASE64.decode(result.content_base64).unwrap();
         assert_eq!(bytes, b"hi");
+        assert!(result.eof);
+        assert_eq!(result.total_size, 2);
+    }
+
+    #[test]
+    fn fs_read_honors_offset_and_len() {
+        let tmp = fixture();
+        fs::write(tmp.path().join("data.txt"), "abcdefghij").unwrap();
+        let server = Server::new(tmp.path());
+
+        // Middle window: bytes [3, 6) → "def", not yet EOF.
+        let resp = call(
+            &server,
+            methods::FS_READ,
+            serde_json::json!({ "path": "data.txt", "offset": 3, "len": 3 }),
+        );
+        let result: FsReadResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(BASE64.decode(result.content_base64).unwrap(), b"def");
+        assert!(!result.eof);
+        assert_eq!(result.total_size, 10);
+
+        // Tail window past the end clamps and reports EOF.
+        let resp = call(
+            &server,
+            methods::FS_READ,
+            serde_json::json!({ "path": "data.txt", "offset": 8, "len": 100 }),
+        );
+        let result: FsReadResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(BASE64.decode(result.content_base64).unwrap(), b"ij");
+        assert!(result.eof);
     }
 
     #[test]
@@ -650,6 +699,8 @@ mod tests {
             methods::FS_READ,
             FsReadParams {
                 path: "README.md".into(),
+                offset: 0,
+                len: None,
             },
         );
         framing::write_frame(&mut input, &serde_json::to_vec(&req).unwrap()).unwrap();
