@@ -28,6 +28,16 @@ pub struct DirEntry {
     pub is_dir: bool,
 }
 
+/// Result of a bounded read ([`WorkspaceFs::read_file_capped`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CappedRead {
+    /// The bytes read (at most the requested cap).
+    pub bytes: Vec<u8>,
+    /// `true` when the file was larger than the cap, so `bytes` holds
+    /// only a prefix. Lets the UI flag a truncated preview.
+    pub truncated: bool,
+}
+
 /// Read-only view over a workspace, abstracting where the bytes
 /// actually live. Implementations must be cheap to clone via `Arc`
 /// (they're stored in the App-level explorer state and consulted
@@ -45,6 +55,23 @@ pub trait WorkspaceFs: Send + Sync + Debug {
 
     /// Read a file as bytes. Used for the side-pane preview.
     fn read_file(&self, rel: &Path) -> io::Result<Vec<u8>>;
+
+    /// Read at most `max` bytes from the start of a file, reporting
+    /// whether the file was longer than the cap. Used for the explorer
+    /// preview so a huge file never has to be transferred or buffered
+    /// in full on the UI path.
+    ///
+    /// The default implementation reads the whole file and truncates —
+    /// fine for cheap local/in-memory backends. Remote implementations
+    /// (e.g. [`ServiceFs`](crate::service_fs::ServiceFs)) should override
+    /// it to fetch only the requested prefix.
+    fn read_file_capped(&self, rel: &Path, max: u64) -> io::Result<CappedRead> {
+        let bytes = self.read_file(rel)?;
+        let truncated = bytes.len() as u64 > max;
+        let mut bytes = bytes;
+        bytes.truncate(max as usize);
+        Ok(CappedRead { bytes, truncated })
+    }
 
     /// Current branch name (or `None` outside a repo).
     fn git_branch(&self) -> Option<String>;
@@ -105,6 +132,20 @@ impl WorkspaceFs for LocalFs {
 
     fn read_file(&self, rel: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(self.root.join(rel))
+    }
+
+    fn read_file_capped(&self, rel: &Path, max: u64) -> io::Result<CappedRead> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(self.root.join(rel))?;
+        let mut bytes = Vec::new();
+        // Read one byte past the cap to detect truncation without
+        // pulling the whole file.
+        file.by_ref()
+            .take(max.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        let truncated = bytes.len() as u64 > max;
+        bytes.truncate(max as usize);
+        Ok(CappedRead { bytes, truncated })
     }
 
     fn git_branch(&self) -> Option<String> {
@@ -168,6 +209,26 @@ mod tests {
         let tmp = fixture();
         let fs = LocalFs::new(tmp.path());
         assert_eq!(fs.read_file(Path::new("README.md")).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn read_file_capped_truncates_and_flags() {
+        let tmp = fixture();
+        fs::write(tmp.path().join("big.txt"), "abcdefghij").unwrap();
+        let fs = LocalFs::new(tmp.path());
+
+        let capped = fs.read_file_capped(Path::new("big.txt"), 4).unwrap();
+        assert_eq!(capped.bytes, b"abcd");
+        assert!(capped.truncated);
+
+        let capped = fs.read_file_capped(Path::new("big.txt"), 100).unwrap();
+        assert_eq!(capped.bytes, b"abcdefghij");
+        assert!(!capped.truncated);
+
+        // Cap exactly at the file size is not a truncation.
+        let capped = fs.read_file_capped(Path::new("big.txt"), 10).unwrap();
+        assert_eq!(capped.bytes, b"abcdefghij");
+        assert!(!capped.truncated);
     }
 
     #[test]

@@ -918,9 +918,19 @@ impl App {
         let full_path = root.join(&rel);
         let tx = self.tx.clone();
         tokio::task::spawn_blocking(move || {
+            // Cap the preview so opening a huge file never transfers or
+            // buffers it in full on the UI path. 256 KiB is plenty for a
+            // glance; larger files show a truncation marker.
+            const PREVIEW_CAP: u64 = 256 * 1024;
             let result = fs
-                .read_file(&rel)
-                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .read_file_capped(&rel, PREVIEW_CAP)
+                .map(|capped| {
+                    let mut text = String::from_utf8_lossy(&capped.bytes).into_owned();
+                    if capped.truncated {
+                        text.push_str("\n\n… [truncated preview — file larger than 256 KiB]");
+                    }
+                    text
+                })
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppEvent::ExplorerFileReady {
                 agent_id,

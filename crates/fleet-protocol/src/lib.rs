@@ -228,13 +228,28 @@ pub struct FsEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FsReadParams {
     pub path: String,
+    /// Byte offset to start reading from. Defaults to `0`. Enables paging
+    /// through large files in bounded chunks instead of one giant frame.
+    #[serde(default)]
+    pub offset: u64,
+    /// Maximum number of bytes to return from `offset`. `None` reads to the
+    /// end of the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub len: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FsReadResult {
-    /// Base64-encoded file contents. Base64 keeps arbitrary bytes safe over
-    /// the JSON channel; Phase 3 will add a streaming path for large files.
+    /// Base64-encoded file contents for the requested range. Base64 keeps
+    /// arbitrary bytes safe over the JSON channel.
     pub content_base64: String,
+    /// `true` when this chunk reached the end of the file (i.e. no more
+    /// bytes follow `offset + returned_len`). Lets a client stop paging.
+    #[serde(default)]
+    pub eof: bool,
+    /// Total size of the file in bytes, independent of the requested range.
+    #[serde(default)]
+    pub total_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

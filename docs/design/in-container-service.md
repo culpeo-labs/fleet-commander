@@ -116,6 +116,9 @@ Each phase ships value and de-risks the next.
   path and `LocalFs` fallback remain available.
 - **Phase 3 — search, streaming reads/diffs, git pane.** Streamed as notifications;
   large reads chunked. (Re-evaluate CulpeoStream here if binary throughput hurts.)
+  _Chunked reads landed: `fs.read` is ranged (`offset`/`len` → `eof`/`totalSize`); the
+  client pages large files and the explorer preview is capped. Search + diffs/git pane
+  still pending._
 - **Phase 4 — PTY/terminal multiplexing.** First strong case for binary streams —
   evaluate a CulpeoStream side-channel (see *Deferred: CulpeoStream*).
 - **Phase 5 — LSP hosting + SSH/WebSocket transport.**
@@ -146,7 +149,7 @@ Each phase ships value and de-risks the next.
   reads land.
 - **Methods (initial):**
   - `fs.list { path, depth? }` → `{ entries: [{ name, isDir }] }`
-  - `fs.read { path, range? }` → `{ contentBase64 }` (small files; chunk later)
+  - `fs.read { path, offset?, len? }` → `{ contentBase64, eof, totalSize }` (ranged/chunked reads; client pages large files, explorer preview is capped)
   - `fs.stat { path }`
   - `fs.watch { path }` / `fs.unwatch` → server `fs.didChange { changes: [{path, kind}] }` (debounced/coalesced)
   - `git.status { includeIgnored }` → `{ entries: { path: kind } }`

@@ -32,7 +32,12 @@ use fleet_protocol::{
 use serde_json::Value;
 
 use crate::git::{StatusError, StatusKind};
-use crate::workspace_fs::{DirEntry, WorkspaceFs};
+use crate::workspace_fs::{CappedRead, DirEntry, WorkspaceFs};
+
+/// Size of each ranged `fs.read` chunk when assembling a full file. Base64
+/// inflates payloads ~1.33x, so 4 MiB stays comfortably under the daemon's
+/// 64 MiB body cap while keeping the number of round-trips low.
+const READ_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 
 /// What can go wrong issuing a single RPC.
 #[derive(Debug)]
@@ -225,17 +230,53 @@ impl WorkspaceFs for ServiceFs {
     }
 
     fn read_file(&self, rel: &Path) -> io::Result<Vec<u8>> {
+        let wire_path = rel_to_wire(rel);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut offset: u64 = 0;
+        loop {
+            let result: FsReadResult = self
+                .call_typed(
+                    methods::FS_READ,
+                    FsReadParams {
+                        path: wire_path.clone(),
+                        offset,
+                        len: Some(READ_CHUNK_BYTES),
+                    },
+                )
+                .map_err(to_io_error)?;
+            let chunk = BASE64.decode(&result.content_base64).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("bad base64: {e}"))
+            })?;
+            let read_len = chunk.len() as u64;
+            buf.extend_from_slice(&chunk);
+            offset += read_len;
+            // Stop at EOF, or defensively if the server returns an empty
+            // chunk without signalling EOF (avoid an infinite loop).
+            if result.eof || read_len == 0 {
+                break;
+            }
+        }
+        Ok(buf)
+    }
+
+    fn read_file_capped(&self, rel: &Path, max: u64) -> io::Result<CappedRead> {
         let result: FsReadResult = self
             .call_typed(
                 methods::FS_READ,
                 FsReadParams {
                     path: rel_to_wire(rel),
+                    offset: 0,
+                    len: Some(max),
                 },
             )
             .map_err(to_io_error)?;
-        BASE64
-            .decode(result.content_base64)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad base64: {e}")))
+        let bytes = BASE64
+            .decode(&result.content_base64)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad base64: {e}")))?;
+        // If this first `max`-byte window already hit EOF, the file fits;
+        // otherwise there are more bytes beyond the cap.
+        let truncated = !result.eof;
+        Ok(CappedRead { bytes, truncated })
     }
 
     fn git_branch(&self) -> Option<String> {
@@ -692,6 +733,8 @@ mod tests {
             methods::FS_READ,
             FsReadResult {
                 content_base64: BASE64.encode(b"hello"),
+                eof: true,
+                total_size: 5,
             },
         ));
         assert_eq!(fs.read_file(Path::new("a.txt")).unwrap(), b"hello");
@@ -705,6 +748,65 @@ mod tests {
         ));
         let err = fs.read_file(Path::new("missing")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A transport that serves `fs.read` from an in-memory buffer,
+    /// honoring `offset`/`len` so it can exercise chunked assembly.
+    #[derive(Debug)]
+    struct RangeReadTransport {
+        data: Vec<u8>,
+    }
+
+    impl Transport for RangeReadTransport {
+        fn call(&self, method: &str, params: Value) -> Result<Value, TransportError> {
+            assert_eq!(method, methods::FS_READ);
+            let params: FsReadParams = serde_json::from_value(params).unwrap();
+            let total = self.data.len() as u64;
+            let start = params.offset.min(total) as usize;
+            let end = match params.len {
+                Some(len) => (params.offset.saturating_add(len)).min(total) as usize,
+                None => total as usize,
+            };
+            let chunk = &self.data[start..end];
+            Ok(serde_json::to_value(FsReadResult {
+                content_base64: BASE64.encode(chunk),
+                eof: end as u64 >= total,
+                total_size: total,
+            })
+            .unwrap())
+        }
+    }
+
+    #[test]
+    fn read_file_assembles_multiple_chunks() {
+        // Larger than READ_CHUNK_BYTES so assembly must span >1 round-trip.
+        let data: Vec<u8> = (0..(READ_CHUNK_BYTES as usize * 2 + 123))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let fs = ServiceFs::new(
+            "/workspace",
+            Box::new(RangeReadTransport { data: data.clone() }),
+        );
+        assert_eq!(fs.read_file(Path::new("big.bin")).unwrap(), data);
+    }
+
+    #[test]
+    fn read_file_capped_reports_truncation() {
+        let data: Vec<u8> = vec![b'x'; 1000];
+        let fs = ServiceFs::new(
+            "/workspace",
+            Box::new(RangeReadTransport { data: data.clone() }),
+        );
+
+        // Cap below the file size → truncated prefix.
+        let capped = fs.read_file_capped(Path::new("f"), 100).unwrap();
+        assert_eq!(capped.bytes, vec![b'x'; 100]);
+        assert!(capped.truncated);
+
+        // Cap at/above the file size → whole file, not truncated.
+        let capped = fs.read_file_capped(Path::new("f"), 1000).unwrap();
+        assert_eq!(capped.bytes, data);
+        assert!(!capped.truncated);
     }
 
     #[test]
