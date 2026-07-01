@@ -9,9 +9,10 @@ use std::thread;
 use std::time::Duration;
 
 use fleet_protocol::{
-    FsDidChangeParams, FsListParams, FsListResult, FsReadParams, FsReadResult, FsWatchParams,
-    FsWatchResult, GitBranchResult, Incoming, InitializeParams, InitializeResult, Notification,
-    PROTOCOL_VERSION, Request, Response, framing, methods,
+    CancelSearchParams, CancelSearchResult, FsDidChangeParams, FsListParams, FsListResult,
+    FsReadParams, FsReadResult, FsWatchParams, FsWatchResult, GitBranchResult, Incoming,
+    InitializeParams, InitializeResult, Notification, PROTOCOL_VERSION, Request, Response,
+    SearchParams, SearchResultParams, SearchSummary, framing, methods,
 };
 
 /// Generous ceiling for any single blocking read so a protocol regression
@@ -23,6 +24,7 @@ struct AgentProcess {
     stdin: ChildStdin,
     rx: Receiver<Incoming>,
     pending: Vec<Notification>,
+    pending_responses: Vec<Response>,
     next_id: u64,
 }
 
@@ -61,6 +63,7 @@ impl AgentProcess {
             stdin,
             rx,
             pending: Vec::new(),
+            pending_responses: Vec::new(),
             next_id: 0,
         }
     }
@@ -97,7 +100,7 @@ impl AgentProcess {
             match self.rx.recv_timeout(RECV_TIMEOUT) {
                 Ok(Incoming::Notification(note)) if note.method == method => return note,
                 Ok(Incoming::Notification(note)) => self.pending.push(note),
-                Ok(Incoming::Response(_)) => {} // unexpected stray response; ignore
+                Ok(Incoming::Response(resp)) => self.pending_responses.push(resp),
                 Err(RecvTimeoutError::Timeout) => {
                     panic!("timed out waiting for {method} notification")
                 }
@@ -105,8 +108,38 @@ impl AgentProcess {
             }
         }
     }
-}
 
+    /// Wait for the response to a specific request `id`, buffering any
+    /// notifications and other responses that arrive first.
+    fn wait_response(&mut self, id: u64) -> Response {
+        if let Some(pos) = self.pending_responses.iter().position(|r| r.id == id) {
+            return self.pending_responses.remove(pos);
+        }
+        loop {
+            match self.rx.recv_timeout(RECV_TIMEOUT) {
+                Ok(Incoming::Response(resp)) if resp.id == id => return resp,
+                Ok(Incoming::Response(resp)) => self.pending_responses.push(resp),
+                Ok(Incoming::Notification(note)) => self.pending.push(note),
+                Err(RecvTimeoutError::Timeout) => panic!("timed out waiting for response {id}"),
+                Err(RecvTimeoutError::Disconnected) => panic!("agent stdout closed"),
+            }
+        }
+    }
+
+    /// Drain all currently-buffered notifications of `method`.
+    fn drain_notifications(&mut self, method: &str) -> Vec<Notification> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.pending.len() {
+            if self.pending[i].method == method {
+                out.push(self.pending.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+}
 impl Drop for AgentProcess {
     fn drop(&mut self) {
         // Closing stdin ends the serve loop; then reap the child.
@@ -192,4 +225,94 @@ fn fs_watch_pushes_did_change_on_filesystem_mutation() {
     let resp = agent.call(methods::FS_WATCH, FsWatchParams { enable: false });
     let watch: FsWatchResult = serde_json::from_value(resp.result.unwrap()).unwrap();
     assert!(!watch.watching);
+}
+
+#[test]
+fn fs_search_streams_matches_then_summary() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("a.txt"), b"needle here\nno match\n").unwrap();
+    std::fs::write(tmp.path().join("src/b.rs"), b"// needle in code\n").unwrap();
+    std::fs::write(tmp.path().join("c.txt"), b"nothing to see\n").unwrap();
+    // Gitignored file must be skipped by the walk.
+    std::fs::write(tmp.path().join(".gitignore"), b"ignored.txt\n").unwrap();
+    std::fs::write(tmp.path().join("ignored.txt"), b"needle ignored\n").unwrap();
+
+    let mut agent = AgentProcess::spawn(tmp.path());
+
+    // The final response to fs.search is the SearchSummary; streamed matches
+    // arrive as fs.searchResult notifications beforehand and are buffered.
+    let resp = agent.call(
+        methods::FS_SEARCH,
+        SearchParams {
+            search_id: 1,
+            query: "needle".into(),
+            is_regex: false,
+            case_sensitive: false,
+            max_results: None,
+        },
+    );
+    let summary: SearchSummary = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert!(!summary.truncated);
+    assert!(!summary.cancelled);
+    assert_eq!(summary.count, 2, "gitignored file should not be matched");
+
+    // Collect streamed matches.
+    let mut paths: Vec<String> = agent
+        .drain_notifications(methods::FS_SEARCH_RESULT)
+        .into_iter()
+        .flat_map(|n| {
+            let p: SearchResultParams = serde_json::from_value(n.params.unwrap()).unwrap();
+            assert_eq!(p.search_id, 1);
+            p.matches.into_iter().map(|m| m.path)
+        })
+        .collect();
+    paths.sort();
+    assert_eq!(paths, vec!["a.txt".to_string(), "src/b.rs".to_string()]);
+}
+
+#[test]
+fn fs_cancel_search_stops_in_flight_search() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // A large fixture so the walk is still running when the cancel arrives.
+    for i in 0..4000 {
+        std::fs::write(
+            tmp.path().join(format!("f{i}.txt")),
+            b"needle on every line\nneedle again\n",
+        )
+        .unwrap();
+    }
+
+    let mut agent = AgentProcess::spawn(tmp.path());
+
+    let search_id = 7;
+    let id = agent.send(
+        methods::FS_SEARCH,
+        SearchParams {
+            search_id,
+            query: "needle".into(),
+            is_regex: false,
+            case_sensitive: false,
+            max_results: None,
+        },
+    );
+
+    // Cancel immediately; the daemon responds normally on a separate id.
+    let cancel_resp = agent.call(methods::FS_CANCEL_SEARCH, CancelSearchParams { search_id });
+    let cancel: CancelSearchResult = serde_json::from_value(cancel_resp.result.unwrap()).unwrap();
+    assert!(
+        cancel.cancelled,
+        "cancel should find the in-flight search still registered"
+    );
+
+    // The search must still terminate and deliver its final summary, flagged
+    // cancelled since it stopped short of the full 8000 matches.
+    let summary_resp = agent.wait_response(id);
+    let summary: SearchSummary = serde_json::from_value(summary_resp.result.unwrap()).unwrap();
+    assert!(summary.cancelled, "summary should report cancellation");
+    assert!(
+        summary.count < 8000,
+        "cancelled search should stop short of all matches, got {}",
+        summary.count
+    );
 }

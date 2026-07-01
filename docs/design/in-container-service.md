@@ -119,7 +119,10 @@ Each phase ships value and de-risks the next.
   _Chunked reads landed: `fs.read` is ranged (`offset`/`len` → `eof`/`totalSize`); the
   client pages large files and the explorer preview is capped. Per-file diffs landed:
   `git.diff` + a `Shift+D` explorer binding open a file's working-tree diff in the side
-  pane. Search still pending._
+  pane. Streaming search landed (engine): `fs.search` walks the workspace (ripgrep's
+  `ignore` + `grep` crates, gitignore-aware) and streams `fs.searchResult` batches
+  followed by a final `SearchSummary`; `fs.cancelSearch { searchId }` stops an in-flight
+  search. The search UI (client + results pane) is the remaining follow-up._
 - **Phase 4 — PTY/terminal multiplexing.** First strong case for binary streams —
   evaluate a CulpeoStream side-channel (see *Deferred: CulpeoStream*).
 - **Phase 5 — LSP hosting + SSH/WebSocket transport.**
@@ -146,13 +149,16 @@ Each phase ships value and de-risks the next.
   Phases 0-3.
 - **Errors:** JSON-RPC error objects with an app code space (NotFound, NotARepo,
   PermissionDenied, Io, …).
-- **Cancellation:** `$/cancelRequest { id }` (LSP-style), added when search/large
-  reads land.
+- **Cancellation:** in-flight searches are cancelled by a domain method,
+  `fs.cancelSearch { searchId }`, keyed on the caller-supplied `searchId` (simpler than
+  LSP `$/cancelRequest` given the client transport assigns JSON-RPC ids internally).
 - **Methods (initial):**
   - `fs.list { path, depth? }` → `{ entries: [{ name, isDir }] }`
   - `fs.read { path, offset?, len? }` → `{ contentBase64, eof, totalSize }` (ranged/chunked reads; client pages large files, explorer preview is capped)
   - `fs.stat { path }`
   - `fs.watch { path }` / `fs.unwatch` → server `fs.didChange { changes: [{path, kind}] }` (debounced/coalesced)
+  - `fs.search { searchId, query, isRegex?, caseSensitive?, maxResults? }` → streams `fs.searchResult { searchId, matches: [{path, line, column, text}] }` notifications, then a final `{ count, truncated, cancelled }` summary
+  - `fs.cancelSearch { searchId }` → `{ cancelled }`
   - `git.status { includeIgnored }` → `{ entries: { path: kind } }`
   - `git.diff { path, staged? }` → `{ diff }` (unified diff for one path; untracked files render as all-additions)
   - `git.branch` → `{ branch? }`
