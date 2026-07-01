@@ -7,22 +7,28 @@
 //! against generic [`BufRead`]/[`Write`] so the transport is interchangeable.
 
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use fleet_protocol::{
-    Capabilities, FsDidChangeParams, FsEntry, FsListParams, FsListResult, FsReadParams,
-    FsReadResult, FsStatParams, FsStatResult, FsWatchParams, FsWatchResult, GitBranchResult,
-    GitDiffParams, GitDiffResult, GitStatusEntry, GitStatusParams, GitStatusResult,
-    InitializeResult, Notification, PROTOCOL_VERSION, Request, Response, RpcError, ServerInfo,
-    WireStatus, error_codes, framing, methods,
+    CancelSearchParams, CancelSearchResult, Capabilities, FsDidChangeParams, FsEntry, FsListParams,
+    FsListResult, FsReadParams, FsReadResult, FsStatParams, FsStatResult, FsWatchParams,
+    FsWatchResult, GitBranchResult, GitDiffParams, GitDiffResult, GitStatusEntry, GitStatusParams,
+    GitStatusResult, InitializeResult, Notification, PROTOCOL_VERSION, Request, Response, RpcError,
+    SearchParams, SearchResultParams, SearchSummary, ServerInfo, WireStatus, error_codes, framing,
+    methods,
 };
 use notify::{RecursiveMode, Watcher};
+use search::{SearchRequest, run_search};
+
+mod search;
 
 /// Serves requests against a fixed workspace `root`.
 pub struct Server {
@@ -86,38 +92,95 @@ impl Server {
             })?;
 
         let mut watch: Option<WatchHandle> = None;
-        let result = self.dispatch_loop(reader, &out_tx, &mut watch);
+        let mut searches = SearchState::default();
+        let result = self.dispatch_loop(reader, &out_tx, &mut watch, &mut searches);
 
-        // Tear down in order: stop the watcher (closes its path channel and
-        // exits the coalescer), then drop our sender so the writer thread
-        // sees the channel close and exits, then join it.
+        // Tear down in order: cancel + join any in-flight searches and stop
+        // the watcher (both hold `out` senders), then drop our sender so the
+        // writer thread sees the channel close and exits, then join it.
+        searches.shutdown();
         drop(watch);
         drop(out_tx);
         let _ = writer_handle.join();
         result
     }
 
-    /// Read framed requests, dispatching each and sending its response (and,
-    /// for `fs.watch`, managing the subscription) to the outbound `out`
-    /// channel. Returns on clean EOF or a transport error.
+    /// Read framed requests, dispatching each and sending its response to the
+    /// outbound `out` channel. Long-running/streaming methods are handled
+    /// out-of-band: `fs.watch` manages a subscription, and `fs.search` spawns
+    /// a worker that streams results and sends the final response itself.
     fn dispatch_loop<R: BufRead>(
         &self,
         reader: &mut R,
         out: &mpsc::Sender<Vec<u8>>,
         watch: &mut Option<WatchHandle>,
+        searches: &mut SearchState,
     ) -> io::Result<()> {
         while let Some(body) = framing::read_frame(reader)? {
-            let response = match serde_json::from_slice::<Request>(&body) {
-                Ok(req) if req.method == methods::FS_WATCH => self.handle_watch(&req, out, watch),
-                Ok(req) => self.handle(&req),
-                Err(e) => Response::err(
-                    0,
-                    RpcError::new(error_codes::PARSE_ERROR, format!("invalid request: {e}")),
-                ),
+            let req = match serde_json::from_slice::<Request>(&body) {
+                Ok(req) => req,
+                Err(e) => {
+                    let response = Response::err(
+                        0,
+                        RpcError::new(error_codes::PARSE_ERROR, format!("invalid request: {e}")),
+                    );
+                    send_body(out, &serde_json::to_vec(&response)?)?;
+                    continue;
+                }
             };
-            send_body(out, &serde_json::to_vec(&response)?)?;
+            match req.method.as_str() {
+                methods::FS_WATCH => {
+                    let response = self.handle_watch(&req, out, watch);
+                    send_body(out, &serde_json::to_vec(&response)?)?;
+                }
+                // The worker owns this request's response; nothing to send now.
+                methods::FS_SEARCH => self.start_search(&req, out, searches),
+                methods::FS_CANCEL_SEARCH => {
+                    let response = handle_cancel_search(&req, searches);
+                    send_body(out, &serde_json::to_vec(&response)?)?;
+                }
+                _ => {
+                    let response = self.handle(&req);
+                    send_body(out, &serde_json::to_vec(&response)?)?;
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Spawn a worker that runs a streaming content search, pushing
+    /// [`methods::FS_SEARCH_RESULT`] notification batches to `out` and, when
+    /// done, the final [`Response`] carrying a [`SearchSummary`]. The search's
+    /// cancel flag is registered in `searches` under its `searchId` so a
+    /// later [`methods::FS_CANCEL_SEARCH`] can stop it.
+    fn start_search(&self, req: &Request, out: &mpsc::Sender<Vec<u8>>, searches: &mut SearchState) {
+        let params: SearchParams = match parse_params(req) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = send_body(out, &to_vec_lossy(&Response::err(req.id, e)));
+                return;
+            }
+        };
+        let id = req.id;
+        let search_id = params.search_id;
+        let cancel = Arc::new(AtomicBool::new(false));
+        searches.register(search_id, cancel.clone());
+
+        let root = self.root.clone();
+        let out = out.clone();
+        let active = searches.active.clone();
+        let handle = thread::Builder::new()
+            .name("fleet-agent-search".into())
+            .spawn(move || {
+                run_search_worker(id, search_id, root, params, cancel, out);
+                // Drop our registration so a stale searchId can't be cancelled
+                // (and to bound the map to live searches).
+                active.lock().unwrap().remove(&search_id);
+            })
+            .ok();
+        if let Some(handle) = handle {
+            searches.workers.push(handle);
+        }
     }
 
     /// Start or stop the workspace watcher per [`FsWatchParams`].
@@ -186,6 +249,7 @@ impl Server {
                 fs: true,
                 git: true,
                 watch: true,
+                search: true,
             },
         })
     }
@@ -354,6 +418,118 @@ const WATCH_COALESCE_WINDOW: Duration = Duration::from_millis(150);
 fn send_body(out: &mpsc::Sender<Vec<u8>>, body: &[u8]) -> io::Result<()> {
     out.send(body.to_vec())
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer thread ended"))
+}
+
+/// Serialize a value we already know is serializable (protocol envelopes),
+/// falling back to an empty vec on the impossible error so callers on the
+/// teardown path don't have to thread another `Result`.
+fn to_vec_lossy(value: &impl serde::Serialize) -> Vec<u8> {
+    serde_json::to_vec(value).unwrap_or_default()
+}
+
+/// How many matches to accumulate before flushing an `fs.searchResult`
+/// notification. Bounds per-frame size for a match-dense search while
+/// keeping the stream responsive.
+const SEARCH_BATCH: usize = 128;
+
+/// Tracks in-flight [`methods::FS_SEARCH`] workers so they can be cancelled
+/// individually (by `searchId`) and joined on shutdown.
+#[derive(Default)]
+struct SearchState {
+    /// `searchId` → its cancellation flag. Workers remove their own entry on
+    /// completion, so a present entry means "still running".
+    active: Arc<std::sync::Mutex<HashMap<u64, Arc<AtomicBool>>>>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl SearchState {
+    fn register(&self, search_id: u64, cancel: Arc<AtomicBool>) {
+        self.active.lock().unwrap().insert(search_id, cancel);
+    }
+
+    /// Signal every in-flight search to stop and join all worker threads.
+    /// Called on daemon teardown so no worker outlives the writer channel.
+    fn shutdown(&mut self) {
+        for cancel in self.active.lock().unwrap().values() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        for handle in self.workers.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Body of a search worker thread: walk + match, streaming coalesced
+/// notification batches, then send the final summary response.
+fn run_search_worker(
+    id: u64,
+    search_id: u64,
+    root: PathBuf,
+    params: SearchParams,
+    cancel: Arc<AtomicBool>,
+    out: mpsc::Sender<Vec<u8>>,
+) {
+    let req = SearchRequest {
+        query: params.query,
+        is_regex: params.is_regex,
+        case_sensitive: params.case_sensitive,
+        max_results: params.max_results,
+    };
+
+    let mut batch: Vec<fleet_protocol::SearchMatch> = Vec::with_capacity(SEARCH_BATCH);
+    let flush = |batch: &mut Vec<fleet_protocol::SearchMatch>| {
+        if batch.is_empty() {
+            return;
+        }
+        let note = Notification::new(
+            methods::FS_SEARCH_RESULT,
+            SearchResultParams {
+                search_id,
+                matches: std::mem::take(batch),
+            },
+        );
+        let _ = send_body(&out, &to_vec_lossy(&note));
+    };
+
+    let outcome = run_search(&root, &req, &cancel, |m| {
+        batch.push(m);
+        if batch.len() >= SEARCH_BATCH {
+            flush(&mut batch);
+        }
+    });
+
+    // Flush any tail matches before the final response so ordering holds.
+    flush(&mut batch);
+
+    let response = match outcome {
+        Ok(o) => Response::ok(
+            id,
+            SearchSummary {
+                count: o.count,
+                truncated: o.truncated,
+                cancelled: o.cancelled,
+            },
+        ),
+        Err(msg) => Response::err(id, RpcError::new(error_codes::INVALID_PARAMS, msg)),
+    };
+    let _ = send_body(&out, &to_vec_lossy(&response));
+}
+
+/// Handle [`methods::FS_CANCEL_SEARCH`]: flip the target search's cancel
+/// flag if it's still running.
+fn handle_cancel_search(req: &Request, searches: &SearchState) -> Response {
+    let params: CancelSearchParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(e) => return Response::err(req.id, e),
+    };
+    let cancelled = match searches.active.lock().unwrap().get(&params.search_id) {
+        Some(cancel) => {
+            cancel.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    };
+    Response::ok(req.id, CancelSearchResult { cancelled })
 }
 
 /// Owns an active filesystem watch: the `notify` watcher plus the coalescer

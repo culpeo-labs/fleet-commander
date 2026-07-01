@@ -29,6 +29,12 @@ pub mod methods {
     pub const GIT_BRANCH: &str = "git.branch";
     /// Request: unified diff for a single path (Phase 3).
     pub const GIT_DIFF: &str = "git.diff";
+    /// Request: start a streaming content search over the workspace (Phase 3).
+    pub const FS_SEARCH: &str = "fs.search";
+    /// Request: cancel an in-flight [`FS_SEARCH`] by its `searchId` (Phase 3).
+    pub const FS_CANCEL_SEARCH: &str = "fs.cancelSearch";
+    /// Server→client notification: a batch of search matches (Phase 3).
+    pub const FS_SEARCH_RESULT: &str = "fs.searchResult";
     /// Request: start or stop watching the workspace for changes.
     pub const FS_WATCH: &str = "fs.watch";
     /// Server→client notification: the workspace changed (Phase 2).
@@ -209,6 +215,10 @@ pub struct Capabilities {
     /// older daemon that omits the field is treated as non-watching.
     #[serde(default)]
     pub watch: bool,
+    /// The server supports streaming content search via [`methods::FS_SEARCH`]
+    /// (Phase 3). Defaults to `false` for older daemons.
+    #[serde(default)]
+    pub search: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -340,6 +350,75 @@ pub struct FsWatchResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct FsDidChangeParams {
     pub paths: Vec<String>,
+}
+
+/// Params for [`methods::FS_SEARCH`]: start a streaming content search.
+///
+/// `search_id` is a client-assigned handle used to correlate the streamed
+/// [`SearchResultParams`] notifications and to target a later
+/// [`methods::FS_CANCEL_SEARCH`]. `max_results` caps the total number of
+/// matches streamed before the server stops early and reports `truncated`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchParams {
+    pub search_id: u64,
+    pub query: String,
+    /// Treat `query` as a regular expression instead of a literal.
+    #[serde(default)]
+    pub is_regex: bool,
+    /// Match case-sensitively. Defaults to smart/insensitive (`false`).
+    #[serde(default)]
+    pub case_sensitive: bool,
+    /// Stop after this many matches (server reports `truncated`). `None`
+    /// means unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_results: Option<u64>,
+}
+
+/// A single content-search hit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchMatch {
+    /// Workspace-relative path (forward slashes).
+    pub path: String,
+    /// 1-based line number of the match.
+    pub line: u64,
+    /// 1-based column (byte offset within the line) of the match start.
+    pub column: u64,
+    /// The full matching line, with trailing newline stripped.
+    pub text: String,
+}
+
+/// Params for the [`methods::FS_SEARCH_RESULT`] notification: a coalesced
+/// batch of matches for one `search_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchResultParams {
+    pub search_id: u64,
+    pub matches: Vec<SearchMatch>,
+}
+
+/// Final result of an [`methods::FS_SEARCH`] request: how many matches were
+/// emitted and whether the search stopped early (hit `max_results` or was
+/// cancelled).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchSummary {
+    pub count: u64,
+    pub truncated: bool,
+    /// `true` when the search ended because of a
+    /// [`methods::FS_CANCEL_SEARCH`] request.
+    #[serde(default)]
+    pub cancelled: bool,
+}
+
+/// Params for [`methods::FS_CANCEL_SEARCH`]: which in-flight search to stop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CancelSearchParams {
+    pub search_id: u64,
+}
+
+/// Result of [`methods::FS_CANCEL_SEARCH`]: whether a matching in-flight
+/// search was found and signalled.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CancelSearchResult {
+    pub cancelled: bool,
 }
 
 // ─── Framing ───────────────────────────────────────────────────────────
