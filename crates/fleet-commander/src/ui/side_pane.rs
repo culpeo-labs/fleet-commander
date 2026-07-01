@@ -88,6 +88,75 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, pane: &SidePane, focused: bool)
                 );
             frame.render_widget(paragraph, area);
         }
+        SidePane::Search {
+            query,
+            matches,
+            selected,
+            scroll,
+            running,
+            summary,
+            ..
+        } => {
+            let status = if *running {
+                " — searching…".to_string()
+            } else if let Some(s) = summary {
+                if s.cancelled {
+                    " — cancelled".to_string()
+                } else if s.truncated {
+                    format!(" ({} matches, truncated)", s.count)
+                } else {
+                    format!(" ({} matches)", s.count)
+                }
+            } else {
+                String::new()
+            };
+            let title = format!(" Search: {query}{status} ");
+            let lines: Vec<Line<'_>> = if matches.is_empty() {
+                let msg = if *running {
+                    "Searching…"
+                } else {
+                    "No matches."
+                };
+                vec![Line::from(Span::styled(
+                    msg,
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else {
+                matches
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        let selected_row = i == *selected;
+                        let loc = format!("{}:{}", m.path, m.line);
+                        let loc_style = if selected_row {
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Cyan)
+                        };
+                        let text_style = if selected_row {
+                            Style::default().fg(Color::Black).bg(Color::Cyan)
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        };
+                        Line::from(vec![
+                            Span::styled(loc, loc_style),
+                            Span::styled("  ", text_style),
+                            Span::styled(m.text.trim_end().to_string(), text_style),
+                        ])
+                    })
+                    .collect()
+            };
+            let paragraph = Paragraph::new(lines).scroll((*scroll, 0)).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(style),
+            );
+            frame.render_widget(paragraph, area);
+        }
     }
 }
 
@@ -218,5 +287,83 @@ mod tests {
             text.contains("View and manage"),
             "session desc missing:\n{text}"
         );
+    }
+
+    fn search_match(
+        path: &str,
+        line: u64,
+        text: &str,
+    ) -> fleet_commander_core::fleet_protocol::SearchMatch {
+        fleet_commander_core::fleet_protocol::SearchMatch {
+            path: path.into(),
+            line,
+            column: 1,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn search_pane_shows_query_and_matches() {
+        let pane = SidePane::Search {
+            query: "needle".into(),
+            search_id: 0,
+            matches: vec![
+                search_match("src/a.rs", 12, "let needle = 1;"),
+                search_match("src/b.rs", 3, "// needle here"),
+            ],
+            selected: 0,
+            scroll: 0,
+            running: false,
+            summary: Some(fleet_commander_core::fleet_protocol::SearchSummary {
+                count: 2,
+                truncated: false,
+                cancelled: false,
+            }),
+        };
+        let app = app_with_side_pane(pane, SessionFocus::SidePane);
+        let text = render_to_string(&app, 100, 12);
+        assert!(text.contains("Search: needle"), "title missing:\n{text}");
+        assert!(text.contains("2 matches"), "summary missing:\n{text}");
+        assert!(text.contains("src/a.rs:12"), "hit path missing:\n{text}");
+        assert!(
+            text.contains("let needle = 1;"),
+            "hit text missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn search_pane_shows_searching_while_running() {
+        let pane = SidePane::Search {
+            query: "foo".into(),
+            search_id: 0,
+            matches: vec![],
+            selected: 0,
+            scroll: 0,
+            running: true,
+            summary: None,
+        };
+        let app = app_with_side_pane(pane, SessionFocus::SidePane);
+        let text = render_to_string(&app, 100, 12);
+        assert!(text.contains("searching"), "running hint missing:\n{text}");
+    }
+
+    #[test]
+    fn search_pane_reports_no_matches() {
+        let pane = SidePane::Search {
+            query: "zzz".into(),
+            search_id: 0,
+            matches: vec![],
+            selected: 0,
+            scroll: 0,
+            running: false,
+            summary: Some(fleet_commander_core::fleet_protocol::SearchSummary {
+                count: 0,
+                truncated: false,
+                cancelled: false,
+            }),
+        };
+        let app = app_with_side_pane(pane, SessionFocus::SidePane);
+        let text = render_to_string(&app, 100, 12);
+        assert!(text.contains("No matches"), "empty hint missing:\n{text}");
     }
 }

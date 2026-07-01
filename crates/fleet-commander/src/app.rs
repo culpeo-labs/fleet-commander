@@ -33,6 +33,11 @@ use crate::explorer::ExplorerState;
 use crate::init;
 use crate::workspace;
 
+/// Cap on how many content-search hits the daemon streams back before it
+/// stops and flags the result truncated. Keeps a broad match on a large tree
+/// from flooding the UI.
+const SEARCH_MAX_RESULTS: u64 = 2_000;
+
 #[derive(Debug, Clone)]
 pub enum Screen {
     AgentList {
@@ -79,6 +84,19 @@ pub enum SidePane {
         commands: Vec<crate::agent::AvailableCommand>,
         scroll: u16,
     },
+    /// Streaming content-search results for the workspace. Populated
+    /// incrementally as `fs.searchResult` batches arrive and finalized
+    /// by `fs.searchDone`. `selected` is the highlighted result row (for
+    /// jump-to-file); `running` is true until the terminal summary lands.
+    Search {
+        query: String,
+        search_id: u64,
+        matches: Vec<fleet_commander_core::fleet_protocol::SearchMatch>,
+        selected: usize,
+        scroll: u16,
+        running: bool,
+        summary: Option<fleet_commander_core::fleet_protocol::SearchSummary>,
+    },
 }
 
 impl SidePane {
@@ -87,7 +105,8 @@ impl SidePane {
         match self {
             SidePane::Diff { scroll, .. }
             | SidePane::FileView { scroll, .. }
-            | SidePane::Commands { scroll, .. } => scroll,
+            | SidePane::Commands { scroll, .. }
+            | SidePane::Search { scroll, .. } => scroll,
         }
     }
 
@@ -140,6 +159,15 @@ pub struct App {
     /// changes. Meaningful only while [`ui::slash_popover::extract_prefix`]
     /// returns `Some` for [`Self::input_buffer`].
     pub slash_selected: usize,
+    /// When true, the user is typing a workspace search query (opened with
+    /// `/` while the explorer is focused). Captures keys like command mode.
+    pub search_mode: bool,
+    /// Buffer for the search query being typed while [`Self::search_mode`].
+    pub search_query: String,
+    /// Monotonic id handed to each launched search so streamed
+    /// `fs.searchResult`/`fs.searchDone` events can be correlated to the
+    /// pane that started them (and stale results dropped).
+    pub search_next_id: u64,
 }
 
 /// A tool permission request waiting for the user's decision. Rendered
@@ -188,6 +216,9 @@ impl App {
             acp_log_filter,
             explorer: ExplorerState::default(),
             slash_selected: 0,
+            search_mode: false,
+            search_query: String::new(),
+            search_next_id: 0,
         }
     }
 
@@ -329,6 +360,7 @@ impl App {
                 root,
                 full_path,
                 result,
+                scroll_to,
             } => {
                 let root_matches = self
                     .explorer
@@ -344,7 +376,7 @@ impl App {
                     *side_pane = Some(SidePane::FileView {
                         path: full_path,
                         content,
-                        scroll: 0,
+                        scroll: scroll_to,
                     });
                 }
             }
@@ -375,6 +407,48 @@ impl App {
                         content,
                         scroll: 0,
                     });
+                }
+            }
+            AppEvent::SearchResults {
+                agent_id,
+                search_id,
+                matches,
+            } => {
+                if self.viewed_agent_id().as_ref() == Some(&agent_id)
+                    && let Screen::AgentSession {
+                        side_pane:
+                            Some(SidePane::Search {
+                                search_id: pane_id,
+                                matches: pane_matches,
+                                ..
+                            }),
+                        ..
+                    } = &mut self.screen
+                    && *pane_id == search_id
+                {
+                    pane_matches.extend(matches);
+                }
+            }
+            AppEvent::SearchDone {
+                agent_id,
+                search_id,
+                summary,
+            } => {
+                if self.viewed_agent_id().as_ref() == Some(&agent_id)
+                    && let Screen::AgentSession {
+                        side_pane:
+                            Some(SidePane::Search {
+                                search_id: pane_id,
+                                running,
+                                summary: pane_summary,
+                                ..
+                            }),
+                        ..
+                    } = &mut self.screen
+                    && *pane_id == search_id
+                {
+                    *running = false;
+                    *pane_summary = Some(summary);
                 }
             }
             AppEvent::AgentBranchReady {
@@ -428,15 +502,44 @@ impl App {
             // The sink runs on the transport's reader thread, so it only does
             // a cheap non-blocking channel send.
             let sink: fleet_commander_core::service_fs::NotificationSink = {
+                use fleet_commander_core::fleet_protocol::{
+                    Notification, SearchDoneParams, SearchResultParams, methods,
+                };
                 let tx = tx.clone();
                 let agent_id = agent_id.clone();
                 let container_id = container_id.clone();
                 Box::new(move |note| {
-                    if note.method == fleet_commander_core::fleet_protocol::methods::FS_DID_CHANGE {
-                        let _ = tx.send(AppEvent::ExplorerFsChanged {
-                            agent_id: agent_id.clone(),
-                            container_id: container_id.clone(),
-                        });
+                    let Notification { method, params, .. } = note;
+                    match method.as_str() {
+                        m if m == methods::FS_DID_CHANGE => {
+                            let _ = tx.send(AppEvent::ExplorerFsChanged {
+                                agent_id: agent_id.clone(),
+                                container_id: container_id.clone(),
+                            });
+                        }
+                        m if m == methods::FS_SEARCH_RESULT => {
+                            if let Some(params) = params
+                                .and_then(|p| serde_json::from_value::<SearchResultParams>(p).ok())
+                            {
+                                let _ = tx.send(AppEvent::SearchResults {
+                                    agent_id: agent_id.clone(),
+                                    search_id: params.search_id,
+                                    matches: params.matches,
+                                });
+                            }
+                        }
+                        m if m == methods::FS_SEARCH_DONE => {
+                            if let Some(params) = params
+                                .and_then(|p| serde_json::from_value::<SearchDoneParams>(p).ok())
+                            {
+                                let _ = tx.send(AppEvent::SearchDone {
+                                    agent_id: agent_id.clone(),
+                                    search_id: params.search_id,
+                                    summary: params.summary,
+                                });
+                            }
+                        }
+                        _ => {}
                     }
                 })
             };
@@ -727,6 +830,30 @@ impl App {
             return;
         }
 
+        // Search input mode (`/` prompt in the explorer) — intercept keys to
+        // build the query. Enter launches the search, Esc aborts.
+        if self.search_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.search_mode = false;
+                    self.search_query.clear();
+                }
+                KeyCode::Enter => {
+                    self.search_mode = false;
+                    let query = std::mem::take(&mut self.search_query);
+                    self.launch_search(query);
+                }
+                KeyCode::Backspace => {
+                    if self.search_query.pop().is_none() {
+                        self.search_mode = false;
+                    }
+                }
+                KeyCode::Char(c) => self.search_query.push(c),
+                _ => {}
+            }
+            return;
+        }
+
         // In input mode, capture text instead of dispatching actions.
         if let Screen::AgentSession {
             input_mode: true,
@@ -863,6 +990,17 @@ impl App {
                             self.request_explorer_diff(entry.path);
                         }
                     }
+                    '/' => {
+                        // Begin composing a workspace content search. Only
+                        // meaningful on a search-capable (remote) backend.
+                        if self.explorer.fs.as_ref().is_some_and(|fs| fs.is_remote()) {
+                            self.search_mode = true;
+                            self.search_query.clear();
+                        } else {
+                            self.status_message =
+                                Some("Search needs a container-backed workspace".into());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -875,6 +1013,11 @@ impl App {
             self.command_buffer.clear();
             return;
         }
+
+        // Snapshot a running search before dispatch so we can cancel it if
+        // this action dismisses (or replaces) the pane. Spawning the cancel
+        // RPC needs `&mut App`, so it can't happen inside the pure dispatcher.
+        let running_before = self.running_search_id();
 
         let next = match &mut self.screen {
             Screen::AgentList { selected } => {
@@ -903,6 +1046,13 @@ impl App {
                 self.ensure_agent_connected(agent_id.clone());
             }
         }
+        // If a running search's pane is no longer present (dismissed or
+        // replaced), tell the daemon to stop it so it doesn't keep scanning.
+        if let Some(id) = running_before
+            && self.running_search_id() != Some(id)
+        {
+            self.cancel_search(id);
+        }
         // Toggling the explorer open is the one mutation handle_session_action
         // makes that the user expects to see freshly-resolved git status for.
         // Issue the refresh from here because spawning the background task
@@ -921,7 +1071,10 @@ impl App {
             return;
         }
         if let Some(rel) = self.explorer.pending_open.take() {
-            self.open_explorer_file(rel);
+            match self.explorer.pending_open_line.take() {
+                Some(line) => self.open_search_result(rel, line),
+                None => self.open_explorer_file(rel),
+            }
         }
         let Some(fs) = self.explorer.fs.clone() else {
             return;
@@ -975,6 +1128,7 @@ impl App {
                 root,
                 full_path,
                 result,
+                scroll_to: 0,
             });
         });
     }
@@ -999,6 +1153,143 @@ impl App {
                 root,
                 full_path,
                 result,
+            });
+        });
+    }
+
+    /// Launch a streaming workspace content search for `query`. Cancels any
+    /// still-running search first, opens a fresh [`SidePane::Search`] focused
+    /// for navigation, and kicks off `fs.start_search` off the UI thread —
+    /// results stream back via the notification sink as `SearchResults`/
+    /// `SearchDone` events. No-op for an empty query or a non-search backend.
+    fn launch_search(&mut self, query: String) {
+        let query = query.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        let Some(fs) = self.explorer.fs.clone() else {
+            return;
+        };
+        if !fs.is_remote() {
+            self.status_message = Some("Search needs a container-backed workspace".into());
+            return;
+        }
+        // Stop a previous in-flight search so its late results can't bleed
+        // into the new pane (they carry the old search_id and are dropped,
+        // but cancelling also frees the daemon worker).
+        if let Some(prev) = self.running_search_id() {
+            self.cancel_search(prev);
+        }
+
+        let search_id = self.search_next_id;
+        self.search_next_id += 1;
+
+        if let Screen::AgentSession {
+            side_pane, focus, ..
+        } = &mut self.screen
+        {
+            *side_pane = Some(SidePane::Search {
+                query: query.clone(),
+                search_id,
+                matches: Vec::new(),
+                selected: 0,
+                scroll: 0,
+                running: true,
+                summary: None,
+            });
+            *focus = SessionFocus::SidePane;
+        }
+
+        let params = fleet_commander_core::fleet_protocol::SearchParams {
+            search_id,
+            query,
+            is_regex: false,
+            case_sensitive: false,
+            max_results: Some(SEARCH_MAX_RESULTS),
+        };
+        let tx = self.tx.clone();
+        let agent_id = self.viewed_agent_id();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = fs.start_search(params) {
+                info!(error = %e, "start_search failed");
+                // Signal completion so the pane stops showing "searching…".
+                if let Some(agent_id) = agent_id {
+                    let _ = tx.send(AppEvent::SearchDone {
+                        agent_id,
+                        search_id,
+                        summary: fleet_commander_core::fleet_protocol::SearchSummary {
+                            count: 0,
+                            truncated: false,
+                            cancelled: true,
+                        },
+                    });
+                }
+            }
+        });
+    }
+
+    /// The id of the currently-visible search if it is still running,
+    /// otherwise `None`.
+    fn running_search_id(&self) -> Option<u64> {
+        match &self.screen {
+            Screen::AgentSession {
+                side_pane:
+                    Some(SidePane::Search {
+                        search_id,
+                        running: true,
+                        ..
+                    }),
+                ..
+            } => Some(*search_id),
+            _ => None,
+        }
+    }
+
+    /// Ask the in-container service to stop `search_id` off the UI thread.
+    /// Best-effort: the pane's `running` flag clears when the (still
+    /// delivered) `fs.searchDone` summary arrives flagged cancelled.
+    fn cancel_search(&self, search_id: u64) {
+        let Some(fs) = self.explorer.fs.clone() else {
+            return;
+        };
+        tokio::task::spawn_blocking(move || {
+            let _ = fs.cancel_search(search_id);
+        });
+    }
+
+    /// Open a search result in the side pane, jumping the preview to the
+    /// match's line. Reads off the UI thread (a possibly-remote RPC) and
+    /// delivers [`AppEvent::ExplorerFileReady`] with the target scroll.
+    fn open_search_result(&self, rel: PathBuf, line: u64) {
+        let Some(fs) = self.explorer.fs.clone() else {
+            return;
+        };
+        let Some(agent_id) = self.viewed_agent_id() else {
+            return;
+        };
+        let root = fs.root_display().to_path_buf();
+        let full_path = root.join(&rel);
+        // Center the match a few lines below the top of the viewport.
+        let scroll_to = (line.saturating_sub(1)) as u16;
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            const PREVIEW_CAP: u64 = 256 * 1024;
+            let result = fs
+                .read_file_capped(&rel, PREVIEW_CAP)
+                .map(|capped| {
+                    let mut text = String::from_utf8_lossy(&capped.bytes).into_owned();
+                    if capped.truncated {
+                        text.push_str("\n\n… [truncated preview — file larger than 256 KiB]");
+                    }
+                    text
+                })
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::ExplorerFileReady {
+                agent_id,
+                root,
+                full_path,
+                result,
+                scroll_to,
             });
         });
     }
@@ -1590,13 +1881,22 @@ fn handle_session_action(
             None
         }
         Action::Down => {
-            // When the side pane is focused, Down/Up scroll the pane (diff,
-            // file preview, or commands browser) rather than the conversation.
+            // When the side pane is focused, Down/Up move within it. The
+            // search pane has a selectable result list; other panes scroll.
             if *focus == SessionFocus::SidePane
                 && let Some(pane) = side_pane.as_mut()
             {
-                let s = pane.scroll_mut();
-                *s = s.saturating_add(1);
+                if let SidePane::Search {
+                    matches, selected, ..
+                } = pane
+                {
+                    if !matches.is_empty() {
+                        *selected = (*selected + 1).min(matches.len() - 1);
+                    }
+                } else {
+                    let s = pane.scroll_mut();
+                    *s = s.saturating_add(1);
+                }
                 return None;
             }
             *scroll = scroll.saturating_add(1);
@@ -1606,8 +1906,12 @@ fn handle_session_action(
             if *focus == SessionFocus::SidePane
                 && let Some(pane) = side_pane.as_mut()
             {
-                let s = pane.scroll_mut();
-                *s = s.saturating_sub(1);
+                if let SidePane::Search { selected, .. } = pane {
+                    *selected = selected.saturating_sub(1);
+                } else {
+                    let s = pane.scroll_mut();
+                    *s = s.saturating_sub(1);
+                }
                 return None;
             }
             if *scroll == usize::MAX {
@@ -1627,6 +1931,21 @@ fn handle_session_action(
         }
         Action::FollowBottom => {
             *scroll = usize::MAX;
+            None
+        }
+        Action::Activate => {
+            // Enter on a focused search result opens the file and jumps the
+            // preview to the hit's line. The (possibly remote) read is
+            // serviced by `App::sync_explorer` via the pending-open fields.
+            if *focus == SessionFocus::SidePane
+                && let Some(SidePane::Search {
+                    matches, selected, ..
+                }) = side_pane.as_ref()
+                && let Some(hit) = matches.get(*selected)
+            {
+                explorer.pending_open = Some(PathBuf::from(&hit.path));
+                explorer.pending_open_line = Some(hit.line);
+            }
             None
         }
         _ => None,
@@ -2929,5 +3248,137 @@ mod tests {
             agent.container.is_none(),
             "rebuild must clear the agent's container handle"
         );
+    }
+
+    fn hit(path: &str, line: u64, text: &str) -> fleet_commander_core::fleet_protocol::SearchMatch {
+        fleet_commander_core::fleet_protocol::SearchMatch {
+            path: path.into(),
+            line,
+            column: 1,
+            text: text.into(),
+        }
+    }
+
+    /// Enter agent a1's session with an open, running search pane focused.
+    fn app_with_search_pane(search_id: u64) -> App {
+        let mut app = app_with_agents();
+        app.handle(press(KeyCode::Enter)); // enter a1's session
+        if let Screen::AgentSession {
+            side_pane, focus, ..
+        } = &mut app.screen
+        {
+            *side_pane = Some(SidePane::Search {
+                query: "needle".into(),
+                search_id,
+                matches: Vec::new(),
+                selected: 0,
+                scroll: 0,
+                running: true,
+                summary: None,
+            });
+            *focus = SessionFocus::SidePane;
+        }
+        app
+    }
+
+    #[test]
+    fn search_results_append_to_matching_pane() {
+        let mut app = app_with_search_pane(7);
+        app.handle(AppEvent::SearchResults {
+            agent_id: "a1".into(),
+            search_id: 7,
+            matches: vec![hit("src/a.rs", 1, "a"), hit("src/b.rs", 2, "b")],
+        });
+        app.handle(AppEvent::SearchResults {
+            agent_id: "a1".into(),
+            search_id: 7,
+            matches: vec![hit("src/c.rs", 3, "c")],
+        });
+        match &app.screen {
+            Screen::AgentSession {
+                side_pane: Some(SidePane::Search { matches, .. }),
+                ..
+            } => assert_eq!(matches.len(), 3),
+            other => panic!("expected search pane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_results_for_stale_id_are_dropped() {
+        let mut app = app_with_search_pane(7);
+        app.handle(AppEvent::SearchResults {
+            agent_id: "a1".into(),
+            search_id: 99, // does not match the pane's id
+            matches: vec![hit("src/a.rs", 1, "a")],
+        });
+        match &app.screen {
+            Screen::AgentSession {
+                side_pane: Some(SidePane::Search { matches, .. }),
+                ..
+            } => assert!(matches.is_empty()),
+            other => panic!("expected search pane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_done_clears_running_and_records_summary() {
+        let mut app = app_with_search_pane(7);
+        app.handle(AppEvent::SearchDone {
+            agent_id: "a1".into(),
+            search_id: 7,
+            summary: fleet_commander_core::fleet_protocol::SearchSummary {
+                count: 4,
+                truncated: true,
+                cancelled: false,
+            },
+        });
+        match &app.screen {
+            Screen::AgentSession {
+                side_pane:
+                    Some(SidePane::Search {
+                        running, summary, ..
+                    }),
+                ..
+            } => {
+                assert!(!running);
+                assert_eq!(summary.as_ref().map(|s| s.count), Some(4));
+            }
+            other => panic!("expected search pane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn down_moves_search_selection_not_scroll() {
+        let mut app = app_with_search_pane(7);
+        app.handle(AppEvent::SearchResults {
+            agent_id: "a1".into(),
+            search_id: 7,
+            matches: vec![hit("a", 1, "a"), hit("b", 2, "b"), hit("c", 3, "c")],
+        });
+        app.handle(press(KeyCode::Char('j')));
+        app.handle(press(KeyCode::Char('j')));
+        // Extra Down must clamp at the last row, not overflow.
+        app.handle(press(KeyCode::Char('j')));
+        match &app.screen {
+            Screen::AgentSession {
+                side_pane: Some(SidePane::Search { selected, .. }),
+                ..
+            } => assert_eq!(*selected, 2),
+            other => panic!("expected search pane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activate_search_hit_sets_pending_open_with_line() {
+        let mut app = app_with_search_pane(7);
+        app.handle(AppEvent::SearchResults {
+            agent_id: "a1".into(),
+            search_id: 7,
+            matches: vec![hit("src/a.rs", 10, "x"), hit("src/b.rs", 42, "y")],
+        });
+        app.handle(press(KeyCode::Char('j'))); // select the second hit
+        app.handle(press(KeyCode::Enter));
+        assert_eq!(app.explorer.pending_open, Some(PathBuf::from("src/b.rs")));
+        assert_eq!(app.explorer.pending_open_line, Some(42));
     }
 }

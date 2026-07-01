@@ -22,6 +22,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     if app.command_mode {
         render_command_bar(frame, bar_area, &app.command_buffer);
+    } else if app.search_mode {
+        render_search_bar(frame, bar_area, &app.search_query);
     } else if let Some(msg) = &app.status_message {
         render_status_bar(frame, bar_area, msg);
     }
@@ -37,6 +39,19 @@ fn render_command_bar(frame: &mut Frame<'_>, area: Rect, buffer: &str) {
             .add_modifier(Modifier::BOLD),
     ))
     .style(Style::default().bg(Color::DarkGray));
+    frame.render_widget(bar, area);
+}
+
+fn render_search_bar(frame: &mut Frame<'_>, area: Rect, query: &str) {
+    let text = format!("/{query}");
+    let bar = Paragraph::new(Span::styled(
+        text,
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))
+    .style(Style::default().bg(Color::Cyan));
     frame.render_widget(bar, area);
 }
 
@@ -93,6 +108,34 @@ mod tests {
         let bottom = bottom_row(&text);
         assert!(bottom.contains(":live"), "command bar missing: {bottom}");
         assert!(!bottom.contains("stale"), "status leaked through: {bottom}");
+    }
+
+    #[test]
+    fn search_mode_renders_query_on_bottom_row() {
+        let mut app = test_app();
+        app.search_mode = true;
+        app.search_query = "needle".into();
+        let text = render_to_string(&app, 40, 8);
+        assert!(
+            bottom_row(&text).contains("/needle"),
+            "search prompt missing from bottom row:\n{text}"
+        );
+    }
+
+    #[test]
+    fn command_mode_takes_precedence_over_search_mode() {
+        let mut app = test_app();
+        app.command_mode = true;
+        app.command_buffer = "live".into();
+        app.search_mode = true;
+        app.search_query = "stale".into();
+        let text = render_to_string(&app, 40, 8);
+        let bottom = bottom_row(&text);
+        assert!(bottom.contains(":live"), "command bar missing: {bottom}");
+        assert!(
+            !bottom.contains("/stale"),
+            "search leaked through: {bottom}"
+        );
     }
 
     #[test]
