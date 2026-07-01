@@ -18,9 +18,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use fleet_protocol::{
     Capabilities, FsDidChangeParams, FsEntry, FsListParams, FsListResult, FsReadParams,
     FsReadResult, FsStatParams, FsStatResult, FsWatchParams, FsWatchResult, GitBranchResult,
-    GitStatusEntry, GitStatusParams, GitStatusResult, InitializeResult, Notification,
-    PROTOCOL_VERSION, Request, Response, RpcError, ServerInfo, WireStatus, error_codes, framing,
-    methods,
+    GitDiffParams, GitDiffResult, GitStatusEntry, GitStatusParams, GitStatusResult,
+    InitializeResult, Notification, PROTOCOL_VERSION, Request, Response, RpcError, ServerInfo,
+    WireStatus, error_codes, framing, methods,
 };
 use notify::{RecursiveMode, Watcher};
 
@@ -163,6 +163,7 @@ impl Server {
             methods::FS_STAT => self.fs_stat(req),
             methods::GIT_STATUS => self.git_status(req),
             methods::GIT_BRANCH => self.git_branch(),
+            methods::GIT_DIFF => self.git_diff(req),
             other => Err(RpcError::new(
                 error_codes::METHOD_NOT_FOUND,
                 format!("unknown method: {other}"),
@@ -259,6 +260,16 @@ impl Server {
         ok(GitBranchResult {
             branch: fleet_git::current_branch(&self.root),
         })
+    }
+
+    fn git_diff(&self, req: &Request) -> Result<serde_json::Value, RpcError> {
+        let params: GitDiffParams = parse_params(req)?;
+        // Validate the path stays inside the workspace before handing it to
+        // git (rejects `..`, absolute paths, and symlink escapes).
+        self.resolve(&params.path)?;
+        let diff = fleet_git::diff(&self.root, Path::new(&params.path), params.staged)
+            .map_err(git_error)?;
+        ok(GitDiffResult { diff })
     }
 
     /// Resolve a workspace-relative request path to an absolute path under
@@ -687,6 +698,38 @@ mod tests {
             serde_json::json!({ "include_ignored": false }),
         );
         assert_eq!(resp.error.unwrap().code, error_codes::NOT_A_REPO);
+    }
+
+    #[test]
+    fn git_diff_outside_repo_maps_to_not_a_repo() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not installed");
+            return;
+        }
+        let tmp = fixture();
+        let server = Server::new(tmp.path());
+        let resp = call(
+            &server,
+            methods::GIT_DIFF,
+            serde_json::json!({ "path": "README.md" }),
+        );
+        assert_eq!(resp.error.unwrap().code, error_codes::NOT_A_REPO);
+    }
+
+    #[test]
+    fn git_diff_path_escape_is_forbidden() {
+        let tmp = fixture();
+        let server = Server::new(tmp.path());
+        let resp = call(
+            &server,
+            methods::GIT_DIFF,
+            serde_json::json!({ "path": "../escape" }),
+        );
+        assert_eq!(resp.error.unwrap().code, error_codes::FORBIDDEN_PATH);
     }
 
     #[test]

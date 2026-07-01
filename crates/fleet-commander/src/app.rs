@@ -348,6 +348,35 @@ impl App {
                     });
                 }
             }
+            AppEvent::ExplorerDiffReady {
+                agent_id,
+                root,
+                full_path,
+                result,
+            } => {
+                let root_matches = self
+                    .explorer
+                    .fs
+                    .as_ref()
+                    .map(|fs| fs.root_display() == root)
+                    .unwrap_or(false);
+                if let Ok(diff) = result
+                    && root_matches
+                    && self.viewed_agent_id().as_ref() == Some(&agent_id)
+                    && let Screen::AgentSession { side_pane, .. } = &mut self.screen
+                {
+                    let content = if diff.trim().is_empty() {
+                        "No changes.".to_string()
+                    } else {
+                        diff
+                    };
+                    *side_pane = Some(SidePane::Diff {
+                        path: full_path,
+                        content,
+                        scroll: 0,
+                    });
+                }
+            }
             AppEvent::AgentBranchReady {
                 agent_id,
                 container_id,
@@ -825,6 +854,15 @@ impl App {
                             }
                         }
                     }
+                    'D' => {
+                        // Show the working-tree diff of the selected file in
+                        // the side pane. Directories have no diff.
+                        if let Some(entry) = self.explorer.selected_entry()
+                            && !entry.is_dir
+                        {
+                            self.request_explorer_diff(entry.path);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -933,6 +971,30 @@ impl App {
                 })
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppEvent::ExplorerFileReady {
+                agent_id,
+                root,
+                full_path,
+                result,
+            });
+        });
+    }
+
+    /// Fetch a `git diff` for an explorer-selected file off the UI
+    /// thread (the diff may be a remote RPC) and deliver it as
+    /// [`AppEvent::ExplorerDiffReady`]. Shows the working-tree diff.
+    fn request_explorer_diff(&self, rel: PathBuf) {
+        let Some(fs) = self.explorer.fs.clone() else {
+            return;
+        };
+        let Some(agent_id) = self.viewed_agent_id() else {
+            return;
+        };
+        let root = fs.root_display().to_path_buf();
+        let full_path = root.join(&rel);
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = fs.git_diff(&rel, false).map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::ExplorerDiffReady {
                 agent_id,
                 root,
                 full_path,
@@ -2658,6 +2720,63 @@ mod tests {
         assert_eq!(info.container_id, "cid");
         assert_eq!(info.remote_user, "vscode");
         assert_eq!(info.remote_workspace_folder, "/workspaces/repo");
+    }
+
+    #[tokio::test]
+    async fn explorer_diff_ready_opens_diff_pane() {
+        let mut app = app_with_container_agent("/ws/repo");
+        app.handle(press(KeyCode::Enter));
+        app.handle(AppEvent::ExplorerDiffReady {
+            agent_id: "a1".into(),
+            root: PathBuf::from("/ws/repo"),
+            full_path: PathBuf::from("/ws/repo/a.txt"),
+            result: Ok("@@ -1 +1 @@\n-a\n+b\n".into()),
+        });
+        match &app.screen {
+            Screen::AgentSession {
+                side_pane: Some(SidePane::Diff { content, path, .. }),
+                ..
+            } => {
+                assert!(content.contains("+b"), "{content}");
+                assert_eq!(path, &PathBuf::from("/ws/repo/a.txt"));
+            }
+            other => panic!("expected Diff pane, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn explorer_diff_ready_empty_shows_no_changes() {
+        let mut app = app_with_container_agent("/ws/repo");
+        app.handle(press(KeyCode::Enter));
+        app.handle(AppEvent::ExplorerDiffReady {
+            agent_id: "a1".into(),
+            root: PathBuf::from("/ws/repo"),
+            full_path: PathBuf::from("/ws/repo/clean.txt"),
+            result: Ok(String::new()),
+        });
+        match &app.screen {
+            Screen::AgentSession {
+                side_pane: Some(SidePane::Diff { content, .. }),
+                ..
+            } => assert_eq!(content, "No changes."),
+            other => panic!("expected Diff pane, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn explorer_diff_ready_ignored_for_different_root() {
+        let mut app = app_with_container_agent("/ws/repo");
+        app.handle(press(KeyCode::Enter));
+        app.handle(AppEvent::ExplorerDiffReady {
+            agent_id: "a1".into(),
+            root: PathBuf::from("/some/other/root"),
+            full_path: PathBuf::from("/some/other/root/a.txt"),
+            result: Ok("diff".into()),
+        });
+        match &app.screen {
+            Screen::AgentSession { side_pane, .. } => assert!(side_pane.is_none()),
+            other => panic!("expected AgentSession, got {other:?}"),
+        }
     }
 
     #[tokio::test]
