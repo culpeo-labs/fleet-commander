@@ -26,8 +26,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use fleet_protocol::{
     FsListParams, FsListResult, FsReadParams, FsReadResult, FsWatchParams, GitBranchResult,
-    GitStatusParams, GitStatusResult, Incoming, InitializeParams, InitializeResult, Notification,
-    PROTOCOL_VERSION, Request, Response, RpcError, WireStatus, error_codes, framing, methods,
+    GitDiffParams, GitDiffResult, GitStatusParams, GitStatusResult, Incoming, InitializeParams,
+    InitializeResult, Notification, PROTOCOL_VERSION, Request, Response, RpcError, WireStatus,
+    error_codes, framing, methods,
 };
 use serde_json::Value;
 
@@ -308,6 +309,28 @@ impl WorkspaceFs for ServiceFs {
             .into_iter()
             .map(|e| (PathBuf::from(e.path), from_wire(e.status)))
             .collect())
+    }
+
+    fn git_diff(&self, rel: &Path, staged: bool) -> Result<String, StatusError> {
+        let result: GitDiffResult = self
+            .call_typed(
+                methods::GIT_DIFF,
+                GitDiffParams {
+                    path: rel_to_wire(rel),
+                    staged,
+                },
+            )
+            .map_err(|e| match e {
+                TransportError::Rpc(rpc) if rpc.code == error_codes::NOT_A_REPO => {
+                    StatusError::NonZeroExit {
+                        code: None,
+                        stderr: rpc.message,
+                    }
+                }
+                TransportError::Io(io) => StatusError::SpawnFailed(io),
+                other => StatusError::SpawnFailed(io::Error::other(other.to_string())),
+            })?;
+        Ok(result.diff)
     }
 }
 
@@ -821,6 +844,28 @@ mod tests {
 
         let fs = service(FakeTransport::new());
         assert_eq!(fs.git_branch(), None);
+    }
+
+    #[test]
+    fn git_diff_returns_patch_text() {
+        let fs = service(FakeTransport::new().with(
+            methods::GIT_DIFF,
+            GitDiffResult {
+                diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
+            },
+        ));
+        let diff = fs.git_diff(Path::new("a.txt"), false).unwrap();
+        assert!(diff.contains("+new"));
+    }
+
+    #[test]
+    fn git_diff_not_a_repo_maps_to_non_zero_exit() {
+        let fs = service(FakeTransport::new().with_error(
+            methods::GIT_DIFF,
+            RpcError::new(error_codes::NOT_A_REPO, "not a repo"),
+        ));
+        let err = fs.git_diff(Path::new("a.txt"), false).unwrap_err();
+        assert!(matches!(err, StatusError::NonZeroExit { .. }));
     }
 
     #[test]

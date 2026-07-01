@@ -27,6 +27,8 @@ pub mod methods {
     pub const FS_STAT: &str = "fs.stat";
     pub const GIT_STATUS: &str = "git.status";
     pub const GIT_BRANCH: &str = "git.branch";
+    /// Request: unified diff for a single path (Phase 3).
+    pub const GIT_DIFF: &str = "git.diff";
     /// Request: start or stop watching the workspace for changes.
     pub const FS_WATCH: &str = "fs.watch";
     /// Server→client notification: the workspace changed (Phase 2).
@@ -297,6 +299,23 @@ pub enum WireStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GitBranchResult {
     pub branch: Option<String>,
+}
+
+/// Params for [`methods::GIT_DIFF`]: the workspace-relative path to diff
+/// and whether to show the staged (index-vs-HEAD) diff instead of the
+/// working-tree diff.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitDiffParams {
+    pub path: String,
+    #[serde(default)]
+    pub staged: bool,
+}
+
+/// Result of [`methods::GIT_DIFF`]: the raw unified diff (empty when the
+/// path has no changes).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitDiffResult {
+    pub diff: String,
 }
 
 /// Params for [`methods::FS_WATCH`]: start (`true`) or stop (`false`)

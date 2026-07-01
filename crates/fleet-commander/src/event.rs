@@ -93,6 +93,15 @@ pub enum AppEvent {
         full_path: std::path::PathBuf,
         result: std::result::Result<String, String>,
     },
+    /// A background `git diff` for an explorer-selected file completed.
+    /// Shown in the [`crate::app::SidePane::Diff`] pane if the agent is
+    /// still viewed and the workspace root still matches.
+    ExplorerDiffReady {
+        agent_id: AgentId,
+        root: std::path::PathBuf,
+        full_path: std::path::PathBuf,
+        result: std::result::Result<String, String>,
+    },
     /// A background fetch of an agent's in-container git branch finished.
     /// `branch` is `None` when the workspace isn't a git tree (or the read
     /// failed). The app stores it on the agent so the header/list reflect the

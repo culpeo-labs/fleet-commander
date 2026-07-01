@@ -87,6 +87,17 @@ pub trait WorkspaceFs: Send + Sync + Debug {
         include_ignored: bool,
     ) -> Result<HashMap<PathBuf, StatusKind>, StatusError>;
 
+    /// Unified diff for a single path. `staged` selects the index-vs-HEAD
+    /// diff over the working-tree diff. Returns an empty string when the
+    /// path has no changes.
+    ///
+    /// The default returns an empty diff so simple/in-memory backends
+    /// compile without bespoke git plumbing; real backends ([`LocalFs`],
+    /// [`ServiceFs`](crate::service_fs::ServiceFs)) override it.
+    fn git_diff(&self, _rel: &Path, _staged: bool) -> Result<String, StatusError> {
+        Ok(String::new())
+    }
+
     /// Whether this filesystem reaches a remote/container target (as
     /// opposed to the host filesystem). Used by the UI to avoid
     /// needlessly downgrading a container-backed view to the host one.
@@ -157,6 +168,10 @@ impl WorkspaceFs for LocalFs {
         include_ignored: bool,
     ) -> Result<HashMap<PathBuf, StatusKind>, StatusError> {
         git::status(&self.root, include_ignored)
+    }
+
+    fn git_diff(&self, rel: &Path, staged: bool) -> Result<String, StatusError> {
+        git::diff(&self.root, rel, staged)
     }
 }
 

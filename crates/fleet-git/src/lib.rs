@@ -192,6 +192,63 @@ pub fn status_entries(
     parse_porcelain_z(&output.stdout).ok_or(StatusError::InvalidOutput)
 }
 
+/// Return the unified diff for a single path inside `workspace`.
+///
+/// With `staged == false` this is the working-tree diff (`git diff -- <path>`);
+/// with `staged == true` it's the index-vs-HEAD diff (`git diff --cached`).
+///
+/// Untracked files have no tracked baseline, so a plain `git diff` reports
+/// nothing for them; when the working-tree diff comes back empty we fall back
+/// to `git diff --no-index` against the null device so a brand-new file still
+/// renders as an all-additions diff. The returned string is the raw patch
+/// (empty when there's genuinely nothing to show).
+pub fn diff(workspace: &Path, rel: &Path, staged: bool) -> Result<String, StatusError> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(workspace).arg("diff");
+    if staged {
+        cmd.arg("--cached");
+    }
+    cmd.arg("--").arg(rel);
+    let output = cmd.output().map_err(StatusError::SpawnFailed)?;
+    if !output.status.success() {
+        return Err(StatusError::NonZeroExit {
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        });
+    }
+    let text = String::from_utf8(output.stdout).map_err(|_| StatusError::InvalidOutput)?;
+
+    // An untracked/new file yields an empty tracked diff — show its full
+    // contents as additions instead of a blank pane.
+    if !staged
+        && text.trim().is_empty()
+        && let Some(untracked) = diff_no_index(workspace, rel)
+    {
+        return Ok(untracked);
+    }
+    Ok(text)
+}
+
+/// `git diff --no-index <null> <rel>` for untracked files. `--no-index`
+/// exits `1` when the files differ (the normal case here), so both `0`
+/// and `1` are treated as success; anything else is reported as no diff.
+fn diff_no_index(workspace: &Path, rel: &Path) -> Option<String> {
+    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["diff", "--no-index", "--", null])
+        .arg(rel)
+        .output()
+        .ok()?;
+    match output.status.code() {
+        Some(0) | Some(1) => String::from_utf8(output.stdout)
+            .ok()
+            .filter(|s| !s.is_empty()),
+        _ => None,
+    }
+}
+
 /// Parse the NUL-separated output of `git status --porcelain=v1 -z`.
 ///
 /// Each entry is `XY <path>\0`, except rename/copy entries which are
@@ -470,5 +527,51 @@ mod tests {
         let tmp = tempdir().unwrap();
         let err = status(tmp.path(), false).expect_err("expected NonZeroExit");
         assert!(matches!(err, StatusError::NonZeroExit { .. }), "{err}");
+    }
+
+    #[test]
+    fn diff_shows_working_tree_changes() {
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: git not installed");
+            return;
+        }
+        let tmp = init_repo();
+        write(&tmp.path().join("a.txt"), "one\ntwo\n");
+        run_git(tmp.path(), &["add", "a.txt"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "init"]);
+
+        // Unstaged modification shows in the working-tree diff but not
+        // in the staged diff.
+        write(&tmp.path().join("a.txt"), "one\ntwo changed\n");
+        let unstaged = diff(tmp.path(), Path::new("a.txt"), false).unwrap();
+        assert!(unstaged.contains("-two"), "{unstaged}");
+        assert!(unstaged.contains("+two changed"), "{unstaged}");
+        assert!(
+            diff(tmp.path(), Path::new("a.txt"), true)
+                .unwrap()
+                .is_empty(),
+            "staged diff should be empty before `git add`"
+        );
+
+        // After staging, it moves to the staged diff.
+        run_git(tmp.path(), &["add", "a.txt"]);
+        let staged = diff(tmp.path(), Path::new("a.txt"), true).unwrap();
+        assert!(staged.contains("+two changed"), "{staged}");
+    }
+
+    #[test]
+    fn diff_renders_untracked_file_as_additions() {
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: git not installed");
+            return;
+        }
+        let tmp = init_repo();
+        write(&tmp.path().join("seed.txt"), "x\n");
+        run_git(tmp.path(), &["add", "seed.txt"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "init"]);
+
+        write(&tmp.path().join("fresh.txt"), "brand new\n");
+        let d = diff(tmp.path(), Path::new("fresh.txt"), false).unwrap();
+        assert!(d.contains("+brand new"), "{d}");
     }
 }

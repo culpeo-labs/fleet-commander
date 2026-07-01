@@ -117,8 +117,9 @@ Each phase ships value and de-risks the next.
 - **Phase 3 — search, streaming reads/diffs, git pane.** Streamed as notifications;
   large reads chunked. (Re-evaluate CulpeoStream here if binary throughput hurts.)
   _Chunked reads landed: `fs.read` is ranged (`offset`/`len` → `eof`/`totalSize`); the
-  client pages large files and the explorer preview is capped. Search + diffs/git pane
-  still pending._
+  client pages large files and the explorer preview is capped. Per-file diffs landed:
+  `git.diff` + a `Shift+D` explorer binding open a file's working-tree diff in the side
+  pane. Search still pending._
 - **Phase 4 — PTY/terminal multiplexing.** First strong case for binary streams —
   evaluate a CulpeoStream side-channel (see *Deferred: CulpeoStream*).
 - **Phase 5 — LSP hosting + SSH/WebSocket transport.**
@@ -153,6 +154,7 @@ Each phase ships value and de-risks the next.
   - `fs.stat { path }`
   - `fs.watch { path }` / `fs.unwatch` → server `fs.didChange { changes: [{path, kind}] }` (debounced/coalesced)
   - `git.status { includeIgnored }` → `{ entries: { path: kind } }`
+  - `git.diff { path, staged? }` → `{ diff }` (unified diff for one path; untracked files render as all-additions)
   - `git.branch` → `{ branch? }`
 - **Modeling:** reuse the `agent-client-protocol` crate's generic JSON-RPC
   connection/transport if it's cleanly separable; otherwise hand-rolled serde types
