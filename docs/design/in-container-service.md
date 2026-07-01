@@ -119,10 +119,12 @@ Each phase ships value and de-risks the next.
   _Chunked reads landed: `fs.read` is ranged (`offset`/`len` → `eof`/`totalSize`); the
   client pages large files and the explorer preview is capped. Per-file diffs landed:
   `git.diff` + a `Shift+D` explorer binding open a file's working-tree diff in the side
-  pane. Streaming search landed (engine): `fs.search` walks the workspace (ripgrep's
-  `ignore` + `grep` crates, gitignore-aware) and streams `fs.searchResult` batches
-  followed by a final `SearchSummary`; `fs.cancelSearch { searchId }` stops an in-flight
-  search. The search UI (client + results pane) is the remaining follow-up._
+  pane. Streaming search landed (engine + client): `fs.search` walks the workspace
+  (ripgrep's `ignore` + `grep` crates, gitignore-aware), returns an immediate ack, then
+  streams `fs.searchResult` batches ending with an `fs.searchDone` summary notification;
+  `fs.cancelSearch { searchId }` stops an in-flight search. `ServiceFs` exposes
+  `start_search`/`cancel_search`, routing results through its notification sink. The
+  search UI (input mode + results pane) is the remaining follow-up._
 - **Phase 4 — PTY/terminal multiplexing.** First strong case for binary streams —
   evaluate a CulpeoStream side-channel (see *Deferred: CulpeoStream*).
 - **Phase 5 — LSP hosting + SSH/WebSocket transport.**
@@ -157,7 +159,7 @@ Each phase ships value and de-risks the next.
   - `fs.read { path, offset?, len? }` → `{ contentBase64, eof, totalSize }` (ranged/chunked reads; client pages large files, explorer preview is capped)
   - `fs.stat { path }`
   - `fs.watch { path }` / `fs.unwatch` → server `fs.didChange { changes: [{path, kind}] }` (debounced/coalesced)
-  - `fs.search { searchId, query, isRegex?, caseSensitive?, maxResults? }` → streams `fs.searchResult { searchId, matches: [{path, line, column, text}] }` notifications, then a final `{ count, truncated, cancelled }` summary
+  - `fs.search { searchId, query, isRegex?, caseSensitive?, maxResults? }` → immediate `{ accepted }` ack, then streams `fs.searchResult { searchId, matches: [{path, line, column, text}] }` notifications, ending with `fs.searchDone { searchId, count, truncated, cancelled }`
   - `fs.cancelSearch { searchId }` → `{ cancelled }`
   - `git.status { includeIgnored }` → `{ entries: { path: kind } }`
   - `git.diff { path, staged? }` → `{ diff }` (unified diff for one path; untracked files render as all-additions)

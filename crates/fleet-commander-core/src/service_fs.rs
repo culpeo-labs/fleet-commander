@@ -25,10 +25,10 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use fleet_protocol::{
-    FsListParams, FsListResult, FsReadParams, FsReadResult, FsWatchParams, GitBranchResult,
-    GitDiffParams, GitDiffResult, GitStatusParams, GitStatusResult, Incoming, InitializeParams,
-    InitializeResult, Notification, PROTOCOL_VERSION, Request, Response, RpcError, WireStatus,
-    error_codes, framing, methods,
+    CancelSearchParams, CancelSearchResult, FsListParams, FsListResult, FsReadParams, FsReadResult,
+    FsWatchParams, GitBranchResult, GitDiffParams, GitDiffResult, GitStatusParams, GitStatusResult,
+    Incoming, InitializeParams, InitializeResult, Notification, PROTOCOL_VERSION, Request,
+    Response, RpcError, SearchAck, SearchParams, WireStatus, error_codes, framing, methods,
 };
 use serde_json::Value;
 
@@ -331,6 +331,20 @@ impl WorkspaceFs for ServiceFs {
                 other => StatusError::SpawnFailed(io::Error::other(other.to_string())),
             })?;
         Ok(result.diff)
+    }
+
+    fn start_search(&self, params: SearchParams) -> io::Result<bool> {
+        let ack: SearchAck = self
+            .call_typed(methods::FS_SEARCH, params)
+            .map_err(to_io_error)?;
+        Ok(ack.accepted)
+    }
+
+    fn cancel_search(&self, search_id: u64) -> io::Result<bool> {
+        let result: CancelSearchResult = self
+            .call_typed(methods::FS_CANCEL_SEARCH, CancelSearchParams { search_id })
+            .map_err(to_io_error)?;
+        Ok(result.cancelled)
     }
 }
 
@@ -666,13 +680,16 @@ impl Drop for ProcessTransport {
 mod tests {
     use super::*;
     use fleet_protocol::{FsEntry, GitStatusEntry};
+    use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
+
+    type CallLog = Arc<StdMutex<Vec<(String, Value)>>>;
 
     /// In-memory transport that records calls and replays canned responses,
     /// so the `WorkspaceFs` mapping logic is testable without a process.
     struct FakeTransport {
         responses: StdMutex<HashMap<String, Result<Value, RpcError>>>,
-        calls: StdMutex<Vec<(String, Value)>>,
+        calls: CallLog,
     }
 
     impl Debug for FakeTransport {
@@ -685,21 +702,27 @@ mod tests {
         fn new() -> Self {
             Self {
                 responses: StdMutex::new(HashMap::new()),
-                calls: StdMutex::new(Vec::new()),
+                calls: Arc::new(StdMutex::new(Vec::new())),
             }
         }
 
-        fn with(mut self, method: &str, result: impl serde::Serialize) -> Self {
+        /// Shared handle to the recorded calls, so a test can inspect the
+        /// params sent after the transport is moved into a `ServiceFs`.
+        fn calls_arc(&self) -> CallLog {
+            Arc::clone(&self.calls)
+        }
+
+        fn with(self, method: &str, result: impl serde::Serialize) -> Self {
             self.responses
-                .get_mut()
+                .lock()
                 .unwrap()
                 .insert(method.into(), Ok(serde_json::to_value(result).unwrap()));
             self
         }
 
-        fn with_error(mut self, method: &str, error: RpcError) -> Self {
+        fn with_error(self, method: &str, error: RpcError) -> Self {
             self.responses
-                .get_mut()
+                .lock()
                 .unwrap()
                 .insert(method.into(), Err(error));
             self
@@ -866,6 +889,69 @@ mod tests {
         ));
         let err = fs.git_diff(Path::new("a.txt"), false).unwrap_err();
         assert!(matches!(err, StatusError::NonZeroExit { .. }));
+    }
+
+    #[test]
+    fn start_search_returns_accepted_and_sends_params() {
+        let transport = FakeTransport::new().with(methods::FS_SEARCH, SearchAck { accepted: true });
+        let calls = transport.calls_arc();
+        let fs = service(transport);
+
+        let accepted = fs
+            .start_search(SearchParams {
+                search_id: 42,
+                query: "needle".into(),
+                is_regex: false,
+                case_sensitive: true,
+                max_results: Some(10),
+            })
+            .unwrap();
+        assert!(accepted);
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (method, params) = &calls[0];
+        assert_eq!(method, methods::FS_SEARCH);
+        let sent: SearchParams = serde_json::from_value(params.clone()).unwrap();
+        assert_eq!(sent.search_id, 42);
+        assert_eq!(sent.query, "needle");
+        assert!(sent.case_sensitive);
+        assert_eq!(sent.max_results, Some(10));
+    }
+
+    #[test]
+    fn start_search_reports_rejection() {
+        let fs =
+            service(FakeTransport::new().with(methods::FS_SEARCH, SearchAck { accepted: false }));
+        assert!(!fs.start_search(search_params()).unwrap());
+    }
+
+    #[test]
+    fn cancel_search_reports_result_and_targets_id() {
+        let transport = FakeTransport::new().with(
+            methods::FS_CANCEL_SEARCH,
+            CancelSearchResult { cancelled: true },
+        );
+        let calls = transport.calls_arc();
+        let fs = service(transport);
+
+        assert!(fs.cancel_search(7).unwrap());
+
+        let calls = calls.lock().unwrap();
+        let (method, params) = &calls[0];
+        assert_eq!(method, methods::FS_CANCEL_SEARCH);
+        let sent: CancelSearchParams = serde_json::from_value(params.clone()).unwrap();
+        assert_eq!(sent.search_id, 7);
+    }
+
+    fn search_params() -> SearchParams {
+        SearchParams {
+            search_id: 1,
+            query: "q".into(),
+            is_regex: false,
+            case_sensitive: false,
+            max_results: None,
+        }
     }
 
     #[test]

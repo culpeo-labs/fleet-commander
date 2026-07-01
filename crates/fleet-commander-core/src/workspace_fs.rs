@@ -19,6 +19,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::git::{self, StatusError, StatusKind};
+use fleet_protocol::SearchParams;
 
 /// A single entry returned by [`WorkspaceFs::list_dir`]. Intentionally
 /// minimal — the explorer only needs the name and a directory flag.
@@ -96,6 +97,26 @@ pub trait WorkspaceFs: Send + Sync + Debug {
     /// [`ServiceFs`](crate::service_fs::ServiceFs)) override it.
     fn git_diff(&self, _rel: &Path, _staged: bool) -> Result<String, StatusError> {
         Ok(String::new())
+    }
+
+    /// Start a streaming content search over the workspace. Matches are not
+    /// returned here — they are delivered asynchronously through the backend's
+    /// notification sink (`fs.searchResult` batches, ended by `fs.searchDone`),
+    /// so only backends wired with a sink (`ServiceFs`) can drive it. Returns
+    /// whether the backend accepted and started the search.
+    ///
+    /// The default returns `Ok(false)` (unsupported), which the UI treats as
+    /// "search unavailable for this view".
+    fn start_search(&self, _params: SearchParams) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    /// Cancel an in-flight search previously started with
+    /// [`start_search`](Self::start_search), identified by its `search_id`.
+    /// Returns whether a matching running search was found and signalled.
+    /// The default returns `Ok(false)`.
+    fn cancel_search(&self, _search_id: u64) -> io::Result<bool> {
+        Ok(false)
     }
 
     /// Whether this filesystem reaches a remote/container target (as

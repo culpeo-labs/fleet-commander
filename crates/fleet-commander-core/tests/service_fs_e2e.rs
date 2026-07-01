@@ -87,3 +87,66 @@ fn service_fs_delivers_live_fs_did_change_notifications() {
         .expect("expected an fs.didChange notification");
     assert_eq!(method, "fs.didChange");
 }
+
+#[test]
+fn service_fs_streams_search_results_through_the_sink() {
+    use fleet_protocol::{SearchDoneParams, SearchParams, SearchResultParams, methods};
+    use std::sync::mpsc;
+
+    let Some(agent) = agent_binary() else {
+        eprintln!("skipping: fleet-agent binary not built");
+        return;
+    };
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("a.txt"), b"needle here\nno match\n").unwrap();
+    std::fs::write(tmp.path().join("src/b.rs"), b"// needle in code\n").unwrap();
+    std::fs::write(tmp.path().join("c.txt"), b"nothing\n").unwrap();
+
+    // Forward the full notification (method + params) so the test can
+    // reassemble the streamed matches and the terminal summary.
+    let (tx, rx) = mpsc::channel();
+    let sink: fleet_commander_core::service_fs::NotificationSink = Box::new(move |note| {
+        let _ = tx.send(note);
+    });
+
+    let fs = ServiceFs::spawn_watched(tmp.path(), &agent, Some(sink)).expect("spawn + sink");
+
+    let accepted = fs
+        .start_search(SearchParams {
+            search_id: 5,
+            query: "needle".into(),
+            is_regex: false,
+            case_sensitive: false,
+            max_results: None,
+        })
+        .expect("start_search");
+    assert!(accepted);
+
+    // Collect notifications until the terminal fs.searchDone arrives.
+    let mut paths = Vec::new();
+    let summary = loop {
+        let note = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("expected a search notification");
+        match note.method.as_str() {
+            m if m == methods::FS_SEARCH_RESULT => {
+                let p: SearchResultParams = serde_json::from_value(note.params.unwrap()).unwrap();
+                assert_eq!(p.search_id, 5);
+                paths.extend(p.matches.into_iter().map(|m| m.path));
+            }
+            m if m == methods::FS_SEARCH_DONE => {
+                let done: SearchDoneParams = serde_json::from_value(note.params.unwrap()).unwrap();
+                assert_eq!(done.search_id, 5);
+                break done.summary;
+            }
+            _ => {} // ignore any stray fs.didChange
+        }
+    };
+
+    paths.sort();
+    assert_eq!(paths, vec!["a.txt".to_string(), "src/b.rs".to_string()]);
+    assert_eq!(summary.count, 2);
+    assert!(!summary.cancelled && !summary.truncated);
+}
