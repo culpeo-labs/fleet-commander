@@ -22,8 +22,8 @@ use fleet_protocol::{
     FsListResult, FsReadParams, FsReadResult, FsStatParams, FsStatResult, FsWatchParams,
     FsWatchResult, GitBranchResult, GitDiffParams, GitDiffResult, GitStatusEntry, GitStatusParams,
     GitStatusResult, InitializeResult, Notification, PROTOCOL_VERSION, Request, Response, RpcError,
-    SearchParams, SearchResultParams, SearchSummary, ServerInfo, WireStatus, error_codes, framing,
-    methods,
+    SearchAck, SearchDoneParams, SearchParams, SearchResultParams, SearchSummary, ServerInfo,
+    WireStatus, error_codes, framing, methods,
 };
 use notify::{RecursiveMode, Watcher};
 use search::{SearchRequest, run_search};
@@ -133,8 +133,12 @@ impl Server {
                     let response = self.handle_watch(&req, out, watch);
                     send_body(out, &serde_json::to_vec(&response)?)?;
                 }
-                // The worker owns this request's response; nothing to send now.
-                methods::FS_SEARCH => self.start_search(&req, out, searches),
+                // `start_search` returns an immediate ack Response; results
+                // (and the terminal summary) stream as notifications.
+                methods::FS_SEARCH => {
+                    let response = self.start_search(&req, out, searches);
+                    send_body(out, &serde_json::to_vec(&response)?)?;
+                }
                 methods::FS_CANCEL_SEARCH => {
                     let response = handle_cancel_search(&req, searches);
                     send_body(out, &serde_json::to_vec(&response)?)?;
@@ -148,20 +152,33 @@ impl Server {
         Ok(())
     }
 
-    /// Spawn a worker that runs a streaming content search, pushing
-    /// [`methods::FS_SEARCH_RESULT`] notification batches to `out` and, when
-    /// done, the final [`Response`] carrying a [`SearchSummary`]. The search's
-    /// cancel flag is registered in `searches` under its `searchId` so a
-    /// later [`methods::FS_CANCEL_SEARCH`] can stop it.
-    fn start_search(&self, req: &Request, out: &mpsc::Sender<Vec<u8>>, searches: &mut SearchState) {
+    /// Register and spawn a streaming content-search worker, returning an
+    /// immediate [`SearchAck`] [`Response`]. The worker pushes
+    /// [`methods::FS_SEARCH_RESULT`] notification batches to `out` and a
+    /// terminal [`methods::FS_SEARCH_DONE`] notification carrying the
+    /// [`SearchSummary`]. The search's cancel flag is registered in `searches`
+    /// under its `searchId` so a later [`methods::FS_CANCEL_SEARCH`] can stop it.
+    fn start_search(
+        &self,
+        req: &Request,
+        out: &mpsc::Sender<Vec<u8>>,
+        searches: &mut SearchState,
+    ) -> Response {
         let params: SearchParams = match parse_params(req) {
             Ok(p) => p,
-            Err(e) => {
-                let _ = send_body(out, &to_vec_lossy(&Response::err(req.id, e)));
-                return;
-            }
+            Err(e) => return Response::err(req.id, e),
         };
-        let id = req.id;
+        // Reject an invalid pattern up front so the client gets a clean
+        // negative ack instead of a silently-empty streamed result.
+        let search_req = SearchRequest {
+            query: params.query.clone(),
+            is_regex: params.is_regex,
+            case_sensitive: params.case_sensitive,
+            max_results: params.max_results,
+        };
+        if search::validate(&search_req).is_err() {
+            return Response::ok(req.id, SearchAck { accepted: false });
+        }
         let search_id = params.search_id;
         let cancel = Arc::new(AtomicBool::new(false));
         searches.register(search_id, cancel.clone());
@@ -172,7 +189,7 @@ impl Server {
         let handle = thread::Builder::new()
             .name("fleet-agent-search".into())
             .spawn(move || {
-                run_search_worker(id, search_id, root, params, cancel, out);
+                run_search_worker(search_id, root, params, cancel, out);
                 // Drop our registration so a stale searchId can't be cancelled
                 // (and to bound the map to live searches).
                 active.lock().unwrap().remove(&search_id);
@@ -181,6 +198,7 @@ impl Server {
         if let Some(handle) = handle {
             searches.workers.push(handle);
         }
+        Response::ok(req.id, SearchAck { accepted: true })
     }
 
     /// Start or stop the workspace watcher per [`FsWatchParams`].
@@ -460,9 +478,11 @@ impl SearchState {
 }
 
 /// Body of a search worker thread: walk + match, streaming coalesced
-/// notification batches, then send the final summary response.
+/// result batches, then a terminal [`methods::FS_SEARCH_DONE`] notification.
+/// The pattern is validated before the worker is spawned, so `run_search`
+/// only fails here on an unexpected build error, which we surface as a
+/// finished (empty) search rather than crashing the daemon.
 fn run_search_worker(
-    id: u64,
     search_id: u64,
     root: PathBuf,
     params: SearchParams,
@@ -498,21 +518,22 @@ fn run_search_worker(
         }
     });
 
-    // Flush any tail matches before the final response so ordering holds.
+    // Flush any tail matches before the terminal notification so ordering holds.
     flush(&mut batch);
 
-    let response = match outcome {
-        Ok(o) => Response::ok(
-            id,
-            SearchSummary {
-                count: o.count,
-                truncated: o.truncated,
-                cancelled: o.cancelled,
+    let summary = outcome.unwrap_or_default();
+    let done = Notification::new(
+        methods::FS_SEARCH_DONE,
+        SearchDoneParams {
+            search_id,
+            summary: SearchSummary {
+                count: summary.count,
+                truncated: summary.truncated,
+                cancelled: summary.cancelled,
             },
-        ),
-        Err(msg) => Response::err(id, RpcError::new(error_codes::INVALID_PARAMS, msg)),
-    };
-    let _ = send_body(&out, &to_vec_lossy(&response));
+        },
+    );
+    let _ = send_body(&out, &to_vec_lossy(&done));
 }
 
 /// Handle [`methods::FS_CANCEL_SEARCH`]: flip the target search's cancel

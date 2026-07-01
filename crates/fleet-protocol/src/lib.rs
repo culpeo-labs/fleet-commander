@@ -35,6 +35,9 @@ pub mod methods {
     pub const FS_CANCEL_SEARCH: &str = "fs.cancelSearch";
     /// Server→client notification: a batch of search matches (Phase 3).
     pub const FS_SEARCH_RESULT: &str = "fs.searchResult";
+    /// Server→client notification: an [`FS_SEARCH`] finished (Phase 3). Carries
+    /// the terminal [`SearchDoneParams`] summary; the request itself only acks.
+    pub const FS_SEARCH_DONE: &str = "fs.searchDone";
     /// Request: start or stop watching the workspace for changes.
     pub const FS_WATCH: &str = "fs.watch";
     /// Server→client notification: the workspace changed (Phase 2).
@@ -395,6 +398,15 @@ pub struct SearchResultParams {
     pub matches: Vec<SearchMatch>,
 }
 
+/// Ack returned immediately by [`methods::FS_SEARCH`]. The search runs
+/// asynchronously; results stream as [`SearchResultParams`] notifications and
+/// finish with a [`SearchDoneParams`] notification. `accepted` is `false` only
+/// if the backend refused to start (e.g. an invalid pattern).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchAck {
+    pub accepted: bool,
+}
+
 /// Final result of an [`methods::FS_SEARCH`] request: how many matches were
 /// emitted and whether the search stopped early (hit `max_results` or was
 /// cancelled).
@@ -406,6 +418,15 @@ pub struct SearchSummary {
     /// [`methods::FS_CANCEL_SEARCH`] request.
     #[serde(default)]
     pub cancelled: bool,
+}
+
+/// Params for the terminal [`methods::FS_SEARCH_DONE`] notification: the
+/// `search_id` that finished plus its [`SearchSummary`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchDoneParams {
+    pub search_id: u64,
+    #[serde(flatten)]
+    pub summary: SearchSummary,
 }
 
 /// Params for [`methods::FS_CANCEL_SEARCH`]: which in-flight search to stop.

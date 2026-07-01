@@ -45,15 +45,7 @@ pub fn run_search(
     cancel: &AtomicBool,
     mut on_match: impl FnMut(SearchMatch),
 ) -> Result<SearchOutcome, String> {
-    let pattern = if req.is_regex {
-        req.query.clone()
-    } else {
-        escape_literal(&req.query)
-    };
-    let matcher = RegexMatcherBuilder::new()
-        .case_insensitive(!req.case_sensitive)
-        .build(&pattern)
-        .map_err(|e| format!("invalid search pattern: {e}"))?;
+    let matcher = build_matcher(req)?;
 
     let mut searcher = SearcherBuilder::new().line_number(true).build();
 
@@ -141,6 +133,26 @@ fn search_file(
             Ok(true)
         }),
     );
+}
+
+/// Build the line matcher for `req`, escaping the query unless it's a regex.
+/// Shared by [`run_search`] and [`validate`] so both agree on pattern syntax.
+fn build_matcher(req: &SearchRequest) -> Result<RegexMatcher, String> {
+    let pattern = if req.is_regex {
+        req.query.clone()
+    } else {
+        escape_literal(&req.query)
+    };
+    RegexMatcherBuilder::new()
+        .case_insensitive(!req.case_sensitive)
+        .build(&pattern)
+        .map_err(|e| format!("invalid search pattern: {e}"))
+}
+
+/// Validate that `req`'s query compiles, without walking the workspace.
+/// Used to reject an invalid pattern before spawning a search worker.
+pub fn validate(req: &SearchRequest) -> Result<(), String> {
+    build_matcher(req).map(|_| ())
 }
 
 /// Escape regex metacharacters so a literal query matches verbatim.
