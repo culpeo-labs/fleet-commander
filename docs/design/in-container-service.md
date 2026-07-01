@@ -124,7 +124,10 @@ Each phase ships value and de-risks the next.
   streams `fs.searchResult` batches ending with an `fs.searchDone` summary notification;
   `fs.cancelSearch { searchId }` stops an in-flight search. `ServiceFs` exposes
   `start_search`/`cancel_search`, routing results through its notification sink. The
-  search UI (input mode + results pane) is the remaining follow-up._
+  search UI landed: `/` in the explorer opens a query prompt, matches stream into a
+  side pane (navigate with `↑/↓`, Enter jumps the preview to the hit's line), and the
+  pane shows a running indicator plus a final count/truncated/cancelled summary;
+  starting a new search or dismissing the pane cancels the previous run._
 - **Phase 4 — PTY/terminal multiplexing.** First strong case for binary streams —
   evaluate a CulpeoStream side-channel (see *Deferred: CulpeoStream*).
 - **Phase 5 — LSP hosting + SSH/WebSocket transport.**

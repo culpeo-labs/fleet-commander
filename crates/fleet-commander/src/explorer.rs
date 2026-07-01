@@ -78,6 +78,10 @@ pub struct ExplorerState {
     /// side pane. Read (and cleared) by the app, which performs the
     /// actual — possibly remote, hence backgrounded — read.
     pub pending_open: Option<PathBuf>,
+    /// Set alongside [`Self::pending_open`] when the open originated from a
+    /// search hit: the 1-based line the preview should scroll to. `None`
+    /// for a plain explorer open (top of file).
+    pub pending_open_line: Option<u64>,
 }
 
 impl std::fmt::Debug for ExplorerState {
@@ -116,6 +120,7 @@ impl ExplorerState {
         self.dir_cache.clear();
         self.dir_loading.clear();
         self.pending_open = None;
+        self.pending_open_line = None;
         self.last_error = None;
     }
 

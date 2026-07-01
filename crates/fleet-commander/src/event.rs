@@ -92,6 +92,9 @@ pub enum AppEvent {
         root: std::path::PathBuf,
         full_path: std::path::PathBuf,
         result: std::result::Result<String, String>,
+        /// Line (0-based) to scroll the preview to. `0` for a plain open;
+        /// set when jumping to a search hit so the match is on screen.
+        scroll_to: u16,
     },
     /// A background `git diff` for an explorer-selected file completed.
     /// Shown in the [`crate::app::SidePane::Diff`] pane if the agent is
@@ -120,6 +123,22 @@ pub enum AppEvent {
     ExplorerFsChanged {
         agent_id: AgentId,
         container_id: String,
+    },
+    /// A batch of streamed content-search matches (`fs.searchResult`)
+    /// arrived for the given `search_id`. Appended to the active
+    /// [`crate::app::SidePane::Search`] pane when it still matches the
+    /// viewed agent and search id.
+    SearchResults {
+        agent_id: AgentId,
+        search_id: u64,
+        matches: Vec<fleet_commander_core::fleet_protocol::SearchMatch>,
+    },
+    /// A content search finished (`fs.searchDone`): its terminal summary
+    /// (count / truncated / cancelled). Clears the pane's `running` flag.
+    SearchDone {
+        agent_id: AgentId,
+        search_id: u64,
+        summary: fleet_commander_core::fleet_protocol::SearchSummary,
     },
     /// Nudge from a per-handle tracker task to redraw because one of its
     /// handles' `watch` channels ticked. Carries no state — the renderer
