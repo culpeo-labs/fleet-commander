@@ -10,9 +10,9 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-client-protocol"
-version = "1.0.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e981a7d0207a0e9eb67d0faafc04e8c6601dea572d67a3163798897c0024521d"
+checksum = "16302d16c7531355db16593d99c38c8297db0c4653aa7dd80c3556bb17f4cd8c"
 dependencies = [
  "agent-client-protocol-derive",
  "agent-client-protocol-schema",
@@ -32,9 +32,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-derive"
-version = "1.0.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d589c28cbe2978c76f8714cc304bc08355ee2f05d120806717725d9ffa12143"
+checksum = "88b37d552feb6981a0109febda6b71fc723678cd065974c2d76279c19c407095"
 dependencies = [
  "quote",
  "syn 2.0.118",
@@ -656,9 +656,9 @@ dependencies = [
 
 [[package]]
 name = "console"
-version = "0.16.3"
+version = "0.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d64e8af5551369d19cf50138de61f1c42074ab970f74e99be916646777f8fc87"
+checksum = "4fe5f465a4f6fee88fad41b85d990f84c835335e85b5d9e6e63e0d06d28cba7c"
 dependencies = [
  "encode_unicode",
  "libc",
@@ -1004,7 +1004,7 @@ version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25f104b501bf2364e78d0d3974cbc774f738f5865306ed128e1e0d7499c0ad96"
 dependencies = [
- "console 0.16.3",
+ "console 0.16.4",
  "fuzzy-matcher",
  "shell-words",
  "tempfile",
@@ -1224,7 +1224,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "fleet-git",
@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-commander"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -1273,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-commander-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -1293,14 +1293,14 @@ dependencies = [
 
 [[package]]
 name = "fleet-git"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "fleet-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1982,9 +1982,9 @@ dependencies = [
 
 [[package]]
 name = "ignore"
-version = "0.4.26"
+version = "0.4.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b915661dd01db3f05050265b2477bcc6527b3792388e2749b41623cc592be67d"
+checksum = "fe112b004901c62c2faa11f4f75e9864e0cc5af8da71c9115d184a3aa888749f"
 dependencies = [
  "crossbeam-deque",
  "globset",
@@ -2054,9 +2054,9 @@ dependencies = [
 
 [[package]]
 name = "inotify-sys"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e05c02b5e89bff3b946cedeca278abc628fe811e604f027c45a8aa3cf793d0eb"
+checksum = "6fda9741ca16536952da2ecaa6105c2f4653fa6f0724681df6d2414c4106d0b0"
 dependencies = [
  "libc",
 ]
@@ -2190,9 +2190,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libredox"
-version = "0.1.17"
+version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f02ab6bace2054fb888a3c16f990117b579d14a3088e472d63c6011fa185c9d3"
+checksum = "c943259e342f1e06ff2da7a83eabdfe7f92ce10262688dbf1895ff0b3e6e4652"
 dependencies = [
  "libc",
 ]
@@ -3418,9 +3418,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.14.1"
+version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30a7197ae7eb376e574fe940d068c30fe0462554a3ddbe4eca7838e049c937a9"
+checksum = "764899a24af3980067ee14bc143654f297b22eaebfe3c7b6b211920a5a59b046"
 dependencies = [
  "zeroize",
 ]
@@ -4086,9 +4086,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.51"
+version = "0.3.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85c17d80feb7334b40c484e45ed1a5273dfd8bfda537c3be2e74a06a6686f327"
+checksum = "18dfaaeddcb932337b5e7866ee7d0ce9b76d2fd092997146f187ec09b4558a50"
 dependencies = [
  "deranged",
  "libc",
@@ -4108,9 +4108,9 @@ checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 
 [[package]]
 name = "time-macros"
-version = "0.2.30"
+version = "0.2.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcef1a61bdb119096e153208ec5cbec23944ce8bca13be5c7f60c634f7403935"
+checksum = "c431b87111666e491a90baa837f914fb45cd5dc3c268591b0220ff5057f2085f"
 dependencies = [
  "num-conv",
  "time-core",
