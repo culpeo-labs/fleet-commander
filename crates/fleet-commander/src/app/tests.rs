@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::agent::{AgentStatus, HistoryEntry};
 use crate::change_source::{ChangeEvent, ChangeKind};
