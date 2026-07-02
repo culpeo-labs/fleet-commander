@@ -148,7 +148,7 @@ Each phase ships value and de-risks the next.
   to embedded newlines; ecosystem-standard; no custom binding to author.
 - **Lifecycle:** `initialize` → `initialized`; `shutdown`/`exit`. `initialize`
   advertises `protocolVersion`, `serverInfo`, and `capabilities`
-  (`watch`, `search`, `git`, `pty`, `lsp`, …). Client degrades gracefully.
+  (`watch`, `search`, `git`, `acp`, `pty`, `lsp`, …). Client degrades gracefully.
 - **Streaming (watch/search):** server→client **notifications** (how LSP streams
   diagnostics and ACP streams `session/update`). No multi-stream substrate needed for
   Phases 0-3.
@@ -167,6 +167,12 @@ Each phase ships value and de-risks the next.
   - `git.status { includeIgnored }` → `{ entries: { path: kind } }`
   - `git.diff { path, staged? }` → `{ diff }` (unified diff for one path; untracked files render as all-additions)
   - `git.branch` → `{ branch? }`
+  - `acp.start { command, cwd?, env? }` → `{ started }` — spawn the ACP coding agent (`copilot --acp --stdio`) *inside* the container, owned by `fleet-agent`. Idempotent: a second call while a child is running returns `{ started: false }`.
+  - `acp.send { data }` (client→server **notification**) / `acp.recv { data }` (server→client **notification**) — relay one newline-delimited ACP wire line each way. Deliberately notifications, not requests, so a long-running prompt never head-of-line-blocks the request/response channel (nor trips the request timeout).
+  - `acp.stderr { data }` (server→client notification) — one line of the child's stderr (device-code/auth prompts, diagnostics).
+  - `acp.exit { code? }` (server→client notification) — the child exited; `code` is `None` if killed by signal.
+  - `acp.stop {}` → `{ stopped }` — terminate the running child.
+- **ACP tunnel (Phase 4a):** the host no longer opens a separate `docker exec copilot --acp --stdio` channel. It runs the coding agent through `fleet-agent` via the `acp.*` methods above, and drives the ACP `Client` over the tunnel as a first-class line-based transport. Capability gate: `capabilities.acp`. This consolidates the container agent under one daemon connection, setting up a persistent daemon + session reattach in Phase 4b.
 - **Modeling:** reuse the `agent-client-protocol` crate's generic JSON-RPC
   connection/transport if it's cleanly separable; otherwise hand-rolled serde types
   for the 3 message kinds + typed params/results per method (keeps `fleet-agent`

@@ -1282,6 +1282,8 @@ dependencies = [
  "dirs",
  "fleet-git",
  "fleet-protocol",
+ "futures-channel",
+ "futures-util",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -25,10 +25,11 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use fleet_protocol::{
-    CancelSearchParams, CancelSearchResult, FsListParams, FsListResult, FsReadParams, FsReadResult,
-    FsWatchParams, GitBranchResult, GitDiffParams, GitDiffResult, GitStatusParams, GitStatusResult,
-    Incoming, InitializeParams, InitializeResult, Notification, PROTOCOL_VERSION, Request,
-    Response, RpcError, SearchAck, SearchParams, WireStatus, error_codes, framing, methods,
+    AcpStartParams, CancelSearchParams, CancelSearchResult, FsListParams, FsListResult,
+    FsReadParams, FsReadResult, FsWatchParams, GitBranchResult, GitDiffParams, GitDiffResult,
+    GitStatusParams, GitStatusResult, Incoming, InitializeParams, InitializeResult, Notification,
+    PROTOCOL_VERSION, Request, Response, RpcError, SearchAck, SearchParams, WireStatus,
+    error_codes, framing, methods,
 };
 use serde_json::Value;
 
@@ -468,16 +469,108 @@ impl ProcessTransport {
         Self::from_command_with_timeout(cmd, REQUEST_TIMEOUT, sink)
     }
 
+    /// Connect a **dedicated** `fleet-agent` (via `docker exec -i …`) purely to
+    /// spawn and tunnel an ACP coding-agent child, then issue `acp.start`.
+    ///
+    /// The daemon must advertise `capabilities.acp`; otherwise this returns an
+    /// error so the caller can fall back to spawning the agent directly. No
+    /// `fs.watch` subscription is started — this connection carries only the
+    /// ACP tunnel (`acp.send`/`acp.recv`/`acp.stderr`/`acp.exit`). Tunnel
+    /// notifications are delivered to `sink` on the reader thread.
+    pub fn docker_exec_acp(
+        container_id: &str,
+        remote_user: &str,
+        agent_path: &str,
+        remote_root: &str,
+        acp_command: &str,
+        sink: NotificationSink,
+    ) -> io::Result<Self> {
+        let argv = docker_exec_argv(container_id, remote_user, agent_path, remote_root);
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        let (transport, init) = Self::spawn_and_init(cmd, REQUEST_TIMEOUT, Some(sink))?;
+        if !init.capabilities.acp {
+            return Err(io::Error::other(
+                "fleet-agent does not support the ACP tunnel (capabilities.acp = false)",
+            ));
+        }
+        let params = serde_json::to_value(AcpStartParams {
+            command: acp_command.to_string(),
+            cwd: Some(remote_root.to_string()),
+            env: Vec::new(),
+        })
+        .expect("serialize acp.start params");
+        transport
+            .call(methods::ACP_START, params)
+            .map_err(|e| io::Error::other(format!("acp.start failed: {e}")))?;
+        Ok(transport)
+    }
+
+    /// Send a JSON-RPC **notification** (no `id`, no response) to the daemon.
+    /// Used for the high-frequency `acp.send` tunnel stream, which must not go
+    /// through the request/response + timeout machinery. Writes are serialized
+    /// with regular calls via the `call` mutex.
+    pub fn notify(&self, method: &str, params: Value) -> Result<(), TransportError> {
+        if !self.healthy.load(Ordering::Acquire) {
+            return Err(TransportError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "agent transport is no longer healthy",
+            )));
+        }
+        let note = Notification::new(method, params);
+        let body = serde_json::to_vec(&note)
+            .map_err(|e| TransportError::Protocol(format!("encode notification: {e}")))?;
+        let mut chan = self
+            .call
+            .lock()
+            .map_err(|_| TransportError::Protocol("transport mutex poisoned".into()))?;
+        if let Err(e) =
+            framing::write_frame(&mut chan.stdin, &body).and_then(|()| chan.stdin.flush())
+        {
+            drop(chan);
+            self.mark_unhealthy();
+            return Err(TransportError::Io(e));
+        }
+        Ok(())
+    }
+
     /// Spawn an already-configured command with piped stdio (stderr is
     /// discarded so daemon logs never corrupt the framed protocol stream or
     /// the host TUI), start the reader thread, then perform the `initialize`
     /// handshake with the given per-call `timeout`. When `sink` is set and
     /// the daemon supports it, also activate a live `fs.watch` subscription.
     fn from_command_with_timeout(
-        mut cmd: Command,
+        cmd: Command,
         timeout: Duration,
         sink: Option<NotificationSink>,
     ) -> io::Result<Self> {
+        let (transport, init) = Self::spawn_and_init(cmd, timeout, sink)?;
+
+        // If the caller wants live updates and the daemon can watch, start
+        // the subscription now. Best-effort: a watch failure must not sink
+        // the whole connection (the explorer still works via polling).
+        if transport.has_notification_sink() && init.capabilities.watch {
+            let params = serde_json::to_value(FsWatchParams { enable: true })
+                .expect("serialize fs.watch params");
+            if let Err(e) = transport.call(methods::FS_WATCH, params) {
+                tracing::warn!(error = %e, "fs.watch subscription failed; explorer falls back to polling");
+            }
+        }
+
+        Ok(transport)
+    }
+
+    /// Spawn an already-configured command with piped stdio (stderr is
+    /// discarded so daemon logs never corrupt the framed protocol stream or
+    /// the host TUI), start the reader thread, then perform the `initialize`
+    /// handshake with the given per-call `timeout`. Returns the connected
+    /// transport and the daemon's [`InitializeResult`] so callers can act on
+    /// its advertised capabilities.
+    fn spawn_and_init(
+        mut cmd: Command,
+        timeout: Duration,
+        sink: Option<NotificationSink>,
+    ) -> io::Result<(Self, InitializeResult)> {
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -528,18 +621,7 @@ impl ProcessTransport {
             )));
         }
 
-        // If the caller wants live updates and the daemon can watch, start
-        // the subscription now. Best-effort: a watch failure must not sink
-        // the whole connection (the explorer still works via polling).
-        if transport.has_notification_sink() && init.capabilities.watch {
-            let params = serde_json::to_value(FsWatchParams { enable: true })
-                .expect("serialize fs.watch params");
-            if let Err(e) = transport.call(methods::FS_WATCH, params) {
-                tracing::warn!(error = %e, "fs.watch subscription failed; explorer falls back to polling");
-            }
-        }
-
-        Ok(transport)
+        Ok((transport, init))
     }
 
     /// Whether a notification sink was wired in (i.e. the reader thread will

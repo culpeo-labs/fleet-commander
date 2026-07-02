@@ -15,6 +15,8 @@ devcontainer-lib.workspace = true
 dirs.workspace = true
 fleet-git = { path = "../fleet-git" }
 fleet-protocol = { path = "../fleet-protocol" }
+futures-channel = "0.3.32"
+futures-util = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
