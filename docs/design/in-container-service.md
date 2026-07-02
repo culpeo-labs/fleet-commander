@@ -49,9 +49,13 @@ additive behind a capability flag.
 
 ### Key decisions
 
-- **Transport = stdio over `docker exec -i`.** No ports, no network auth (inherits
-  docker's), no firewall story. Exactly the ACP pattern (`copilot --acp --stdio`).
-  Framing = LSP/DAP/ACP-style `Content-Length: N\r\n\r\n<json>`.
+- **Transport = stdio bridged to a persistent daemon's unix socket over
+  `docker exec -i`.** No ports, no network auth (inherits docker's), no firewall
+  story. The daemon (started by `postStartCommand`) listens on a unix socket; the
+  host runs `fleet-agent bridge --socket <path>` over `docker exec -i` to relay
+  stdio ↔ socket (portable across native Docker and Docker Desktop). This decouples
+  the daemon's lifetime from any single `docker exec`, so it survives TUI restarts
+  (Phase 4b). Framing = LSP/DAP/ACP-style `Content-Length: N\r\n\r\n<json>`.
 - **`initialize` handshake from day one** — protocol version + capability negotiation
   (mirrors ACP/LSP). Client degrades gracefully; protocol can evolve.
 - **Paths are workspace-relative**; the server holds the root. Keeps the client
@@ -173,6 +177,7 @@ Each phase ships value and de-risks the next.
   - `acp.exit { code? }` (server→client notification) — the child exited; `code` is `None` if killed by signal.
   - `acp.stop {}` → `{ stopped }` — terminate the running child.
 - **ACP tunnel (Phase 4a):** the host no longer opens a separate `docker exec copilot --acp --stdio` channel. It runs the coding agent through `fleet-agent` via the `acp.*` methods above, and drives the ACP `Client` over the tunnel as a first-class line-based transport. Capability gate: `capabilities.acp`. This consolidates the container agent under one daemon connection, setting up a persistent daemon + session reattach in Phase 4b.
+- **Persistent daemon (Phase 4b):** `fleet-agent` runs as a long-lived service started by the devcontainer `postStartCommand` (`serve --root <ws> --socket <path>`), binding a unix socket in `/tmp`. Startup is idempotent (a redundant launch exits when it finds a live socket), and it serves each client on its own thread — a live session holds two connections at once (fs/watch + ACP tunnel). The host reaches it with `fleet-agent bridge --socket <path>` over `docker exec -i`. Because the daemon outlives any single client connection, a TUI restart reattaches instead of respawning. B1 keeps per-connection state (independent `Server` per accept, mirroring the earlier two-process model); daemon-scoped state that persists across disconnects (one reattachable ACP child) and connection unification land in B2/B3.
 - **Modeling:** reuse the `agent-client-protocol` crate's generic JSON-RPC
   connection/transport if it's cleanly separable; otherwise hand-rolled serde types
   for the 3 message kinds + typed params/results per method (keeps `fleet-agent`

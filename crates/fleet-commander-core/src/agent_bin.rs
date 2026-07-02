@@ -20,6 +20,14 @@ pub const CONTAINER_AGENT_PATH: &str = "/opt/fleet/bin/fleet-agent";
 /// Directory inside the container holding the agent binaries + launcher.
 pub const CONTAINER_AGENT_DIR: &str = "/opt/fleet/bin";
 
+/// Fixed path of the persistent daemon's unix socket inside the container.
+///
+/// The daemon (started by the devcontainer `postStartCommand`) binds this
+/// socket; the host reaches it via `fleet-agent bridge --socket <this>` over
+/// `docker exec`. Kept in `/tmp` because it is always writable by the remote
+/// user without extra ownership fixups, and each container hosts one workspace.
+pub const CONTAINER_AGENT_SOCKET: &str = "/tmp/fleet-agent.sock";
+
 /// Architecture slugs we ship `fleet-agent` binaries for.
 pub const KNOWN_ARCH_SLUGS: &[&str] = &["x86_64", "aarch64"];
 

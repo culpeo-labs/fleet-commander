@@ -83,7 +83,6 @@ impl App {
             };
             match ServiceFs::connect_docker_watched(
                 workspace,
-                &info.remote_workspace_folder,
                 &info.container_id,
                 &info.remote_user,
                 fleet_commander_core::agent_bin::CONTAINER_AGENT_PATH,
@@ -122,7 +121,6 @@ impl App {
             let container_id = info.container_id.clone();
             let branch = match ServiceFs::connect_docker(
                 workspace,
-                &info.remote_workspace_folder,
                 &info.container_id,
                 &info.remote_user,
                 fleet_commander_core::agent_bin::CONTAINER_AGENT_PATH,

@@ -20,11 +20,13 @@ inside the container, not just the host bind mount.
 │      ├─ ACP runtime for coding agents (via fleet-agent tunnel)       │
 │      └─ ServiceFs client for fleet-agent                             │
 └───────────────────────────────┬─────────────────────────────────────┘
-                                │ docker exec -i
+                                │ docker exec -i `fleet-agent bridge`
+                                │ (relays stdio ↔ daemon unix socket)
                                 │ JSON-RPC Content-Length frames
                                 ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│ Container: fleet-agent daemon                                          │
+│ Container: persistent fleet-agent daemon (postStartCommand)            │
+│  listens on a unix socket; a thread per client connection.             │
 │  fs.list/read/stat, git status, git branch, fs.watch → didChange,      │
 │  fs.search, git.diff, and acp.* — spawns & tunnels the coding agent:   │
 │                                                                        │
@@ -77,18 +79,18 @@ connection. If an agent has a workspace folder, it first starts the dev containe
 and emits `SessionEvent::ContainerReady`.
 
 For containerized agents the ACP session is **tunnelled through `fleet-agent`**
-rather than spawned over a separate `docker exec`. The host opens a dedicated
-`fleet-agent serve` connection, checks `capabilities.acp`, and calls `acp.start` to
-have the daemon spawn the coding agent (`copilot --acp --stdio`) inside the
-container. ACP wire lines are then relayed as fire-and-forget notifications —
-`acp.send` (host→child stdin) and `acp.recv` (child stdout→host) — with `acp.stderr`
-forwarding diagnostics and `acp.exit`/`acp.stop` handling teardown
-(`crates/fleet-commander-core/src/agent_runtime/tunnel.rs` exposes this as a
-line-based ACP transport). Host-run (non-container) agents still spawn the ACP
-command directly:
+rather than spawned over a separate `docker exec`. The host opens a second
+connection to the persistent daemon (via `fleet-agent bridge`), checks
+`capabilities.acp`, and calls `acp.start` to have the daemon spawn the coding agent
+(`copilot --acp --stdio`) inside the container. ACP wire lines are then relayed as
+fire-and-forget notifications — `acp.send` (host→child stdin) and `acp.recv` (child
+stdout→host) — with `acp.stderr` forwarding diagnostics and `acp.exit`/`acp.stop`
+handling teardown (`crates/fleet-commander-core/src/agent_runtime/tunnel.rs` exposes
+this as a line-based ACP transport). Host-run (non-container) agents still spawn the
+ACP command directly:
 
 ```text
-docker exec -i <container_id> fleet-agent serve   →   acp.start → copilot --acp --stdio
+docker exec -i <container_id> fleet-agent bridge --socket <path>   →   daemon: acp.start → copilot --acp --stdio
 ```
 
 `agent_runtime/connection.rs` then builds an ACP client over the chosen transport,
@@ -123,21 +125,29 @@ implemented by three crates:
 - `fleet-protocol` defines JSON-RPC 2.0 envelopes, method params/results,
   notifications, error codes, capability negotiation, and LSP/DAP/ACP-style
   `Content-Length: N\r\n\r\n<json>` framing.
-- `fleet-agent` serves a fixed workspace root. It handles `initialize`, `fs.list`,
+- `fleet-agent` runs as a **persistent daemon** rooted at one workspace, started by
+  the devcontainer `postStartCommand` (`fleet-agent serve --root <ws> --socket <path>`)
+  and listening on a unix socket. It handles `initialize`, `fs.list`,
   `fs.read` (base64 bytes), `fs.stat`, `git.status`, `git.branch`, `git.diff`,
   `fs.search`/`fs.cancelSearch`, `fs.watch`, and the `acp.*` agent tunnel
   (`src/acp.rs`, which spawns and relays the in-container coding agent's stdio).
-  Its resolver rejects absolute paths, `..`, and symlink escapes from the workspace
-  root.
+  Startup is idempotent (a redundant launch exits when it finds a live socket), and
+  it serves each client connection on its own thread. Its resolver rejects absolute
+  paths, `..`, and symlink escapes from the workspace root.
 - `ServiceFs` in `crates/fleet-commander-core/src/service_fs.rs` implements
   `WorkspaceFs` by sending typed RPCs to `fleet-agent`. If the daemon is unavailable,
   callers keep using `LocalFs` (`workspace_fs.rs`).
 
-Transport is stdio over `docker exec -i`, not a port. `ProcessTransport` owns the
-child process, serializes calls with a mutex, enforces a 30-second request timeout,
-and kills/marks the transport unhealthy on EOF, timeout, or I/O failure. Its reader
-thread demultiplexes incoming frames: responses go back to the pending call, while
-server-initiated notifications go to an optional `NotificationSink`.
+Transport is stdio bridged to the daemon's unix socket over `docker exec -i`, not a
+port. The host runs `fleet-agent bridge --socket <path>` (a thin stdio↔socket relay,
+portable across native Docker and Docker Desktop) and speaks the wire protocol to it;
+the relay forwards to the persistent daemon, which keeps running across client
+disconnects so a TUI restart reattaches instead of respawning. `ProcessTransport`
+owns the bridge child process, serializes calls with a mutex, enforces a 30-second
+request timeout, and kills/marks the transport unhealthy on EOF, timeout, or I/O
+failure. Its reader thread demultiplexes incoming frames: responses go back to the
+pending call, while server-initiated notifications go to an optional
+`NotificationSink`.
 
 Phase 2 adds live filesystem push. A watched connection sends `fs.watch { enable:
 true }` when the daemon advertises `capabilities.watch`; the daemon uses `notify` to

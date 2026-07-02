@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use dialoguer::{Confirm, Select};
 
+use fleet_commander_core::agent_bin::{CONTAINER_AGENT_PATH, CONTAINER_AGENT_SOCKET};
 use fleet_commander_core::base_layer::{workspace_layer_dir, workspace_slug};
 
 use crate::agent::Agent;
@@ -216,13 +217,11 @@ pub fn generate_workspace_layer(workspace: &Path, agent_kind: AgentKind) -> Resu
         base.insert("mounts".to_string(), serde_json::to_value(&mounts)?);
     }
 
-    // Add postStartCommand for ownership fixups.
-    if let Some(cmd) = agent_kind.post_start_command() {
-        base.insert(
-            "postStartCommand".to_string(),
-            serde_json::Value::String(cmd),
-        );
-    }
+    let post_start = daemon_post_start_command(agent_kind);
+    base.insert(
+        "postStartCommand".to_string(),
+        serde_json::Value::String(post_start),
+    );
 
     // Add required features (e.g. copilot-cli) so the agent binary is
     // available regardless of the project's own feature list.
@@ -242,6 +241,28 @@ pub fn generate_workspace_layer(workspace: &Path, agent_kind: AgentKind) -> Resu
     std::fs::write(&layer_path, &json)?;
 
     Ok(())
+}
+
+/// Build the `postStartCommand` for a workspace's base layer: run the agent's
+/// ownership fixups (if any), then start the persistent `fleet-agent` daemon in
+/// the background.
+///
+/// The daemon binds a unix socket the host reaches via `fleet-agent bridge`. It
+/// is idempotent — a redundant launch exits when it finds a live socket — so it
+/// is safe to run unconditionally on every container start (`postStartCommand`
+/// re-runs on each start per the devcontainer spec). `nohup … &` fully detaches
+/// it so the `postStartCommand` itself returns immediately, and `--root "$PWD"`
+/// roots the daemon at the workspace folder (the cwd lifecycle commands run in).
+fn daemon_post_start_command(agent_kind: AgentKind) -> String {
+    let daemon_launch = format!(
+        "nohup {bin} serve --socket {sock} --root \"$PWD\" </dev/null >/tmp/fleet-agent.log 2>&1 &",
+        bin = CONTAINER_AGENT_PATH,
+        sock = CONTAINER_AGENT_SOCKET,
+    );
+    match agent_kind.post_start_command() {
+        Some(fixup) => format!("{fixup}; {daemon_launch}"),
+        None => daemon_launch,
+    }
 }
 
 #[cfg(test)]
@@ -311,5 +332,19 @@ mod tests {
         // Verify slug generation.
         let slug = workspace_slug(&workspace);
         assert_eq!(slug, "my-project");
+    }
+
+    #[test]
+    fn daemon_post_start_command_launches_socket_daemon_after_fixups() {
+        let cmd = daemon_post_start_command(AgentKind::Copilot);
+        // The agent's ownership fixup runs first, then the daemon launch.
+        let fixup = AgentKind::Copilot.post_start_command().unwrap();
+        assert!(cmd.starts_with(&fixup), "fixup should run first: {cmd}");
+        // Daemon is started detached, bound to the shared socket, rooted at cwd.
+        assert!(cmd.contains(&format!(
+            "{CONTAINER_AGENT_PATH} serve --socket {CONTAINER_AGENT_SOCKET}"
+        )));
+        assert!(cmd.contains("--root \"$PWD\""));
+        assert!(cmd.contains("nohup") && cmd.trim_end().ends_with('&'));
     }
 }
