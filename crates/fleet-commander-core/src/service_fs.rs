@@ -110,30 +110,23 @@ impl ServiceFs {
         Ok(Self::new(root, Box::new(transport)))
     }
 
-    /// Connect to a `fleet-agent` running **inside a container** via
-    /// `docker exec -i`, perform the `initialize` handshake, and return a
-    /// connected `ServiceFs`.
+    /// Connect to the persistent `fleet-agent` daemon running **inside a
+    /// container** by bridging over `docker exec -i`, perform the `initialize`
+    /// handshake, and return a connected `ServiceFs`.
     ///
     /// `root_display` is the host-side path shown to the user (so the
     /// explorer's root label stays stable across the `LocalFs` → `ServiceFs`
-    /// upgrade); `remote_root` is the in-container workspace the daemon
-    /// resolves paths against; `agent_path` is the in-container binary path
-    /// (typically [`crate::agent_bin::CONTAINER_AGENT_PATH`]).
+    /// upgrade); `agent_path` is the in-container binary path (typically
+    /// [`crate::agent_bin::CONTAINER_AGENT_PATH`]). The daemon already knows its
+    /// workspace root (it was started with `--root` by the `postStartCommand`),
+    /// so no remote root is passed here.
     pub fn connect_docker(
         root_display: impl Into<PathBuf>,
-        remote_root: &str,
         container_id: &str,
         remote_user: &str,
         agent_path: &str,
     ) -> io::Result<Self> {
-        Self::connect_docker_watched(
-            root_display,
-            remote_root,
-            container_id,
-            remote_user,
-            agent_path,
-            None,
-        )
+        Self::connect_docker_watched(root_display, container_id, remote_user, agent_path, None)
     }
 
     /// Like [`connect_docker`](Self::connect_docker), but installs a live
@@ -143,19 +136,12 @@ impl ServiceFs {
     /// explorer to refresh in response to in-container filesystem changes.
     pub fn connect_docker_watched(
         root_display: impl Into<PathBuf>,
-        remote_root: &str,
         container_id: &str,
         remote_user: &str,
         agent_path: &str,
         sink: Option<NotificationSink>,
     ) -> io::Result<Self> {
-        let transport = ProcessTransport::docker_exec(
-            container_id,
-            remote_user,
-            agent_path,
-            remote_root,
-            sink,
-        )?;
+        let transport = ProcessTransport::docker_exec(container_id, remote_user, agent_path, sink)?;
         Ok(Self::new(root_display, Box::new(transport)))
     }
 
@@ -445,21 +431,26 @@ impl ProcessTransport {
         Self::from_command(cmd, sink)
     }
 
-    /// Connect to a `fleet-agent` running inside a container by shelling
-    /// `docker exec -i …` and complete the `initialize` handshake.
+    /// Connect to the persistent `fleet-agent` daemon inside a container by
+    /// bridging `docker exec -i … fleet-agent bridge` to its unix socket, then
+    /// complete the `initialize` handshake.
     ///
-    /// `agent_path` and `remote_root` are paths **inside** the container.
-    /// When `sink` is provided and the daemon advertises the `watch`
-    /// capability, a live `fs.watch` subscription is started and its
-    /// `fs.didChange` notifications are delivered to `sink`.
+    /// `agent_path` is the in-container binary path. When `sink` is provided and
+    /// the daemon advertises the `watch` capability, a live `fs.watch`
+    /// subscription is started and its `fs.didChange` notifications are
+    /// delivered to `sink`.
     pub fn docker_exec(
         container_id: &str,
         remote_user: &str,
         agent_path: &str,
-        remote_root: &str,
         sink: Option<NotificationSink>,
     ) -> io::Result<Self> {
-        let argv = docker_exec_argv(container_id, remote_user, agent_path, remote_root);
+        let argv = docker_exec_argv(
+            container_id,
+            remote_user,
+            agent_path,
+            crate::agent_bin::CONTAINER_AGENT_SOCKET,
+        );
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
         Self::from_command(cmd, sink)
@@ -485,7 +476,12 @@ impl ProcessTransport {
         acp_command: &str,
         sink: NotificationSink,
     ) -> io::Result<Self> {
-        let argv = docker_exec_argv(container_id, remote_user, agent_path, remote_root);
+        let argv = docker_exec_argv(
+            container_id,
+            remote_user,
+            agent_path,
+            crate::agent_bin::CONTAINER_AGENT_SOCKET,
+        );
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
         let (transport, init) = Self::spawn_and_init(cmd, REQUEST_TIMEOUT, Some(sink))?;
@@ -646,11 +642,16 @@ impl ProcessTransport {
 ///
 /// The daemon resolves all paths against `--root`, so no working directory is
 /// set; `-i` keeps stdin open for the framed request/response stream.
+/// Build the `docker exec` argv that connects the host to the container's
+/// **persistent daemon** through a `bridge` relay. The daemon itself is started
+/// separately by the devcontainer `postStartCommand`; here we only open a
+/// client connection to its unix socket, so this survives TUI restarts (the
+/// daemon keeps running between connections).
 pub fn docker_exec_argv(
     container_id: &str,
     remote_user: &str,
     agent_path: &str,
-    remote_root: &str,
+    socket_path: &str,
 ) -> Vec<String> {
     vec![
         "docker".into(),
@@ -660,9 +661,9 @@ pub fn docker_exec_argv(
         remote_user.into(),
         container_id.into(),
         agent_path.into(),
-        "serve".into(),
-        "--root".into(),
-        remote_root.into(),
+        "bridge".into(),
+        "--socket".into(),
+        socket_path.into(),
     ]
 }
 
@@ -1083,7 +1084,7 @@ mod tests {
             "abc123",
             "vscode",
             "/opt/fleet/bin/fleet-agent",
-            "/workspaces/repo",
+            "/tmp/fleet-agent.sock",
         );
         assert_eq!(
             argv,
@@ -1095,9 +1096,9 @@ mod tests {
                 "vscode",
                 "abc123",
                 "/opt/fleet/bin/fleet-agent",
-                "serve",
-                "--root",
-                "/workspaces/repo",
+                "bridge",
+                "--socket",
+                "/tmp/fleet-agent.sock",
             ]
         );
     }

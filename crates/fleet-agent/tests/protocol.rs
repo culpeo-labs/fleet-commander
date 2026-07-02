@@ -30,7 +30,7 @@ struct AgentProcess {
 
 impl AgentProcess {
     fn spawn(root: &std::path::Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_fleet-agent"))
+        let child = Command::new(env!("CARGO_BIN_EXE_fleet-agent"))
             .arg("serve")
             .arg("--root")
             .arg(root)
@@ -38,6 +38,24 @@ impl AgentProcess {
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn fleet-agent");
+        Self::from_child(child)
+    }
+
+    /// Connect to an already-running socket daemon through a `bridge` relay,
+    /// exactly as the host does via `docker exec`.
+    fn spawn_bridge(socket: &std::path::Path) -> Self {
+        let child = Command::new(env!("CARGO_BIN_EXE_fleet-agent"))
+            .arg("bridge")
+            .arg("--socket")
+            .arg(socket)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn fleet-agent bridge");
+        Self::from_child(child)
+    }
+
+    fn from_child(mut child: Child) -> Self {
         let stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -397,4 +415,118 @@ fn acp_tunnel_relays_child_stdio_and_reports_exit() {
     let stop: AcpStopResult = serde_json::from_value(resp.result.unwrap()).unwrap();
     assert!(stop.stopped, "acp.stop should signal the running child");
     let _ = agent.next_notification(methods::ACP_EXIT);
+}
+
+/// Owns a `serve --socket` daemon process and kills it on drop.
+struct SocketDaemon {
+    child: Child,
+    socket: std::path::PathBuf,
+    _tmp: tempfile::TempDir,
+}
+
+impl SocketDaemon {
+    fn start(root: &std::path::Path) -> Self {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let socket = tmp.path().join("agent.sock");
+        let child = Command::new(env!("CARGO_BIN_EXE_fleet-agent"))
+            .arg("serve")
+            .arg("--root")
+            .arg(root)
+            .arg("--socket")
+            .arg(&socket)
+            .spawn()
+            .expect("spawn fleet-agent daemon");
+
+        // Wait for the daemon to bind before any bridge tries to connect.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemon never created its socket"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        Self {
+            child,
+            socket,
+            _tmp: tmp,
+        }
+    }
+}
+
+impl Drop for SocketDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn socket_daemon_serves_bridge_clients_and_survives_reconnect() {
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::write(root.path().join("hello.txt"), b"world").unwrap();
+    let daemon = SocketDaemon::start(root.path());
+
+    // First client: connect through a bridge and drive the protocol.
+    {
+        let mut agent = AgentProcess::spawn_bridge(&daemon.socket);
+        let resp = agent.call(
+            methods::INITIALIZE,
+            InitializeParams {
+                protocol_version: PROTOCOL_VERSION,
+            },
+        );
+        let init: InitializeResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(init.protocol_version, PROTOCOL_VERSION);
+        assert!(init.capabilities.fs && init.capabilities.git);
+
+        let resp = agent.call(methods::FS_LIST, FsListParams { path: "".into() });
+        let list: FsListResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        let names: Vec<_> = list.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["hello.txt"]);
+        // Dropping `agent` kills the bridge; the daemon should keep listening.
+    }
+
+    // Second client: the daemon must accept a fresh connection after the first
+    // one disconnected — the reattach guarantee Phase B is built on.
+    {
+        let mut agent = AgentProcess::spawn_bridge(&daemon.socket);
+        let resp = agent.call(
+            methods::INITIALIZE,
+            InitializeParams {
+                protocol_version: PROTOCOL_VERSION,
+            },
+        );
+        let init: InitializeResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(init.protocol_version, PROTOCOL_VERSION);
+    }
+}
+
+#[test]
+fn socket_daemon_serves_two_clients_concurrently() {
+    // A live session holds two connections at once (fs/watch + ACP tunnel), so
+    // the daemon must serve them in parallel — a second client must not block
+    // behind the first one's still-open connection.
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::write(root.path().join("a.txt"), b"1").unwrap();
+    let daemon = SocketDaemon::start(root.path());
+
+    let mut first = AgentProcess::spawn_bridge(&daemon.socket);
+    let mut second = AgentProcess::spawn_bridge(&daemon.socket);
+
+    // Both connections are open simultaneously; drive them interleaved.
+    for agent in [&mut first, &mut second] {
+        let resp = agent.call(
+            methods::INITIALIZE,
+            InitializeParams {
+                protocol_version: PROTOCOL_VERSION,
+            },
+        );
+        let init: InitializeResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(init.protocol_version, PROTOCOL_VERSION);
+    }
+    // The first connection still works after the second one connected.
+    let resp = first.call(methods::FS_LIST, FsListParams { path: "".into() });
+    let list: FsListResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert_eq!(list.entries.len(), 1);
 }
