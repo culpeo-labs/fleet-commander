@@ -28,6 +28,7 @@ impl Server {
                 git: true,
                 watch: true,
                 search: true,
+                acp: true,
             },
         })
     }

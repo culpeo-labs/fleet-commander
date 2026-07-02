@@ -10,7 +10,9 @@ use agent_client_protocol::schema::v1::{
     PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionNotification, SessionUpdate, TextContent,
 };
-use agent_client_protocol::{AcpAgent, Agent as AcpAgentRole, ConnectionTo, LineDirection};
+use agent_client_protocol::{
+    AcpAgent, Agent as AcpAgentRole, ConnectionTo, DynConnectTo, LineDirection,
+};
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -21,6 +23,7 @@ use crate::session_state::SessionStateMachine;
 use super::AcpLog;
 use super::auth::{build_auth_command, terminal_auth_command};
 use super::resume::{try_find_and_resume, try_resume_specific};
+use super::tunnel;
 use super::updates::apply_session_update;
 
 #[allow(clippy::too_many_arguments)]
@@ -69,34 +72,50 @@ async fn connect_and_run(
     event_tx: mpsc::UnboundedSender<SessionEvent>,
     acp_log: Option<AcpLog>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut agent = AcpAgent::from_str(acp_command)?;
     info!(agent_id = %agent_id, command = %acp_command, "Connecting to ACP agent");
 
-    // Forward agent stderr to the TUI so the user sees device-code URLs,
-    // diagnostic messages, etc. When --acp-log is set, also append every
-    // wire line (both directions) to the log file for protocol debugging.
-    let debug_aid = agent_id.clone();
-    let debug_tx = event_tx.clone();
-    let debug_log = acp_log.clone();
-    agent = agent.with_debug(move |line, direction| {
-        if direction == LineDirection::Stderr {
-            let _ = debug_tx.send(SessionEvent::Output {
-                agent_id: debug_aid.clone(),
-                line: format!("  {line}"),
-            });
-        }
-        if let Some(ref log) = debug_log {
-            let prefix = match direction {
-                LineDirection::Stdin => ">>",
-                LineDirection::Stdout => "<<",
-                LineDirection::Stderr => "!!",
-            };
-            if let Ok(mut file) = log.lock() {
-                use std::io::Write;
-                let _ = writeln!(file, "[{debug_aid}] {prefix} {line}");
+    // Build the ACP transport. Inside a container the agent is spawned and
+    // tunnelled by `fleet-agent` (Phase 4a); on the host it is spawned
+    // directly. Either way it is type-erased to a `DynConnectTo<Client>` so the
+    // builder chain below is identical.
+    let component: DynConnectTo<agent_client_protocol::Client> = if let Some(ci) = container_info {
+        let lines = tunnel::connect(
+            ci,
+            acp_command,
+            agent_id.clone(),
+            event_tx.clone(),
+            acp_log.clone(),
+        )?;
+        DynConnectTo::new(lines)
+    } else {
+        let mut agent = AcpAgent::from_str(acp_command)?;
+        // Forward agent stderr to the TUI so the user sees device-code URLs,
+        // diagnostic messages, etc. When --acp-log is set, also append every
+        // wire line (both directions) to the log file for protocol debugging.
+        let debug_aid = agent_id.clone();
+        let debug_tx = event_tx.clone();
+        let debug_log = acp_log.clone();
+        agent = agent.with_debug(move |line, direction| {
+            if direction == LineDirection::Stderr {
+                let _ = debug_tx.send(SessionEvent::Output {
+                    agent_id: debug_aid.clone(),
+                    line: format!("  {line}"),
+                });
             }
-        }
-    });
+            if let Some(ref log) = debug_log {
+                let prefix = match direction {
+                    LineDirection::Stdin => ">>",
+                    LineDirection::Stdout => "<<",
+                    LineDirection::Stderr => "!!",
+                };
+                if let Ok(mut file) = log.lock() {
+                    use std::io::Write;
+                    let _ = writeln!(file, "[{debug_aid}] {prefix} {line}");
+                }
+            }
+        });
+        DynConnectTo::new(agent)
+    };
 
     // Clone container_info fields we need into the closure (can't move a reference).
     let ci_for_auth: Option<(String, String, String)> = container_info.map(|ci| {
@@ -220,7 +239,7 @@ async fn connect_and_run(
             },
             agent_client_protocol::on_receive_request!(),
         )
-        .connect_with(agent, |connection: ConnectionTo<AcpAgentRole>| {
+        .connect_with(component, |connection: ConnectionTo<AcpAgentRole>| {
             let aid = aid.clone();
             let tx = event_tx;
             async move {

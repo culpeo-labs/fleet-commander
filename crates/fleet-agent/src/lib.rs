@@ -11,14 +11,16 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
-use fleet_protocol::{Request, Response, RpcError, error_codes, framing, methods};
+use fleet_protocol::{Notification, Request, Response, RpcError, error_codes, framing, methods};
 
+mod acp;
 mod handlers;
 mod search;
 mod search_stream;
 mod util;
 mod watch;
 
+use acp::{AcpChild, handle_acp_send, handle_acp_stop};
 use search_stream::{SearchState, handle_cancel_search};
 use util::send_body;
 use watch::WatchHandle;
@@ -86,12 +88,15 @@ impl Server {
 
         let mut watch: Option<WatchHandle> = None;
         let mut searches = SearchState::default();
-        let result = self.dispatch_loop(reader, &out_tx, &mut watch, &mut searches);
+        let mut acp: Option<AcpChild> = None;
+        let result = self.dispatch_loop(reader, &out_tx, &mut watch, &mut searches, &mut acp);
 
-        // Tear down in order: cancel + join any in-flight searches and stop
-        // the watcher (both hold `out` senders), then drop our sender so the
-        // writer thread sees the channel close and exits, then join it.
+        // Tear down in order: cancel + join any in-flight searches, stop the
+        // ACP child, and stop the watcher (all hold `out` senders), then drop
+        // our sender so the writer thread sees the channel close and exits,
+        // then join it.
         searches.shutdown();
+        drop(acp);
         drop(watch);
         drop(out_tx);
         let _ = writer_handle.join();
@@ -108,9 +113,35 @@ impl Server {
         out: &mpsc::Sender<Vec<u8>>,
         watch: &mut Option<WatchHandle>,
         searches: &mut SearchState,
+        acp: &mut Option<AcpChild>,
     ) -> io::Result<()> {
         while let Some(body) = framing::read_frame(reader)? {
-            let req = match serde_json::from_slice::<Request>(&body) {
+            // Peek at the raw object to tell requests (have an `id`, expect a
+            // response) from notifications (no `id`, fire-and-forget, e.g. the
+            // high-frequency `acp.send`).
+            let value: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    let response = Response::err(
+                        0,
+                        RpcError::new(error_codes::PARSE_ERROR, format!("invalid request: {e}")),
+                    );
+                    send_body(out, &serde_json::to_vec(&response)?)?;
+                    continue;
+                }
+            };
+
+            if value.get("id").is_none() {
+                // Client→server notification: no response is sent.
+                if let Ok(note) = serde_json::from_value::<Notification>(value)
+                    && note.method == methods::ACP_SEND
+                {
+                    handle_acp_send(&note, acp);
+                }
+                continue;
+            }
+
+            let req = match serde_json::from_value::<Request>(value) {
                 Ok(req) => req,
                 Err(e) => {
                     let response = Response::err(
@@ -134,6 +165,14 @@ impl Server {
                 }
                 methods::FS_CANCEL_SEARCH => {
                     let response = handle_cancel_search(&req, searches);
+                    send_body(out, &serde_json::to_vec(&response)?)?;
+                }
+                methods::ACP_START => {
+                    let response = self.handle_acp_start(&req, out, acp);
+                    send_body(out, &serde_json::to_vec(&response)?)?;
+                }
+                methods::ACP_STOP => {
+                    let response = handle_acp_stop(&req, acp);
                     send_body(out, &serde_json::to_vec(&response)?)?;
                 }
                 _ => {

@@ -9,10 +9,11 @@ use std::thread;
 use std::time::Duration;
 
 use fleet_protocol::{
-    CancelSearchParams, CancelSearchResult, FsDidChangeParams, FsListParams, FsListResult,
-    FsReadParams, FsReadResult, FsWatchParams, FsWatchResult, GitBranchResult, Incoming,
-    InitializeParams, InitializeResult, Notification, PROTOCOL_VERSION, Request, Response,
-    SearchAck, SearchDoneParams, SearchParams, SearchResultParams, framing, methods,
+    AcpDataParams, AcpStartParams, AcpStartResult, AcpStopResult, CancelSearchParams,
+    CancelSearchResult, FsDidChangeParams, FsListParams, FsListResult, FsReadParams, FsReadResult,
+    FsWatchParams, FsWatchResult, GitBranchResult, Incoming, InitializeParams, InitializeResult,
+    Notification, PROTOCOL_VERSION, Request, Response, SearchAck, SearchDoneParams, SearchParams,
+    SearchResultParams, framing, methods,
 };
 
 /// Generous ceiling for any single blocking read so a protocol regression
@@ -73,6 +74,15 @@ impl AgentProcess {
         framing::write_frame(&mut self.stdin, &body).unwrap();
         self.stdin.flush().unwrap();
         self.next_id
+    }
+
+    /// Send a fire-and-forget notification (no `id`, no response), as the host
+    /// does for the high-frequency `acp.send` tunnel stream.
+    fn send_notification(&mut self, method: &str, params: impl serde::Serialize) {
+        let note = Notification::new(method, params);
+        let body = serde_json::to_vec(&note).unwrap();
+        framing::write_frame(&mut self.stdin, &body).unwrap();
+        self.stdin.flush().unwrap();
     }
 
     /// Send a request and wait for its response, buffering any notifications
@@ -328,4 +338,63 @@ fn fs_cancel_search_stops_in_flight_search() {
         "cancelled search should stop short of all matches, got {}",
         done.summary.count
     );
+}
+
+#[test]
+fn acp_tunnel_relays_child_stdio_and_reports_exit() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut agent = AgentProcess::spawn(tmp.path());
+
+    // initialize — the daemon must advertise the ACP tunnel capability.
+    let resp = agent.call(
+        methods::INITIALIZE,
+        InitializeParams {
+            protocol_version: PROTOCOL_VERSION,
+        },
+    );
+    let init: InitializeResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert!(init.capabilities.acp, "daemon should advertise acp support");
+
+    // Spawn `cat` as a stand-in ACP child: it echoes each stdin line back on
+    // stdout, which is all we need to prove the tunnel relays both directions.
+    let resp = agent.call(
+        methods::ACP_START,
+        AcpStartParams {
+            command: "cat".into(),
+            cwd: None,
+            env: Vec::new(),
+        },
+    );
+    let start: AcpStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert!(start.started, "acp.start should spawn the child");
+
+    // A second start is a no-op while a child is running.
+    let resp = agent.call(
+        methods::ACP_START,
+        AcpStartParams {
+            command: "cat".into(),
+            cwd: None,
+            env: Vec::new(),
+        },
+    );
+    let again: AcpStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert!(!again.started, "a second acp.start must not spawn a child");
+
+    // Host→agent line arrives on the child's stdin; the child echoes it and we
+    // receive it back as an acp.recv notification.
+    agent.send_notification(
+        methods::ACP_SEND,
+        AcpDataParams {
+            data: "{\"jsonrpc\":\"2.0\"}".into(),
+        },
+    );
+    let note = agent.next_notification(methods::ACP_RECV);
+    let echoed: AcpDataParams = serde_json::from_value(note.params.unwrap()).unwrap();
+    assert_eq!(echoed.data, "{\"jsonrpc\":\"2.0\"}");
+
+    // Stopping kills the child; its closed stdout yields an acp.exit.
+    let resp = agent.call(methods::ACP_STOP, ());
+    let stop: AcpStopResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert!(stop.stopped, "acp.stop should signal the running child");
+    let _ = agent.next_notification(methods::ACP_EXIT);
 }

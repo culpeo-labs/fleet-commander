@@ -17,17 +17,19 @@ inside the container, not just the host bind mount.
 │  ├─ App/AppEvent event loop, screens, keybindings, MCP server        │
 │  └─ fleet-commander-core                                            │
 │      ├─ container lifecycle via devcontainer-lib + Docker API        │
-│      ├─ ACP runtime for coding agents                               │
+│      ├─ ACP runtime for coding agents (via fleet-agent tunnel)       │
 │      └─ ServiceFs client for fleet-agent                             │
-└───────────────┬───────────────────────────────────────┬─────────────┘
-                │ docker exec -i                         │ docker exec -i
-                │ JSON-RPC Content-Length frames          │ ACP stdio
-                ▼                                         ▼
-┌──────────────────────────────────┐      ┌───────────────────────────┐
-│ Container: fleet-agent daemon     │      │ Container: coding agent    │
-│  fs.list/read/stat, git status,   │      │  copilot --acp --stdio,    │
-│  git branch, fs.watch → didChange │      │  claude-agent-acp, …       │
-└──────────────────────────────────┘      └───────────────────────────┘
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │ docker exec -i
+                                │ JSON-RPC Content-Length frames
+                                ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ Container: fleet-agent daemon                                          │
+│  fs.list/read/stat, git status, git branch, fs.watch → didChange,      │
+│  fs.search, git.diff, and acp.* — spawns & tunnels the coding agent:   │
+│                                                                        │
+│      fleet-agent ──stdio──▶ copilot --acp --stdio (claude-agent-acp…)  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Workspace crates
@@ -38,8 +40,8 @@ The workspace members are declared in `Cargo.toml`.
 | --- | --- | --- |
 | `crates/fleet-commander` | The binary TUI. It contains CLI/init flow, workspace persistence, `App` state machine, `AppEvent`, ratatui rendering, MCP tools, keybindings, and embedded-agent install hook. See `src/main.rs`, `src/app.rs`, `src/event.rs`, and `src/ui.rs`. | `fleet-commander-core`, `agent-client-protocol`, ratatui/crossterm, rmcp/axum, config/rendering deps |
 | `crates/fleet-commander-core` | Frontend-agnostic runtime: dev-container lifecycle, ACP agent runtime, session handle model, workspace filesystem abstraction, `ServiceFs`, git helpers re-export, and `fleet-agent` binary resolution. See `src/lib.rs`. | `fleet-protocol`, `fleet-git`, `agent-client-protocol`, `devcontainer-lib` |
-| `crates/fleet-protocol` | Dependency-light wire types and `Content-Length` stdio framing for the in-container service. Defines JSON-RPC requests, responses, notifications, capabilities, and methods such as `fs.list`, `git.status`, and `fs.watch`. See `src/lib.rs`. | `serde`, `serde_json` |
-| `crates/fleet-agent` | Injected in-container daemon binary. Serves filesystem and git inspection for one workspace root over JSON-RPC stdio. See `src/lib.rs` and `src/main.rs`. | `fleet-protocol`, `fleet-git`, `notify`, `base64` |
+| `crates/fleet-protocol` | Dependency-light wire types and `Content-Length` stdio framing for the in-container service. Defines JSON-RPC requests, responses, notifications, capabilities, and methods such as `fs.list`, `git.status`, `fs.watch`, and the `acp.*` agent tunnel. See `src/lib.rs`. | `serde`, `serde_json` |
+| `crates/fleet-agent` | Injected in-container daemon binary. Serves filesystem and git inspection for one workspace root over JSON-RPC stdio, and spawns/tunnels the ACP coding agent via `acp.*`. See `src/lib.rs`, `src/main.rs`, and `src/acp.rs`. | `fleet-protocol`, `fleet-git`, `notify`, `base64` |
 | `crates/fleet-git` | Small git inspection helper shared by host and daemon. It parses `.git/HEAD` directly for branch names and shells out to `git status --porcelain=v1 -z` for status. See `src/lib.rs`. | std only at runtime |
 
 ## Host TUI and app loop
@@ -71,17 +73,29 @@ stored per workspace (`crates/fleet-commander/src/workspace.rs`); Copilot curren
 maps to `copilot --acp --stdio` in `src/agent_kind.rs`.
 
 `crates/fleet-commander-core/src/agent_runtime/mod.rs` starts a persistent agent
-connection. If an agent has a workspace folder, it first starts the dev container,
-emits `SessionEvent::ContainerReady`, and wraps the ACP command with:
+connection. If an agent has a workspace folder, it first starts the dev container
+and emits `SessionEvent::ContainerReady`.
+
+For containerized agents the ACP session is **tunnelled through `fleet-agent`**
+rather than spawned over a separate `docker exec`. The host opens a dedicated
+`fleet-agent serve` connection, checks `capabilities.acp`, and calls `acp.start` to
+have the daemon spawn the coding agent (`copilot --acp --stdio`) inside the
+container. ACP wire lines are then relayed as fire-and-forget notifications —
+`acp.send` (host→child stdin) and `acp.recv` (child stdout→host) — with `acp.stderr`
+forwarding diagnostics and `acp.exit`/`acp.stop` handling teardown
+(`crates/fleet-commander-core/src/agent_runtime/tunnel.rs` exposes this as a
+line-based ACP transport). Host-run (non-container) agents still spawn the ACP
+command directly:
 
 ```text
-docker exec -i -u <remote_user> -w <remote_workspace> <container_id> <acp_command>
+docker exec -i <container_id> fleet-agent serve   →   acp.start → copilot --acp --stdio
 ```
 
-`agent_runtime/connection.rs` then builds an ACP client, sends `initialize`, handles
-agent authentication, resumes or loads prior sessions when supported, creates a new
-session otherwise, forwards prompts as `PromptRequest`, and maps ACP notifications
-into Fleet Commander's handle-based `SessionEvent` model.
+`agent_runtime/connection.rs` then builds an ACP client over the chosen transport,
+sends `initialize`, handles agent authentication, resumes or loads prior sessions
+when supported, creates a new session otherwise, forwards prompts as
+`PromptRequest`, and maps ACP notifications into Fleet Commander's handle-based
+`SessionEvent` model.
 
 ## Dev-container orchestration
 
@@ -110,7 +124,9 @@ implemented by three crates:
   notifications, error codes, capability negotiation, and LSP/DAP/ACP-style
   `Content-Length: N\r\n\r\n<json>` framing.
 - `fleet-agent` serves a fixed workspace root. It handles `initialize`, `fs.list`,
-  `fs.read` (base64 bytes), `fs.stat`, `git.status`, `git.branch`, and `fs.watch`.
+  `fs.read` (base64 bytes), `fs.stat`, `git.status`, `git.branch`, `git.diff`,
+  `fs.search`/`fs.cancelSearch`, `fs.watch`, and the `acp.*` agent tunnel
+  (`src/acp.rs`, which spawns and relays the in-container coding agent's stdio).
   Its resolver rejects absolute paths, `..`, and symlink escapes from the workspace
   root.
 - `ServiceFs` in `crates/fleet-commander-core/src/service_fs.rs` implements

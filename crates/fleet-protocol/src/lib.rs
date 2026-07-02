@@ -42,6 +42,23 @@ pub mod methods {
     pub const FS_WATCH: &str = "fs.watch";
     /// Server→client notification: the workspace changed (Phase 2).
     pub const FS_DID_CHANGE: &str = "fs.didChange";
+    /// Request: spawn an ACP coding-agent child process inside the workspace
+    /// and begin tunnelling its stdio through this connection (Phase 4a).
+    pub const ACP_START: &str = "acp.start";
+    /// Client→server notification: one line of ACP wire data destined for the
+    /// child's stdin. ACP's stdio transport is newline-delimited JSON, so each
+    /// notification carries exactly one message.
+    pub const ACP_SEND: &str = "acp.send";
+    /// Server→client notification: one line of ACP wire data read from the
+    /// child's stdout.
+    pub const ACP_RECV: &str = "acp.recv";
+    /// Server→client notification: one line from the child's stderr (diagnostic
+    /// output, e.g. device-code login URLs). Surfaced to the operator.
+    pub const ACP_STDERR: &str = "acp.stderr";
+    /// Server→client notification: the ACP child exited.
+    pub const ACP_EXIT: &str = "acp.exit";
+    /// Request: terminate the ACP child if one is running.
+    pub const ACP_STOP: &str = "acp.stop";
 }
 
 /// JSON-RPC + application error codes.
@@ -222,6 +239,11 @@ pub struct Capabilities {
     /// (Phase 3). Defaults to `false` for older daemons.
     #[serde(default)]
     pub search: bool,
+    /// The server can spawn and tunnel an ACP coding-agent child via
+    /// [`methods::ACP_START`] (Phase 4a). Defaults to `false` for older
+    /// daemons.
+    #[serde(default)]
+    pub acp: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -440,6 +462,56 @@ pub struct CancelSearchParams {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CancelSearchResult {
     pub cancelled: bool,
+}
+
+/// Params for [`methods::ACP_START`]: spawn an ACP coding-agent child.
+///
+/// `command` is a shell-free argv-style command line (parsed the same way the
+/// host would parse an ACP command, e.g. `copilot --acp --stdio`). `cwd` is the
+/// working directory for the child — normally the workspace root. `env` is a
+/// list of extra environment variables to set on the child.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AcpStartParams {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<AcpEnvVar>,
+}
+
+/// A single environment variable for the ACP child.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcpEnvVar {
+    pub name: String,
+    pub value: String,
+}
+
+/// Result of [`methods::ACP_START`]: whether a child was spawned. `started` is
+/// `false` if a child was already running (the existing one is left in place).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcpStartResult {
+    pub started: bool,
+}
+
+/// Params for the [`methods::ACP_SEND`] / [`methods::ACP_RECV`] notifications:
+/// one line of ACP wire data (no trailing newline).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcpDataParams {
+    pub data: String,
+}
+
+/// Params for the [`methods::ACP_EXIT`] notification: the child's exit code,
+/// or `None` if it was terminated by a signal / the code was unavailable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AcpExitParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<i32>,
+}
+
+/// Result of [`methods::ACP_STOP`]: whether a running child was signalled.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcpStopResult {
+    pub stopped: bool,
 }
 
 // ─── Framing ───────────────────────────────────────────────────────────

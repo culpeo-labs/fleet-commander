@@ -17,6 +17,7 @@
 mod auth;
 mod connection;
 mod resume;
+mod tunnel;
 mod updates;
 
 use std::path::PathBuf;
@@ -96,19 +97,12 @@ pub fn start_agent(
                             remote_workspace_folder: info.remote_workspace_folder.clone(),
                         });
 
-                        // Wrap ACP command with docker exec to run inside the
-                        // container. Authentication is handled by the interactive
-                        // terminal login flow, so no env vars are injected here.
-                        let exec_cmd = format!(
-                            "docker exec -i -u {} -w {} {} {}",
-                            info.remote_user,
-                            info.remote_workspace_folder,
-                            info.container_id,
-                            acp_command,
-                        );
-
+                        // The ACP agent runs *inside* the container, spawned
+                        // by fleet-agent via the ACP tunnel (see
+                        // `connection`/`tunnel`). Pass the raw ACP command
+                        // through unchanged — no `docker exec` wrapping here.
                         let cwd = PathBuf::from(&info.remote_workspace_folder);
-                        (exec_cmd, cwd, Some(info))
+                        (acp_command.clone(), cwd, Some(info))
                     }
                     Err(err) => {
                         error!(agent_id = %agent_id, error = %err, "Container failed to start");
