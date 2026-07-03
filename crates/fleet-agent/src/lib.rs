@@ -17,11 +17,15 @@ mod acp;
 mod handlers;
 mod search;
 mod search_stream;
+mod session;
 mod util;
 mod watch;
 
 use acp::{AcpChild, handle_acp_send, handle_acp_stop};
 use search_stream::{SearchState, handle_cancel_search};
+use session::{
+    SessionHandle, handle_session_cancel, handle_session_permission_respond, handle_session_prompt,
+};
 use util::send_body;
 use watch::WatchHandle;
 
@@ -89,13 +93,22 @@ impl Server {
         let mut watch: Option<WatchHandle> = None;
         let mut searches = SearchState::default();
         let mut acp: Option<AcpChild> = None;
-        let result = self.dispatch_loop(reader, &out_tx, &mut watch, &mut searches, &mut acp);
+        let mut session: Option<SessionHandle> = None;
+        let result = self.dispatch_loop(
+            reader,
+            &out_tx,
+            &mut watch,
+            &mut searches,
+            &mut acp,
+            &mut session,
+        );
 
         // Tear down in order: cancel + join any in-flight searches, stop the
-        // ACP child, and stop the watcher (all hold `out` senders), then drop
-        // our sender so the writer thread sees the channel close and exits,
-        // then join it.
+        // ACP child / session, and stop the watcher (all hold `out` senders),
+        // then drop our sender so the writer thread sees the channel close and
+        // exits, then join it.
         searches.shutdown();
+        drop(session);
         drop(acp);
         drop(watch);
         drop(out_tx);
@@ -114,6 +127,7 @@ impl Server {
         watch: &mut Option<WatchHandle>,
         searches: &mut SearchState,
         acp: &mut Option<AcpChild>,
+        session: &mut Option<SessionHandle>,
     ) -> io::Result<()> {
         while let Some(body) = framing::read_frame(reader)? {
             // Peek at the raw object to tell requests (have an `id`, expect a
@@ -133,10 +147,15 @@ impl Server {
 
             if value.get("id").is_none() {
                 // Client→server notification: no response is sent.
-                if let Ok(note) = serde_json::from_value::<Notification>(value)
-                    && note.method == methods::ACP_SEND
-                {
-                    handle_acp_send(&note, acp);
+                if let Ok(note) = serde_json::from_value::<Notification>(value) {
+                    match note.method.as_str() {
+                        methods::ACP_SEND => handle_acp_send(&note, acp),
+                        methods::SESSION_PROMPT => handle_session_prompt(&note, session),
+                        methods::SESSION_PERMISSION_RESPOND => {
+                            handle_session_permission_respond(&note, session)
+                        }
+                        _ => {}
+                    }
                 }
                 continue;
             }
@@ -173,6 +192,14 @@ impl Server {
                 }
                 methods::ACP_STOP => {
                     let response = handle_acp_stop(&req, acp);
+                    send_body(out, &serde_json::to_vec(&response)?)?;
+                }
+                methods::SESSION_START => {
+                    let response = self.handle_session_start(&req, out, session);
+                    send_body(out, &serde_json::to_vec(&response)?)?;
+                }
+                methods::SESSION_CANCEL => {
+                    let response = handle_session_cancel(&req, session);
                     send_body(out, &serde_json::to_vec(&response)?)?;
                 }
                 _ => {
