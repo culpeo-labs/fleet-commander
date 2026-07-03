@@ -1226,6 +1226,7 @@ dependencies = [
 name = "fleet-agent"
 version = "0.3.0"
 dependencies = [
+ "agent-client-protocol",
  "base64 0.22.1",
  "fleet-git",
  "fleet-protocol",
@@ -1237,6 +1238,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

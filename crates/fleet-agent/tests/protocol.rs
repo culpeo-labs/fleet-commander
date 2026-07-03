@@ -13,7 +13,8 @@ use fleet_protocol::{
     CancelSearchResult, FsDidChangeParams, FsListParams, FsListResult, FsReadParams, FsReadResult,
     FsWatchParams, FsWatchResult, GitBranchResult, Incoming, InitializeParams, InitializeResult,
     Notification, PROTOCOL_VERSION, Request, Response, SearchAck, SearchDoneParams, SearchParams,
-    SearchResultParams, framing, methods,
+    SearchResultParams, SessionConnectedParams, SessionPromptParams, SessionPromptResultParams,
+    SessionStartParams, SessionStartResult, SessionUpdateParams, framing, methods,
 };
 
 /// Generous ceiling for any single blocking read so a protocol regression
@@ -415,6 +416,110 @@ fn acp_tunnel_relays_child_stdio_and_reports_exit() {
     let stop: AcpStopResult = serde_json::from_value(resp.result.unwrap()).unwrap();
     assert!(stop.stopped, "acp.stop should signal the running child");
     let _ = agent.next_notification(methods::ACP_EXIT);
+}
+
+/// A minimal ACP coding agent, in Python (preinstalled on the CI runners),
+/// speaking newline-delimited JSON-RPC — enough for the daemon to complete the
+/// `initialize` → `session/new` → `session/prompt` handshake. On a prompt it
+/// streams one `session/update` (agent message chunk) then answers the request.
+const FAKE_ACP_AGENT: &str = r#"
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid,
+              "result": {"protocolVersion": 1, "agentCapabilities": {}, "authMethods": []}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "test-session-1"}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "method": "session/update",
+              "params": {"sessionId": "test-session-1",
+                         "update": {"sessionUpdate": "agent_message_chunk",
+                                    "content": {"type": "text", "text": "pong"}}}})
+        send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+    elif method == "authenticate":
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+    elif mid is not None:
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+"#;
+
+/// Drive the daemon-owned session protocol end-to-end against the fake ACP
+/// agent: `session.start` runs the handshake and returns the session id, a
+/// prompt is forwarded, and the agent's streamed update plus the turn's
+/// completion come back as `session.update` / `session.promptResult`.
+#[test]
+fn daemon_owns_acp_session_end_to_end() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let script = tmp.path().join("fake_acp.py");
+    std::fs::write(&script, FAKE_ACP_AGENT).unwrap();
+
+    let mut agent = AgentProcess::spawn(tmp.path());
+
+    // The daemon must advertise it owns the ACP session.
+    let resp = agent.call(
+        methods::INITIALIZE,
+        InitializeParams {
+            protocol_version: PROTOCOL_VERSION,
+        },
+    );
+    let init: InitializeResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert!(
+        init.capabilities.session,
+        "daemon should advertise session support"
+    );
+
+    // Start a session: the daemon spawns the fake agent, runs the handshake,
+    // and returns the session id.
+    let resp = agent.call(
+        methods::SESSION_START,
+        SessionStartParams {
+            command: format!("python3 {}", script.display()),
+            cwd: tmp.path().display().to_string(),
+            previous_session_id: None,
+            env: Vec::new(),
+        },
+    );
+    let started: SessionStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert_eq!(
+        started.session_id.as_deref(),
+        Some("test-session-1"),
+        "session.start should return the agent's session id"
+    );
+    assert!(started.auth_required.is_none());
+
+    // The daemon announces readiness.
+    let note = agent.next_notification(methods::SESSION_CONNECTED);
+    let connected: SessionConnectedParams = serde_json::from_value(note.params.unwrap()).unwrap();
+    assert_eq!(connected.session_id.as_deref(), Some("test-session-1"));
+
+    // Send a prompt; the agent streams an update and completes the turn.
+    agent.send_notification(
+        methods::SESSION_PROMPT,
+        SessionPromptParams {
+            text: "ping".into(),
+        },
+    );
+
+    let note = agent.next_notification(methods::SESSION_UPDATE);
+    let update: SessionUpdateParams = serde_json::from_value(note.params.unwrap()).unwrap();
+    assert_eq!(
+        update.update["sessionUpdate"], "agent_message_chunk",
+        "forwarded update should be the agent message chunk"
+    );
+
+    let note = agent.next_notification(methods::SESSION_PROMPT_RESULT);
+    let result: SessionPromptResultParams = serde_json::from_value(note.params.unwrap()).unwrap();
+    assert!(result.ok, "prompt turn should complete successfully");
 }
 
 /// Owns a `serve --socket` daemon process and kills it on drop.
