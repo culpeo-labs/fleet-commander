@@ -29,6 +29,9 @@ impl Server {
                 watch: true,
                 search: true,
                 acp: true,
+                // Flipped to `true` once the daemon owns the ACP session
+                // (Phase 4b2 y1-agent-session).
+                session: false,
             },
         })
     }

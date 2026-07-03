@@ -59,6 +59,44 @@ pub mod methods {
     pub const ACP_EXIT: &str = "acp.exit";
     /// Request: terminate the ACP child if one is running.
     pub const ACP_STOP: &str = "acp.stop";
+
+    // ─── Session protocol (Phase 4b2) ───────────────────────────────────
+    // The daemon owns the ACP client/session; the host drives it through
+    // these higher-level methods instead of the raw `acp.*` byte tunnel.
+    /// Request: start (or resume) an ACP coding-agent session owned by the
+    /// daemon. Spawns the agent, runs the ACP handshake, and returns the
+    /// session id. See [`SessionStartParams`] / [`SessionStartResult`].
+    pub const SESSION_START: &str = "session.start";
+    /// Client→server notification: submit a prompt turn. A notification (not a
+    /// request) because a turn can run far longer than the request timeout;
+    /// completion arrives via [`SESSION_PROMPT_RESULT`].
+    pub const SESSION_PROMPT: &str = "session.prompt";
+    /// Request: cancel the in-flight prompt turn, if any.
+    pub const SESSION_CANCEL: &str = "session.cancel";
+    /// Client→server notification: the operator's answer to a
+    /// [`SESSION_PERMISSION_REQUEST`], keyed by its `request_id`.
+    pub const SESSION_PERMISSION_RESPOND: &str = "session.permissionRespond";
+    /// Server→client notification: a forwarded ACP `session/update` (opaque ACP
+    /// JSON in [`SessionUpdateParams::update`]). The host feeds it into its own
+    /// update aggregation.
+    pub const SESSION_UPDATE: &str = "session.update";
+    /// Server→client notification: the agent is requesting tool-use permission.
+    /// The host must reply with [`SESSION_PERMISSION_RESPOND`].
+    pub const SESSION_PERMISSION_REQUEST: &str = "session.permissionRequest";
+    /// Server→client notification: a prompt turn finished (ok, or with error).
+    pub const SESSION_PROMPT_RESULT: &str = "session.promptResult";
+    /// Server→client notification: the session is open and ready for prompts.
+    pub const SESSION_CONNECTED: &str = "session.connected";
+    /// Server→client notification: a diagnostic/stderr line from the agent
+    /// (e.g. device-code login URLs).
+    pub const SESSION_OUTPUT: &str = "session.output";
+    /// Server→client notification: a session-level error.
+    pub const SESSION_ERROR: &str = "session.error";
+    /// Server→client notification: the agent process exited.
+    pub const SESSION_EXIT: &str = "session.exit";
+    /// Server→client notification: interactive authentication is required; the
+    /// host should run the carried terminal command.
+    pub const SESSION_AUTH_REQUIRED: &str = "session.authRequired";
 }
 
 /// JSON-RPC + application error codes.
@@ -244,6 +282,10 @@ pub struct Capabilities {
     /// daemons.
     #[serde(default)]
     pub acp: bool,
+    /// The server owns the ACP client/session and speaks the higher-level
+    /// `session.*` protocol (Phase 4b2). Defaults to `false` for older daemons.
+    #[serde(default)]
+    pub session: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -514,6 +556,121 @@ pub struct AcpStopResult {
     pub stopped: bool,
 }
 
+// ─── Session protocol (Phase 4b2) ──────────────────────────────────────
+
+/// Params for [`methods::SESSION_START`]: launch (or resume) a daemon-owned
+/// ACP session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionStartParams {
+    /// The ACP agent command line, e.g. `copilot --acp --stdio`.
+    pub command: String,
+    /// Working directory / session cwd inside the container.
+    pub cwd: String,
+    /// A prior session id to resume, if any (best-effort — the daemon falls
+    /// back to listing or creating a session when it cannot be resumed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_session_id: Option<String>,
+    /// Extra environment variables for the agent child.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<AcpEnvVar>,
+}
+
+/// Result of [`methods::SESSION_START`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionStartResult {
+    /// The active session id (freshly created or resumed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// If set, interactive authentication is required before a session can be
+    /// established; the host should run this terminal command and retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_required: Option<Vec<String>>,
+}
+
+/// Params for the [`methods::SESSION_PROMPT`] notification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionPromptParams {
+    pub text: String,
+}
+
+/// Params for the [`methods::SESSION_UPDATE`] notification: one forwarded ACP
+/// `session/update`, carried as the raw ACP JSON value so the host can feed it
+/// straight into its own update aggregation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionUpdateParams {
+    pub update: Value,
+}
+
+/// Params for the [`methods::SESSION_PERMISSION_REQUEST`] notification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionPermissionRequestParams {
+    /// Correlates with the [`SessionPermissionRespondParams::request_id`] the
+    /// host sends back.
+    pub request_id: String,
+    /// Human-readable tool title shown to the operator.
+    pub tool_name: String,
+    /// Selectable options: `(option_id, display_name, kind_label)`.
+    pub options: Vec<PermissionOption>,
+}
+
+/// A single permission option offered to the operator.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PermissionOption {
+    pub option_id: String,
+    pub name: String,
+    pub kind: String,
+}
+
+/// Params for the [`methods::SESSION_PERMISSION_RESPOND`] notification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionPermissionRespondParams {
+    pub request_id: String,
+    /// The chosen `option_id`, or `None` to cancel/reject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_id: Option<String>,
+}
+
+/// Params for the [`methods::SESSION_PROMPT_RESULT`] notification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SessionPromptResultParams {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Params for the [`methods::SESSION_CONNECTED`] notification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionConnectedParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// Params for the [`methods::SESSION_OUTPUT`] notification: one diagnostic line.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionOutputParams {
+    pub line: String,
+}
+
+/// Params for the [`methods::SESSION_ERROR`] notification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionErrorParams {
+    pub message: String,
+}
+
+/// Params for the [`methods::SESSION_EXIT`] notification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SessionExitParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<i32>,
+}
+
+/// Params for the [`methods::SESSION_AUTH_REQUIRED`] notification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionAuthRequiredParams {
+    /// A terminal command the operator should run to authenticate.
+    pub command: Vec<String>,
+}
+
 // ─── Framing ───────────────────────────────────────────────────────────
 
 /// `Content-Length`-delimited framing over an arbitrary byte stream.
@@ -731,6 +888,74 @@ mod tests {
         // as non-watching rather than failing.
         let caps: Capabilities = serde_json::from_str(r#"{"fs":true,"git":true}"#).unwrap();
         assert!(caps.fs && caps.git && !caps.watch);
+    }
+
+    #[test]
+    fn capabilities_session_defaults_to_false_when_absent() {
+        // A daemon predating the `session` field must deserialize as
+        // non-session-capable rather than failing.
+        let caps: Capabilities =
+            serde_json::from_str(r#"{"fs":true,"git":true,"acp":true}"#).unwrap();
+        assert!(caps.acp && !caps.session);
+    }
+
+    #[test]
+    fn session_start_params_round_trip() {
+        let p = SessionStartParams {
+            command: "copilot --acp --stdio".into(),
+            cwd: "/workspaces/demo".into(),
+            previous_session_id: Some("abc-123".into()),
+            env: vec![AcpEnvVar {
+                name: "FOO".into(),
+                value: "bar".into(),
+            }],
+        };
+        let back: SessionStartParams =
+            serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn session_start_result_omits_absent_fields() {
+        let r = SessionStartResult {
+            session_id: Some("s1".into()),
+            auth_required: None,
+        };
+        let value = serde_json::to_value(&r).unwrap();
+        assert_eq!(value["session_id"], "s1");
+        assert!(value.get("auth_required").is_none());
+        let back: SessionStartResult = serde_json::from_value(value).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn session_update_carries_raw_acp_json() {
+        let p = SessionUpdateParams {
+            update: serde_json::json!({ "sessionUpdate": "agent_message_chunk" }),
+        };
+        let note = Notification::new(methods::SESSION_UPDATE, &p);
+        let value: serde_json::Value = serde_json::to_value(&note).unwrap();
+        assert_eq!(value["method"], methods::SESSION_UPDATE);
+        assert_eq!(
+            value["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+    }
+
+    #[test]
+    fn session_permission_request_round_trips() {
+        let p = SessionPermissionRequestParams {
+            request_id: "req-1".into(),
+            tool_name: "shell".into(),
+            options: vec![PermissionOption {
+                option_id: "allow".into(),
+                name: "Allow".into(),
+                kind: "allow_once".into(),
+            }],
+        };
+        let back: SessionPermissionRequestParams =
+            serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
     }
 
     #[test]
