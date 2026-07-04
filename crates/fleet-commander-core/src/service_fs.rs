@@ -344,6 +344,11 @@ impl WorkspaceFs for ServiceFs {
 /// thread, a slow call delays only the explorer, never the TUI.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Longer per-call deadline for the session transport: `session.start` drives
+/// the full in-container ACP handshake (initialize + auth + resume), which can
+/// take much longer than a filesystem RPC.
+const SESSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// A [`Transport`] that talks to a spawned `fleet-agent` child over its
 /// stdio pipes.
 ///
@@ -500,6 +505,40 @@ impl ProcessTransport {
             .call(methods::ACP_START, params)
             .map_err(|e| io::Error::other(format!("acp.start failed: {e}")))?;
         Ok(transport)
+    }
+
+    /// Connect a **dedicated** `fleet-agent` connection for driving a
+    /// daemon-owned ACP session (Phase 4b2). Unlike [`docker_exec_acp`], the
+    /// daemon owns the ACP client and exposes the higher-level `session.*`
+    /// protocol; the host only observes and prompts.
+    ///
+    /// Verifies the daemon advertises `capabilities.session`. Returns
+    /// `Ok(None)` when it does not, so the caller can fall back to the Phase 4a
+    /// ACP tunnel. `session.*` notifications are delivered to `sink` on the
+    /// reader thread. The per-call deadline is longer than a filesystem RPC
+    /// because `session.start` drives the full in-container ACP handshake
+    /// (initialize + auth + resume).
+    ///
+    /// [`docker_exec_acp`]: Self::docker_exec_acp
+    pub fn docker_exec_session(
+        container_id: &str,
+        remote_user: &str,
+        agent_path: &str,
+        sink: NotificationSink,
+    ) -> io::Result<Option<Self>> {
+        let argv = docker_exec_argv(
+            container_id,
+            remote_user,
+            agent_path,
+            crate::agent_bin::CONTAINER_AGENT_SOCKET,
+        );
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        let (transport, init) = Self::spawn_and_init(cmd, SESSION_REQUEST_TIMEOUT, Some(sink))?;
+        if !init.capabilities.session {
+            return Ok(None);
+        }
+        Ok(Some(transport))
     }
 
     /// Send a JSON-RPC **notification** (no `id`, no response) to the daemon.
