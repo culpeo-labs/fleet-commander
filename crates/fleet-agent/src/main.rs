@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
 
-use fleet_agent::Server;
+use fleet_agent::{DaemonState, Server};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -100,11 +100,16 @@ fn serve_socket(root: &Path, socket: &Path) -> Result<(), String> {
         UnixListener::bind(socket).map_err(|e| format!("bind {}: {e}", socket.display()))?;
     eprintln!("fleet-agent: listening on {}", socket.display());
 
+    // Daemon-scoped state shared by every connection. Its session registry is
+    // what lets an ACP session outlive the client (TUI) that started it: a
+    // reconnecting client reattaches to the same session instead of respawning.
+    let state = DaemonState::new();
+
     // One thread per client connection. A single session holds *two* concurrent
-    // connections (the fs/watch channel and the ACP tunnel), so the daemon must
-    // serve them in parallel rather than one-at-a-time. Each connection gets its
-    // own `Server` (independent watch/ACP/search state) — shared daemon-scoped
-    // state that survives disconnects arrives in Phase B2.
+    // connections (the fs/watch channel and the ACP session channel), so the
+    // daemon must serve them in parallel rather than one-at-a-time. Each
+    // connection gets its own `Server` for watch/ACP/search state, but they
+    // share the daemon-scoped session registry via `DaemonState`.
     for conn in listener.incoming() {
         let conn = match conn {
             Ok(c) => c,
@@ -114,8 +119,9 @@ fn serve_socket(root: &Path, socket: &Path) -> Result<(), String> {
             }
         };
         let root = root.to_path_buf();
+        let state = state.clone();
         thread::spawn(move || {
-            let server = Server::new(root);
+            let server = Server::with_state(root, &state);
             let read_half = match conn.try_clone() {
                 Ok(c) => c,
                 Err(e) => {

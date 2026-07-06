@@ -24,10 +24,34 @@ mod watch;
 use acp::{AcpChild, handle_acp_send, handle_acp_stop};
 use search_stream::{SearchState, handle_cancel_search};
 use session::{
-    SessionHandle, handle_session_cancel, handle_session_permission_respond, handle_session_prompt,
+    SessionRegistry, SharedSession, handle_session_cancel, handle_session_permission_respond,
+    handle_session_prompt, new_registry,
 };
+use std::sync::Arc;
 use util::send_body;
 use watch::WatchHandle;
+
+/// Daemon-scoped state shared across every client connection. Currently just
+/// the live-session registry; created once by the socket daemon and handed to
+/// each connection's [`Server`] via [`Server::with_state`].
+#[derive(Clone)]
+pub struct DaemonState {
+    sessions: SessionRegistry,
+}
+
+impl DaemonState {
+    pub fn new() -> Self {
+        Self {
+            sessions: new_registry(),
+        }
+    }
+}
+
+impl Default for DaemonState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Serves requests against a fixed workspace `root`.
 pub struct Server {
@@ -36,16 +60,35 @@ pub struct Server {
     /// request path stays inside the workspace even when it traverses a
     /// symlink. Falls back to `root` if the workspace can't be canonicalized.
     canonical_root: PathBuf,
+    /// Daemon-scoped registry of live ACP sessions, shared across every client
+    /// connection so a reconnecting host reattaches to its existing session.
+    sessions: SessionRegistry,
 }
 
 impl Server {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self::with_sessions(root, new_registry())
+    }
+
+    /// Like [`new`](Self::new) but sharing an existing session registry, so
+    /// multiple client connections (each with their own `Server`) observe the
+    /// same daemon-scoped sessions. Used by the socket daemon via
+    /// [`Server::with_state`].
+    pub(crate) fn with_sessions(root: impl Into<PathBuf>, sessions: SessionRegistry) -> Self {
         let root = root.into();
         let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
         Self {
             root,
             canonical_root,
+            sessions,
         }
+    }
+
+    /// Build a `Server` for one client connection that shares the daemon's
+    /// [`DaemonState`] (its session registry), so sessions survive a client
+    /// disconnect and a reconnecting client reattaches to them.
+    pub fn with_state(root: impl Into<PathBuf>, state: &DaemonState) -> Self {
+        Self::with_sessions(root, state.sessions.clone())
     }
 
     /// Read framed requests from `reader` until EOF, dispatching each and
@@ -93,7 +136,9 @@ impl Server {
         let mut watch: Option<WatchHandle> = None;
         let mut searches = SearchState::default();
         let mut acp: Option<AcpChild> = None;
-        let mut session: Option<SessionHandle> = None;
+        // The session this connection is attached to (owned daemon-side; this is
+        // just a reference so we can detach on disconnect without ending it).
+        let mut session: Option<Arc<SharedSession>> = None;
         let result = self.dispatch_loop(
             reader,
             &out_tx,
@@ -104,11 +149,14 @@ impl Server {
         );
 
         // Tear down in order: cancel + join any in-flight searches, stop the
-        // ACP child / session, and stop the watcher (all hold `out` senders),
-        // then drop our sender so the writer thread sees the channel close and
-        // exits, then join it.
+        // ACP tunnel child, detach (but do NOT end) the daemon-scoped session so
+        // it survives this client's disconnect, and stop the watcher (all hold
+        // `out` senders); then drop our sender so the writer thread sees the
+        // channel close and exits, then join it.
         searches.shutdown();
-        drop(session);
+        if let Some(session) = &session {
+            session.detach();
+        }
         drop(acp);
         drop(watch);
         drop(out_tx);
@@ -127,7 +175,7 @@ impl Server {
         watch: &mut Option<WatchHandle>,
         searches: &mut SearchState,
         acp: &mut Option<AcpChild>,
-        session: &mut Option<SessionHandle>,
+        session: &mut Option<Arc<SharedSession>>,
     ) -> io::Result<()> {
         while let Some(body) = framing::read_frame(reader)? {
             // Peek at the raw object to tell requests (have an `id`, expect a
