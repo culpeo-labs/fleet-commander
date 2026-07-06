@@ -158,6 +158,20 @@ pub(crate) fn new_registry() -> SessionRegistry {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// A per-connection slot recording which session (if any) this connection is
+/// attached to. Shared between the dispatch loop and the `session.start` worker
+/// thread: `session.start` resolves off the read loop (so filesystem requests
+/// keep flowing while the multi-second ACP handshake runs), then publishes the
+/// resulting session here before its response frame is written — so by the time
+/// the host sees the `session.start` reply and sends a `session.prompt`, the
+/// dispatch loop already finds the session in this slot.
+pub(crate) type SessionSlot = Arc<Mutex<Option<Arc<SharedSession>>>>;
+
+/// Create an empty per-connection session slot.
+pub(crate) fn new_slot() -> SessionSlot {
+    Arc::new(Mutex::new(None))
+}
+
 /// Outcome of [`SharedSession::start`]: the result to return to the host, plus
 /// the live session when one actually opened (absent on auth-required/failure,
 /// where the worker thread has already finished).
@@ -299,56 +313,94 @@ fn frame(method: &str, params: impl Serialize) -> Vec<u8> {
 }
 
 impl crate::Server {
-    /// Handle a `session.start` request. If a **live** session already exists
-    /// for this cwd (e.g. the host restarted and reconnected), reattach to it —
-    /// replaying its buffered history to this connection — instead of spawning a
-    /// new agent. Otherwise start a fresh session and register it. The
-    /// per-connection `attached` slot records which session this connection is
-    /// bound to so it can be detached (not torn down) on disconnect.
-    pub(crate) fn handle_session_start(
+    /// Handle a `session.start` request **off the dispatch loop**. Spawns a
+    /// worker that reattaches-or-starts the session and writes the response
+    /// frame itself once the (multi-second) ACP handshake resolves. Returning
+    /// immediately keeps the connection's read loop free to serve concurrent
+    /// `fs.*`/`git.*` requests (the explorer/git panes) while a session starts.
+    ///
+    /// If a **live** session already exists for this cwd (e.g. the host
+    /// restarted and reconnected), the worker reattaches to it — replaying its
+    /// buffered history to this connection — instead of spawning a new agent.
+    /// Either way it records the bound session in `slot` (so it can be detached,
+    /// not torn down, on disconnect) *before* sending the response, so a prompt
+    /// that follows the reply always finds the session.
+    pub(crate) fn spawn_session_start(
         &self,
         req: &Request,
         out: &std_mpsc::Sender<Vec<u8>>,
-        attached: &mut Option<Arc<SharedSession>>,
-    ) -> Response {
+        slot: &SessionSlot,
+    ) {
+        let id = req.id;
         let params: SessionStartParams = match parse_params(req) {
             Ok(p) => p,
-            Err(e) => return Response::err(req.id, e),
-        };
-        let key = params.cwd.clone();
-
-        // Reattach to a live session for this cwd if one exists.
-        {
-            let reg = self.sessions.lock().expect("session registry poisoned");
-            if let Some(existing) = reg.get(&key)
-                && existing.is_alive()
-            {
-                existing.attach(out.clone());
-                let result = SessionStartResult {
-                    session_id: existing.session_id(),
-                    auth_required: None,
-                };
-                *attached = Some(existing.clone());
-                return Response::ok(req.id, result);
+            Err(e) => {
+                send_response(out, Response::err(id, e));
+                return;
             }
-        }
+        };
+        let sessions = self.sessions.clone();
+        let out = out.clone();
+        let slot = slot.clone();
+        thread::Builder::new()
+            .name("fleet-agent-session-start".into())
+            .spawn(move || {
+                let result = start_or_reattach(&sessions, params, &out, &slot);
+                send_response(&out, Response::ok(id, result));
+            })
+            .expect("spawn session-start thread");
+    }
+}
 
-        // No live session — start a fresh one (blocks on the handshake).
-        let started = SharedSession::start(params, out.clone());
-        let result = started.result.clone();
-        if let Some(session) = started.session {
-            self.sessions
-                .lock()
-                .expect("session registry poisoned")
-                .insert(key, session.clone());
-            *attached = Some(session);
+/// Reattach to a live session for `params.cwd` if one exists, else start a fresh
+/// one. Publishes the bound session into `slot` and returns the result to send
+/// back to the host.
+fn start_or_reattach(
+    sessions: &SessionRegistry,
+    params: SessionStartParams,
+    out: &std_mpsc::Sender<Vec<u8>>,
+    slot: &SessionSlot,
+) -> SessionStartResult {
+    let key = params.cwd.clone();
+
+    // Reattach to a live session for this cwd if one exists.
+    {
+        let reg = sessions.lock().expect("session registry poisoned");
+        if let Some(existing) = reg.get(&key)
+            && existing.is_alive()
+        {
+            existing.attach(out.clone());
+            *slot.lock().expect("session slot poisoned") = Some(existing.clone());
+            return SessionStartResult {
+                session_id: existing.session_id(),
+                auth_required: None,
+            };
         }
-        Response::ok(req.id, result)
+    }
+
+    // No live session — start a fresh one (blocks on the handshake, but on this
+    // worker thread, not the dispatch loop).
+    let started = SharedSession::start(params, out.clone());
+    let result = started.result.clone();
+    if let Some(session) = started.session {
+        sessions
+            .lock()
+            .expect("session registry poisoned")
+            .insert(key, session.clone());
+        *slot.lock().expect("session slot poisoned") = Some(session);
+    }
+    result
+}
+
+/// Serialize and enqueue a JSON-RPC response onto the outbound frame channel.
+fn send_response(out: &std_mpsc::Sender<Vec<u8>>, response: Response) {
+    if let Ok(body) = serde_json::to_vec(&response) {
+        let _ = out.send(body);
     }
 }
 
 /// Route a `session.prompt` notification to the attached session.
-pub(crate) fn handle_session_prompt(note: &Notification, session: &Option<Arc<SharedSession>>) {
+pub(crate) fn handle_session_prompt(note: &Notification, slot: &SessionSlot) {
     let params: SessionPromptParams = match note
         .params
         .clone()
@@ -357,16 +409,13 @@ pub(crate) fn handle_session_prompt(note: &Notification, session: &Option<Arc<Sh
         Some(p) => p,
         None => return,
     };
-    if let Some(session) = session.as_ref() {
+    if let Some(session) = slot.lock().expect("session slot poisoned").as_ref() {
         session.prompt(params.text);
     }
 }
 
 /// Route a `session.permissionRespond` notification to the attached session.
-pub(crate) fn handle_session_permission_respond(
-    note: &Notification,
-    session: &Option<Arc<SharedSession>>,
-) {
+pub(crate) fn handle_session_permission_respond(note: &Notification, slot: &SessionSlot) {
     let params: SessionPermissionRespondParams = match note
         .params
         .clone()
@@ -375,7 +424,7 @@ pub(crate) fn handle_session_permission_respond(
         Some(p) => p,
         None => return,
     };
-    if let Some(session) = session.as_ref() {
+    if let Some(session) = slot.lock().expect("session slot poisoned").as_ref() {
         session.respond_permission(&params.request_id, params.option_id);
     }
 }
@@ -383,11 +432,8 @@ pub(crate) fn handle_session_permission_respond(
 /// Handle a `session.cancel` request. A full mid-turn cancel (forwarding an ACP
 /// `session/cancel` to the agent) lands with the host rewire; for now this
 /// acknowledges the request without interrupting the in-flight turn.
-pub(crate) fn handle_session_cancel(
-    req: &Request,
-    session: &Option<Arc<SharedSession>>,
-) -> Response {
-    let active = session.is_some();
+pub(crate) fn handle_session_cancel(req: &Request, slot: &SessionSlot) -> Response {
+    let active = slot.lock().expect("session slot poisoned").is_some();
     Response::ok(req.id, serde_json::json!({ "cancelled": active }))
 }
 

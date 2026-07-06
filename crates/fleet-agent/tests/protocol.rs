@@ -26,6 +26,7 @@ struct AgentProcess {
     stdin: ChildStdin,
     rx: Receiver<Incoming>,
     pending: Vec<Notification>,
+    pending_responses: Vec<Response>,
     next_id: u64,
 }
 
@@ -82,6 +83,7 @@ impl AgentProcess {
             stdin,
             rx,
             pending: Vec::new(),
+            pending_responses: Vec::new(),
             next_id: 0,
         }
     }
@@ -113,6 +115,28 @@ impl AgentProcess {
                 Ok(Incoming::Response(resp)) => return resp,
                 Ok(Incoming::Notification(note)) => self.pending.push(note),
                 Err(RecvTimeoutError::Timeout) => panic!("timed out waiting for response"),
+                Err(RecvTimeoutError::Disconnected) => panic!("agent stdout closed"),
+            }
+        }
+    }
+
+    /// Wait for the response to a specific request `id`, buffering any
+    /// notifications and out-of-order responses that arrive first. Lets a test
+    /// issue several requests without waiting and then collect their responses
+    /// in any order — e.g. to prove `fs.list` is answered before an in-flight
+    /// `session.start` resolves.
+    fn await_response(&mut self, id: u64) -> Response {
+        if let Some(pos) = self.pending_responses.iter().position(|r| r.id == id) {
+            return self.pending_responses.remove(pos);
+        }
+        loop {
+            match self.rx.recv_timeout(RECV_TIMEOUT) {
+                Ok(Incoming::Response(resp)) if resp.id == id => return resp,
+                Ok(Incoming::Response(resp)) => self.pending_responses.push(resp),
+                Ok(Incoming::Notification(note)) => self.pending.push(note),
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("timed out waiting for response id {id}")
+                }
                 Err(RecvTimeoutError::Disconnected) => panic!("agent stdout closed"),
             }
         }
@@ -520,6 +544,88 @@ fn daemon_owns_acp_session_end_to_end() {
     let note = agent.next_notification(methods::SESSION_PROMPT_RESULT);
     let result: SessionPromptResultParams = serde_json::from_value(note.params.unwrap()).unwrap();
     assert!(result.ok, "prompt turn should complete successfully");
+}
+
+/// Like [`FAKE_ACP_AGENT`] but deliberately slow to `initialize`, so the
+/// daemon's `session.start` stays blocked in the ACP handshake long enough to
+/// observe that concurrent `fs.*` requests are still served.
+const SLOW_ACP_AGENT: &str = r#"
+import sys, json, time
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if method == "initialize":
+        time.sleep(2)
+        send({"jsonrpc": "2.0", "id": mid,
+              "result": {"protocolVersion": 1, "agentCapabilities": {}, "authMethods": []}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "test-session-1"}})
+    elif method == "authenticate":
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+    elif mid is not None:
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+"#;
+
+/// `session.start` runs a multi-second ACP handshake in the daemon; it must not
+/// stall the connection's dispatch loop. This drives a slow-initializing agent
+/// and proves an `fs.list` on the **same connection** is answered promptly while
+/// `session.start` is still in flight — the concurrency the host relies on so a
+/// single bridge can carry both the explorer's `fs.*` traffic and the session.
+#[test]
+fn fs_requests_are_served_while_session_start_is_in_flight() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let script = tmp.path().join("slow_acp.py");
+    std::fs::write(&script, SLOW_ACP_AGENT).unwrap();
+    std::fs::write(tmp.path().join("hello.txt"), b"world").unwrap();
+
+    let mut agent = AgentProcess::spawn(tmp.path());
+    agent.call(
+        methods::INITIALIZE,
+        InitializeParams {
+            protocol_version: PROTOCOL_VERSION,
+        },
+    );
+
+    // Kick off session.start without waiting for its (slow) response.
+    let start_id = agent.send(
+        methods::SESSION_START,
+        SessionStartParams {
+            command: format!("python3 {}", script.display()),
+            cwd: tmp.path().display().to_string(),
+            previous_session_id: None,
+            env: Vec::new(),
+        },
+    );
+
+    // fs.list must be answered well before the ~2s handshake resolves.
+    let began = std::time::Instant::now();
+    let fs_id = agent.send(methods::FS_LIST, FsListParams { path: "".into() });
+    let resp = agent.await_response(fs_id);
+    let elapsed = began.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "fs.list was blocked behind session.start ({}ms)",
+        elapsed.as_millis()
+    );
+    let list: FsListResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert!(
+        list.entries.iter().any(|e| e.name == "hello.txt"),
+        "fs.list should return the workspace contents"
+    );
+
+    // session.start still resolves correctly afterward.
+    let resp = agent.await_response(start_id);
+    let started: SessionStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert_eq!(started.session_id.as_deref(), Some("test-session-1"));
 }
 
 /// Owns a `serve --socket` daemon process and kills it on drop.
