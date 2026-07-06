@@ -24,10 +24,9 @@ mod watch;
 use acp::{AcpChild, handle_acp_send, handle_acp_stop};
 use search_stream::{SearchState, handle_cancel_search};
 use session::{
-    SessionRegistry, SharedSession, handle_session_cancel, handle_session_permission_respond,
-    handle_session_prompt, new_registry,
+    SessionRegistry, SessionSlot, handle_session_cancel, handle_session_permission_respond,
+    handle_session_prompt, new_registry, new_slot,
 };
-use std::sync::Arc;
 use util::send_body;
 use watch::WatchHandle;
 
@@ -138,14 +137,16 @@ impl Server {
         let mut acp: Option<AcpChild> = None;
         // The session this connection is attached to (owned daemon-side; this is
         // just a reference so we can detach on disconnect without ending it).
-        let mut session: Option<Arc<SharedSession>> = None;
+        // Shared with the `session.start` worker thread via a slot so the read
+        // loop stays free while a session's ACP handshake runs.
+        let session: SessionSlot = new_slot();
         let result = self.dispatch_loop(
             reader,
             &out_tx,
             &mut watch,
             &mut searches,
             &mut acp,
-            &mut session,
+            &session,
         );
 
         // Tear down in order: cancel + join any in-flight searches, stop the
@@ -154,7 +155,7 @@ impl Server {
         // `out` senders); then drop our sender so the writer thread sees the
         // channel close and exits, then join it.
         searches.shutdown();
-        if let Some(session) = &session {
+        if let Some(session) = session.lock().expect("session slot poisoned").as_ref() {
             session.detach();
         }
         drop(acp);
@@ -175,7 +176,7 @@ impl Server {
         watch: &mut Option<WatchHandle>,
         searches: &mut SearchState,
         acp: &mut Option<AcpChild>,
-        session: &mut Option<Arc<SharedSession>>,
+        session: &SessionSlot,
     ) -> io::Result<()> {
         while let Some(body) = framing::read_frame(reader)? {
             // Peek at the raw object to tell requests (have an `id`, expect a
@@ -243,8 +244,7 @@ impl Server {
                     send_body(out, &serde_json::to_vec(&response)?)?;
                 }
                 methods::SESSION_START => {
-                    let response = self.handle_session_start(&req, out, session);
-                    send_body(out, &serde_json::to_vec(&response)?)?;
+                    self.spawn_session_start(&req, out, session);
                 }
                 methods::SESSION_CANCEL => {
                     let response = handle_session_cancel(&req, session);
