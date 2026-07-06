@@ -17,6 +17,7 @@
 mod auth;
 mod connection;
 mod resume;
+mod session_client;
 mod tunnel;
 mod updates;
 

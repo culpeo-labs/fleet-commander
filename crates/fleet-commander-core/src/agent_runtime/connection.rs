@@ -23,6 +23,7 @@ use crate::session_state::SessionStateMachine;
 use super::AcpLog;
 use super::auth::{build_auth_command, terminal_auth_command};
 use super::resume::{try_find_and_resume, try_resume_specific};
+use super::session_client::{self, SessionRunError};
 use super::tunnel;
 use super::updates::apply_session_update;
 
@@ -33,10 +34,38 @@ pub(super) async fn run_persistent_connection(
     session_cwd: PathBuf,
     container_info: Option<&container::ContainerInfo>,
     previous_session_id: Option<String>,
-    prompt_rx: mpsc::UnboundedReceiver<String>,
+    mut prompt_rx: mpsc::UnboundedReceiver<String>,
     event_tx: mpsc::UnboundedSender<SessionEvent>,
     acp_log: Option<AcpLog>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Inside a container, prefer the daemon-owned session protocol (Phase 4b2):
+    // `fleet-agent` owns the ACP client so the session survives a TUI restart.
+    // Fall back to the Phase 4a ACP tunnel for older daemons that predate
+    // `capabilities.session`.
+    if let Some(ci) = container_info {
+        match session_client::run(
+            &agent_id,
+            acp_command,
+            &session_cwd,
+            ci,
+            previous_session_id.clone(),
+            &mut prompt_rx,
+            &event_tx,
+            acp_log.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(SessionRunError::Unsupported) => {
+                info!(
+                    agent_id = %agent_id,
+                    "daemon lacks capabilities.session; falling back to ACP tunnel"
+                );
+            }
+            Err(SessionRunError::Fatal(err)) => return Err(err),
+        }
+    }
+
     let prompt_rx = std::sync::Arc::new(tokio::sync::Mutex::new(prompt_rx));
 
     connect_and_run(
