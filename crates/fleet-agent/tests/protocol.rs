@@ -635,3 +635,95 @@ fn socket_daemon_serves_two_clients_concurrently() {
     let list: FsListResult = serde_json::from_value(resp.result.unwrap()).unwrap();
     assert_eq!(list.entries.len(), 1);
 }
+
+/// A daemon-owned session must **survive a client disconnect** and let a
+/// reconnecting client reattach to it — replaying the session's history rather
+/// than spawning a fresh agent. This is the restart-survival guarantee (Phase
+/// 4b2 y2-reattach): the TUI can exit and relaunch without losing the session.
+#[test]
+fn daemon_session_survives_disconnect_and_replays_on_reattach() {
+    let root = tempfile::TempDir::new().unwrap();
+    let script = root.path().join("fake_acp.py");
+    std::fs::write(&script, FAKE_ACP_AGENT).unwrap();
+    let daemon = SocketDaemon::start(root.path());
+
+    let command = format!("python3 {}", script.display());
+    let cwd = root.path().display().to_string();
+
+    // First client: start a session and run one prompt turn.
+    {
+        let mut agent = AgentProcess::spawn_bridge(&daemon.socket);
+        agent.call(
+            methods::INITIALIZE,
+            InitializeParams {
+                protocol_version: PROTOCOL_VERSION,
+            },
+        );
+        let resp = agent.call(
+            methods::SESSION_START,
+            SessionStartParams {
+                command: command.clone(),
+                cwd: cwd.clone(),
+                previous_session_id: None,
+                env: Vec::new(),
+            },
+        );
+        let started: SessionStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(started.session_id.as_deref(), Some("test-session-1"));
+
+        agent.next_notification(methods::SESSION_CONNECTED);
+        agent.send_notification(
+            methods::SESSION_PROMPT,
+            SessionPromptParams {
+                text: "ping".into(),
+            },
+        );
+        let note = agent.next_notification(methods::SESSION_UPDATE);
+        let update: SessionUpdateParams = serde_json::from_value(note.params.unwrap()).unwrap();
+        assert_eq!(update.update["content"]["text"], "pong");
+        agent.next_notification(methods::SESSION_PROMPT_RESULT);
+        // Dropping `agent` disconnects the client; the session must live on.
+    }
+
+    // Second client: reattaching via `session.start` for the same cwd must NOT
+    // spawn a new agent. It returns the existing session id and replays the
+    // buffered history — including the prior turn's "pong" update — even though
+    // this client never sent a prompt.
+    {
+        let mut agent = AgentProcess::spawn_bridge(&daemon.socket);
+        agent.call(
+            methods::INITIALIZE,
+            InitializeParams {
+                protocol_version: PROTOCOL_VERSION,
+            },
+        );
+        let resp = agent.call(
+            methods::SESSION_START,
+            SessionStartParams {
+                command: command.clone(),
+                cwd: cwd.clone(),
+                previous_session_id: None,
+                env: Vec::new(),
+            },
+        );
+        let started: SessionStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(
+            started.session_id.as_deref(),
+            Some("test-session-1"),
+            "reattach should return the existing session id"
+        );
+
+        // Replayed history: the original connected + the prior turn's update.
+        let note = agent.next_notification(methods::SESSION_CONNECTED);
+        let connected: SessionConnectedParams =
+            serde_json::from_value(note.params.unwrap()).unwrap();
+        assert_eq!(connected.session_id.as_deref(), Some("test-session-1"));
+
+        let note = agent.next_notification(methods::SESSION_UPDATE);
+        let update: SessionUpdateParams = serde_json::from_value(note.params.unwrap()).unwrap();
+        assert_eq!(
+            update.update["content"]["text"], "pong",
+            "reattach should replay the prior turn's update from the buffer"
+        );
+    }
+}
