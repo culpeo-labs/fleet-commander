@@ -511,6 +511,7 @@ fn daemon_owns_acp_session_end_to_end() {
             cwd: tmp.path().display().to_string(),
             previous_session_id: None,
             env: Vec::new(),
+            mcp: false,
         },
     );
     let started: SessionStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
@@ -603,6 +604,7 @@ fn fs_requests_are_served_while_session_start_is_in_flight() {
             cwd: tmp.path().display().to_string(),
             previous_session_id: None,
             env: Vec::new(),
+            mcp: false,
         },
     );
 
@@ -772,6 +774,7 @@ fn daemon_session_survives_disconnect_and_replays_on_reattach() {
                 cwd: cwd.clone(),
                 previous_session_id: None,
                 env: Vec::new(),
+                mcp: false,
             },
         );
         let started: SessionStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
@@ -810,6 +813,7 @@ fn daemon_session_survives_disconnect_and_replays_on_reattach() {
                 cwd: cwd.clone(),
                 previous_session_id: None,
                 env: Vec::new(),
+                mcp: false,
             },
         );
         let started: SessionStartResult = serde_json::from_value(resp.result.unwrap()).unwrap();
