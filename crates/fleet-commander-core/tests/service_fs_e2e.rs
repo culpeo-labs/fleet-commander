@@ -150,3 +150,43 @@ fn service_fs_streams_search_results_through_the_sink() {
     assert_eq!(summary.count, 2);
     assert!(!summary.cancelled && !summary.truncated);
 }
+
+/// The host transport multiplexes concurrent requests: several calls may be in
+/// flight at once, each response routed back to its own waiter by id. Fire many
+/// `list_dir`/`read_file` calls from multiple threads over a single shared
+/// `ServiceFs` and assert every one gets its correct result — proving the
+/// reader routes by id with no cross-talk or deadlock. This is the property the
+/// unified fs+session bridge depends on so a slow `session.start` never blocks
+/// the explorer's `fs.*` traffic.
+#[test]
+fn service_fs_handles_concurrent_calls() {
+    use std::sync::Arc;
+
+    let Some(agent) = agent_binary() else {
+        eprintln!("skipping: fleet-agent binary not built");
+        return;
+    };
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("README.md"), b"hello world").unwrap();
+
+    let fs = Arc::new(ServiceFs::spawn(tmp.path(), &agent).expect("spawn + initialize"));
+
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let fs = fs.clone();
+            std::thread::spawn(move || {
+                for _ in 0..25 {
+                    let entries = fs.list_dir(std::path::Path::new("")).unwrap();
+                    assert!(entries.iter().any(|e| e.name == "README.md"));
+                    let bytes = fs.read_file(std::path::Path::new("README.md")).unwrap();
+                    assert_eq!(bytes, b"hello world");
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("worker thread panicked");
+    }
+}
