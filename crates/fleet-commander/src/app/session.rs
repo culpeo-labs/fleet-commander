@@ -5,10 +5,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tracing::{info, warn};
+use tracing::warn;
 
 use fleet_commander_core::agent_runtime;
-use fleet_commander_core::service_fs::ServiceFs;
 use fleet_commander_core::session::SessionEvent;
 use fleet_commander_core::workspace_fs::{LocalFs, WorkspaceFs};
 
@@ -20,124 +19,6 @@ use super::{App, PendingPermission, Screen, SessionFocus, SidePane};
 use super::{spawn_text_tracker, spawn_tool_tracker};
 
 impl App {
-    /// Connect to the in-container `fleet-agent` on a background thread and,
-    /// once the (blocking) handshake completes, hand the resulting
-    /// [`ServiceFs`] back to the event loop via [`AppEvent::ExplorerFsReady`].
-    ///
-    /// On failure (no binary mounted, container gone, …) the explorer simply
-    /// stays on the host-side [`LocalFs`].
-    pub(super) fn request_service_fs_upgrade(
-        &self,
-        agent_id: AgentId,
-        info: ContainerInfo,
-        workspace: PathBuf,
-    ) {
-        let tx = self.tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let container_id = info.container_id.clone();
-            // Route live `fs.didChange` pushes back into the event loop so the
-            // explorer refreshes itself when files change inside the container.
-            // The sink runs on the transport's reader thread, so it only does
-            // a cheap non-blocking channel send.
-            let sink: fleet_commander_core::service_fs::NotificationSink = {
-                use fleet_commander_core::fleet_protocol::{
-                    Notification, SearchDoneParams, SearchResultParams, methods,
-                };
-                let tx = tx.clone();
-                let agent_id = agent_id.clone();
-                let container_id = container_id.clone();
-                Box::new(move |note| {
-                    let Notification { method, params, .. } = note;
-                    match method.as_str() {
-                        m if m == methods::FS_DID_CHANGE => {
-                            let _ = tx.send(AppEvent::ExplorerFsChanged {
-                                agent_id: agent_id.clone(),
-                                container_id: container_id.clone(),
-                            });
-                        }
-                        m if m == methods::FS_SEARCH_RESULT => {
-                            if let Some(params) = params
-                                .and_then(|p| serde_json::from_value::<SearchResultParams>(p).ok())
-                            {
-                                let _ = tx.send(AppEvent::SearchResults {
-                                    agent_id: agent_id.clone(),
-                                    search_id: params.search_id,
-                                    matches: params.matches,
-                                });
-                            }
-                        }
-                        m if m == methods::FS_SEARCH_DONE => {
-                            if let Some(params) = params
-                                .and_then(|p| serde_json::from_value::<SearchDoneParams>(p).ok())
-                            {
-                                let _ = tx.send(AppEvent::SearchDone {
-                                    agent_id: agent_id.clone(),
-                                    search_id: params.search_id,
-                                    summary: params.summary,
-                                });
-                            }
-                        }
-                        _ => {}
-                    }
-                })
-            };
-            match ServiceFs::connect_docker_watched(
-                workspace,
-                &info.container_id,
-                &info.remote_user,
-                fleet_commander_core::agent_bin::CONTAINER_AGENT_PATH,
-                Some(sink),
-            ) {
-                Ok(fs) => {
-                    let _ = tx.send(AppEvent::ExplorerFsReady {
-                        agent_id,
-                        container_id,
-                        fs: Arc::new(fs) as Arc<dyn WorkspaceFs>,
-                    });
-                }
-                Err(e) => {
-                    info!(error = %e, "Container service unavailable; explorer stays on host filesystem");
-                }
-            }
-        });
-    }
-    /// Read the agent's git branch from inside its container on a background
-    /// thread (a one-shot `docker exec` via the same `fleet-agent` service the
-    /// explorer uses) and deliver it as [`AppEvent::AgentBranchReady`].
-    ///
-    /// No-op if the agent has no started container — we deliberately never read
-    /// the host bind-mount, so the header/list branch and the explorer's git
-    /// status always reflect the same (container) filesystem.
-    pub(super) fn refresh_agent_branch(&self, agent_id: AgentId) {
-        let Some((info, workspace)) = self.agents.iter().find(|a| a.id == agent_id).and_then(|a| {
-            let info = a.container.clone()?;
-            let ws = a.workspace_folder.clone()?;
-            Some((info, ws))
-        }) else {
-            return;
-        };
-        let tx = self.tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let container_id = info.container_id.clone();
-            let branch = match ServiceFs::connect_docker(
-                workspace,
-                &info.container_id,
-                &info.remote_user,
-                fleet_commander_core::agent_bin::CONTAINER_AGENT_PATH,
-            ) {
-                Ok(fs) => fs.git_branch(),
-                Err(e) => {
-                    info!(error = %e, "Branch fetch failed; container service unavailable");
-                    return;
-                }
-            };
-            let _ = tx.send(AppEvent::AgentBranchReady {
-                agent_id,
-                container_id,
-                branch,
-            });
-        });
-    }
     pub(super) fn handle_session_event(&mut self, event: SessionEvent) {
         match event {
             SessionEvent::Output { agent_id, line } => {
@@ -160,26 +41,32 @@ impl App {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.container = Some(info.clone());
                 }
-                // Fetch the branch from inside the new container (covers both
-                // the viewed agent's header and any other agent's list row).
-                self.refresh_agent_branch(agent_id.clone());
-                // If this agent's explorer is on screen, upgrade it from the
-                // host filesystem to the in-container service.
-                if self.viewed_agent_id().as_ref() == Some(&agent_id)
-                    && let Some(ws) = self
-                        .agents
-                        .iter()
-                        .find(|a| a.id == agent_id)
-                        .and_then(|a| a.workspace_folder.clone())
-                {
-                    self.request_service_fs_upgrade(agent_id, info, ws);
-                }
+                // The explorer's `ServiceFs` and the agent's git branch are now
+                // delivered by the daemon-owned session driver over the shared
+                // bridge (see `SessionEvent::ExplorerFs`/`AgentBranch`), so
+                // there is nothing to fetch here — we just record the container.
             }
             SessionEvent::Exited { agent_id, .. } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                     agent.status = AgentStatus::Stopped;
                     agent.prompt_tx = None;
                     agent.task_handle = None;
+                    // Drop the shared-bridge fs so the underlying `docker exec`
+                    // is torn down once the session driver also releases it
+                    // (`ServiceFs` holds the last `Arc` to the transport, whose
+                    // `Drop` kills the child). Without this the exec would leak.
+                    agent.explorer_fs = None;
+                }
+                // If the exited agent's explorer is on screen, downgrade it back
+                // to the host filesystem so the last remote `Arc` is released.
+                if self.viewed_agent_id().as_ref() == Some(&agent_id) {
+                    let local = self
+                        .agents
+                        .iter()
+                        .find(|a| a.id == agent_id)
+                        .and_then(|a| a.workspace_folder.clone())
+                        .map(|w| Arc::new(LocalFs::new(w)) as Arc<dyn WorkspaceFs>);
+                    self.explorer.set_fs(local);
                 }
             }
             SessionEvent::Error { agent_id, message } => {
@@ -262,6 +149,66 @@ impl App {
                     agent.available_commands = commands;
                 }
             }
+            // The following four events arrive from the daemon-owned session
+            // driver over the shared bridge (Phase 4b2 y3). Store per-agent
+            // state where relevant, then re-emit the existing `AppEvent`s so the
+            // viewed/container/root guards in `app/mod.rs` are reused verbatim.
+            SessionEvent::ExplorerFs {
+                agent_id,
+                container_id,
+                fs,
+            } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                    agent.explorer_fs = Some(fs.clone());
+                }
+                let _ = self.tx.send(AppEvent::ExplorerFsReady {
+                    agent_id,
+                    container_id,
+                    fs,
+                });
+            }
+            SessionEvent::ExplorerFsChanged {
+                agent_id,
+                container_id,
+            } => {
+                let _ = self.tx.send(AppEvent::ExplorerFsChanged {
+                    agent_id,
+                    container_id,
+                });
+            }
+            SessionEvent::SearchResults {
+                agent_id,
+                search_id,
+                matches,
+            } => {
+                let _ = self.tx.send(AppEvent::SearchResults {
+                    agent_id,
+                    search_id,
+                    matches,
+                });
+            }
+            SessionEvent::SearchDone {
+                agent_id,
+                search_id,
+                summary,
+            } => {
+                let _ = self.tx.send(AppEvent::SearchDone {
+                    agent_id,
+                    search_id,
+                    summary,
+                });
+            }
+            SessionEvent::AgentBranch {
+                agent_id,
+                container_id,
+                branch,
+            } => {
+                let _ = self.tx.send(AppEvent::AgentBranchReady {
+                    agent_id,
+                    container_id,
+                    branch,
+                });
+            }
         }
     }
     /// Start the ACP connection for an agent if not already connected.
@@ -272,28 +219,40 @@ impl App {
         // the currently-viewed agent.
         if let Some(agent) = self.agents.iter().find(|a| a.id == agent_id) {
             let ws = agent.workspace_folder.clone();
-            let container = agent.container.clone();
+            // The container-backed fs delivered over the shared bridge, if the
+            // session driver has already handed one to us. Re-installed on
+            // re-entry instead of opening a fresh `docker exec`.
+            let stored_fs = agent.explorer_fs.clone();
             let local = ws
                 .as_ref()
                 .map(|w| Arc::new(LocalFs::new(w)) as Arc<dyn WorkspaceFs>);
             // If the explorer already shows a container-backed fs for this
-            // same root, don't downgrade it to LocalFs (and don't re-spawn
-            // the upgrade) on a repeat entry into the session screen.
+            // same root, don't downgrade it to LocalFs (and don't re-install)
+            // on a repeat entry into the session screen.
             let already_remote = match (&self.explorer.fs, &local) {
                 (Some(cur), Some(l)) => cur.is_remote() && cur.root_display() == l.root_display(),
                 _ => false,
             };
             if !already_remote {
                 let had_fs = self.explorer.fs.is_some();
-                self.explorer.set_fs(local);
-                // Refresh status when the workspace is set for the first time
-                // (or when switching to a new agent's workspace cleared state).
-                if self.explorer.fs.is_some() && (!had_fs || self.explorer.status.is_empty()) {
-                    self.request_explorer_refresh();
-                }
-                // Upgrade to the in-container service if the container is up.
-                if let (Some(info), Some(w)) = (container, ws) {
-                    self.request_service_fs_upgrade(agent_id.clone(), info, w);
+                // Prefer the stored remote fs; fall back to the host `LocalFs`
+                // until the session driver delivers one (via `ExplorerFs`).
+                match stored_fs {
+                    Some(fs) => {
+                        self.explorer.set_fs(Some(fs));
+                        self.request_explorer_refresh();
+                    }
+                    None => {
+                        self.explorer.set_fs(local);
+                        // Refresh status when the workspace is set for the first
+                        // time (or when switching to a new agent's workspace
+                        // cleared state).
+                        if self.explorer.fs.is_some()
+                            && (!had_fs || self.explorer.status.is_empty())
+                        {
+                            self.request_explorer_refresh();
+                        }
+                    }
                 }
             }
         }

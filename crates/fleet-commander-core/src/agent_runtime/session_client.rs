@@ -17,19 +17,20 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use agent_client_protocol::schema::v1::{AvailableCommandInput, SessionUpdate};
 use fleet_protocol::{
-    Notification, SessionConnectedParams, SessionErrorParams, SessionExitParams,
-    SessionOutputParams, SessionPermissionRequestParams, SessionPermissionRespondParams,
-    SessionPromptParams, SessionPromptResultParams, SessionStartParams, SessionStartResult,
-    SessionUpdateParams, methods,
+    Notification, SearchDoneParams, SearchResultParams, SessionConnectedParams, SessionErrorParams,
+    SessionExitParams, SessionOutputParams, SessionPermissionRequestParams,
+    SessionPermissionRespondParams, SessionPromptParams, SessionPromptResultParams,
+    SessionStartParams, SessionStartResult, SessionUpdateParams, methods,
 };
 use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::agent_bin::CONTAINER_AGENT_PATH;
 use crate::container::ContainerInfo;
-use crate::service_fs::{NotificationSink, ProcessTransport, Transport};
+use crate::service_fs::{NotificationSink, ProcessTransport, ServiceFs, Transport};
 use crate::session::{AgentId, AvailableCommand, SessionEvent};
 use crate::session_state::SessionStateMachine;
+use crate::workspace_fs::WorkspaceFs;
 
 use super::AcpLog;
 use super::auth::build_auth_command;
@@ -89,6 +90,7 @@ pub(super) async fn run(
 
     let sink = build_sink(
         agent_id.clone(),
+        ci.container_id.clone(),
         event_tx.clone(),
         state.clone(),
         handle.clone(),
@@ -108,6 +110,30 @@ pub(super) async fn run(
         Err(e) => return Err(SessionRunError::Fatal(Box::new(e))),
     };
     let _ = transport_cell.set(Arc::downgrade(&transport));
+
+    // Unification (Phase 4b2 y3): the explorer's filesystem now rides this
+    // same bridge instead of opening its own `docker exec`. Build a `ServiceFs`
+    // over a shared clone of the transport and hand it to the consumer. The
+    // root label is the *host* workspace path so the App's `same_root` check
+    // installs it over its initial `LocalFs`. `fs.watch` was already started by
+    // `docker_exec_session`, so `fs.didChange` pushes reach the sink above.
+    let fs_transport: Arc<dyn Transport> = transport.clone();
+    let service_fs = ServiceFs::new(ci.workspace_folder.clone(), fs_transport);
+    // Read the branch over the shared bridge before handing the fs off (a quick
+    // blocking RPC, like `session.start` below). Emit it so the header/list row
+    // reflect the container's branch — the same filesystem as the explorer.
+    let branch = service_fs.git_branch();
+    let fs: Arc<dyn WorkspaceFs> = Arc::new(service_fs);
+    let _ = event_tx.send(SessionEvent::ExplorerFs {
+        agent_id: agent_id.clone(),
+        container_id: ci.container_id.clone(),
+        fs,
+    });
+    let _ = event_tx.send(SessionEvent::AgentBranch {
+        agent_id: agent_id.clone(),
+        container_id: ci.container_id.clone(),
+        branch,
+    });
 
     // Start (or resume) the daemon-owned session. This blocks in the daemon
     // until the ACP handshake resolves; the returned result tells us whether a
@@ -194,6 +220,7 @@ fn wrap_auth_command(ci: &(String, String, String), command: Vec<String>) -> Vec
 #[allow(clippy::too_many_arguments)]
 fn build_sink(
     agent_id: AgentId,
+    container_id: String,
     event_tx: mpsc::UnboundedSender<SessionEvent>,
     state: Arc<Mutex<SessionStateMachine>>,
     handle: tokio::runtime::Handle,
@@ -345,6 +372,33 @@ fn build_sink(
         // Auth is surfaced from the synchronous `session.start` result; ignore
         // the mirrored notification to avoid a duplicate prompt.
         methods::SESSION_AUTH_REQUIRED => {}
+        // Filesystem traffic on the shared bridge (Phase 4b2 y3). The explorer
+        // `ServiceFs` rides this same connection, so its `fs.watch` pushes and
+        // `fs.search` results arrive here too — route them to the consumer.
+        methods::FS_DID_CHANGE => {
+            let _ = event_tx.send(SessionEvent::ExplorerFsChanged {
+                agent_id: agent_id.clone(),
+                container_id: container_id.clone(),
+            });
+        }
+        methods::FS_SEARCH_RESULT => {
+            if let Some(params) = decode::<SearchResultParams>(&note) {
+                let _ = event_tx.send(SessionEvent::SearchResults {
+                    agent_id: agent_id.clone(),
+                    search_id: params.search_id,
+                    matches: params.matches,
+                });
+            }
+        }
+        methods::FS_SEARCH_DONE => {
+            if let Some(params) = decode::<SearchDoneParams>(&note) {
+                let _ = event_tx.send(SessionEvent::SearchDone {
+                    agent_id: agent_id.clone(),
+                    search_id: params.search_id,
+                    summary: params.summary,
+                });
+            }
+        }
         _ => {}
     })
 }

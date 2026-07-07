@@ -6,6 +6,7 @@
 
 use std::cell::Cell;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -14,6 +15,7 @@ pub use fleet_commander_core::container::ContainerInfo;
 pub use fleet_commander_core::session::{
     AgentId, AssistantMessage, AvailableCommand, Thought, ToolCall, UserMessage,
 };
+pub use fleet_commander_core::workspace_fs::WorkspaceFs;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -94,12 +96,20 @@ pub struct Agent {
     /// container**, or `None` when no container is started (we only surface
     /// git for a live container, never the host bind-mount, so branch and
     /// the explorer's git status always come from the same filesystem).
-    /// Refreshed by [`crate::app::App::refresh_agent_branch`].
+    /// Delivered by the daemon-owned session driver via
+    /// [`fleet_commander_core::session::SessionEvent::AgentBranch`].
     pub git_branch: Option<String>,
     /// Slash commands advertised by the agent via ACP's
     /// `available_commands_update` notification. Empty until the agent
     /// publishes a list. The agent may replace the list at any time.
     pub available_commands: Vec<AvailableCommand>,
+    /// Container-backed explorer filesystem delivered by the daemon-owned
+    /// session driver over the **shared** `fleet-agent` bridge (Phase 4b2 y3).
+    /// Stored so re-entering this agent's session re-installs it directly
+    /// instead of opening a fresh `docker exec`. `None` until the session
+    /// connects (or after the agent exits — cleared so the bridge can be
+    /// torn down).
+    pub explorer_fs: Option<Arc<dyn WorkspaceFs>>,
 }
 
 impl Agent {
@@ -118,6 +128,7 @@ impl Agent {
             last_effective_top: Cell::new(0),
             git_branch: None,
             available_commands: Vec::new(),
+            explorer_fs: None,
         }
     }
 
