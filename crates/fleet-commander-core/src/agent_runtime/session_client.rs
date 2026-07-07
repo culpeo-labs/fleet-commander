@@ -143,6 +143,7 @@ pub(super) async fn run(
         cwd: session_cwd.to_string_lossy().into_owned(),
         previous_session_id,
         env: Vec::new(),
+        mcp: false,
     };
     let params = serde_json::to_value(params).expect("serialize session.start params");
     let result: SessionStartResult = transport

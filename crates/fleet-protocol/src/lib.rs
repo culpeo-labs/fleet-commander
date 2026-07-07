@@ -97,6 +97,19 @@ pub mod methods {
     /// Server→client notification: interactive authentication is required; the
     /// host should run the carried terminal command.
     pub const SESSION_AUTH_REQUIRED: &str = "session.authRequired";
+
+    // --- MCP tunnel (Feature 2: cross-workspace connect) ---
+    /// Server→client notification: a new in-container MCP relay opened. The
+    /// daemon assigns a `tunnel_id`; the host stands up an MCP server bound to
+    /// this tunnel (and the owning agent's identity) to service it.
+    pub const MCP_OPEN: &str = "mcp.open";
+    /// Bidirectional notification: one MCP JSON-RPC message for a tunnel. The
+    /// daemon relays in-container→host frames and vice versa, carried as the
+    /// raw MCP JSON value in [`McpDataParams::message`].
+    pub const MCP_DATA: &str = "mcp.data";
+    /// Bidirectional notification: the tunnel closed (the in-container MCP
+    /// client disconnected, or the host tore the server down).
+    pub const MCP_CLOSE: &str = "mcp.close";
 }
 
 /// JSON-RPC + application error codes.
@@ -286,6 +299,11 @@ pub struct Capabilities {
     /// `session.*` protocol (Phase 4b2). Defaults to `false` for older daemons.
     #[serde(default)]
     pub session: bool,
+    /// The server can relay an in-container MCP stream to the host over the
+    /// `mcp.*` tunnel frames (Feature 2). Defaults to `false` for older
+    /// daemons.
+    #[serde(default)]
+    pub mcp: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -573,6 +591,12 @@ pub struct SessionStartParams {
     /// Extra environment variables for the agent child.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<AcpEnvVar>,
+    /// When `true`, the daemon injects a stdio `fleet-agent mcp` server into
+    /// the ACP `session/new` `mcp_servers` and relays its traffic to the host
+    /// via the `mcp.*` tunnel (Feature 2). Defaults to `false` so the daemon
+    /// only wires MCP when the host has an MCP server to expose.
+    #[serde(default)]
+    pub mcp: bool,
 }
 
 /// Result of [`methods::SESSION_START`].
@@ -669,6 +693,24 @@ pub struct SessionExitParams {
 pub struct SessionAuthRequiredParams {
     /// A terminal command the operator should run to authenticate.
     pub command: Vec<String>,
+}
+
+/// Params for [`methods::MCP_OPEN`] and [`methods::MCP_CLOSE`]: identifies one
+/// MCP relay tunnel between an in-container `fleet-agent mcp` process and the
+/// host MCP server.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpTunnelParams {
+    /// Daemon-assigned identifier, unique per session connection.
+    pub tunnel_id: u64,
+}
+
+/// Params for [`methods::MCP_DATA`]: one MCP JSON-RPC message for a tunnel,
+/// carried verbatim so neither the daemon nor the host has to understand MCP.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpDataParams {
+    pub tunnel_id: u64,
+    /// The raw MCP JSON-RPC message (request, response, or notification).
+    pub message: Value,
 }
 
 // ─── Framing ───────────────────────────────────────────────────────────
@@ -909,10 +951,46 @@ mod tests {
                 name: "FOO".into(),
                 value: "bar".into(),
             }],
+            mcp: true,
         };
         let back: SessionStartParams =
             serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn session_start_params_mcp_defaults_to_false_when_absent() {
+        // A host predating the `mcp` flag omits it; the daemon must default it
+        // off rather than failing to parse.
+        let p: SessionStartParams =
+            serde_json::from_str(r#"{"command":"copilot --acp --stdio","cwd":"/workspaces/demo"}"#)
+                .unwrap();
+        assert!(!p.mcp);
+    }
+
+    #[test]
+    fn capabilities_mcp_defaults_to_false_when_absent() {
+        let caps: Capabilities =
+            serde_json::from_str(r#"{"fs":true,"git":true,"acp":true,"session":true}"#).unwrap();
+        assert!(caps.session && !caps.mcp);
+    }
+
+    #[test]
+    fn mcp_tunnel_and_data_params_round_trip() {
+        let open = McpTunnelParams { tunnel_id: 7 };
+        let note = Notification::new(methods::MCP_OPEN, open);
+        let value: serde_json::Value = serde_json::to_value(&note).unwrap();
+        assert_eq!(value["method"], methods::MCP_OPEN);
+        assert_eq!(value["params"]["tunnel_id"], 7);
+
+        let data = McpDataParams {
+            tunnel_id: 7,
+            message: serde_json::json!({ "jsonrpc": "2.0", "method": "tools/list", "id": 1 }),
+        };
+        let back: McpDataParams =
+            serde_json::from_value(serde_json::to_value(&data).unwrap()).unwrap();
+        assert_eq!(back, data);
+        assert_eq!(back.message["method"], "tools/list");
     }
 
     #[test]
