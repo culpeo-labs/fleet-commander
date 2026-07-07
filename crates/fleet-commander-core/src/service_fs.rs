@@ -16,9 +16,9 @@ use std::fmt::Debug;
 use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -77,13 +77,18 @@ pub trait Transport: Send + Sync + Debug {
 #[derive(Debug)]
 pub struct ServiceFs {
     root: PathBuf,
-    transport: Box<dyn Transport>,
+    transport: Arc<dyn Transport>,
 }
 
 impl ServiceFs {
     /// Wrap an already-connected transport. `root` is used only for
     /// [`WorkspaceFs::root_display`]; all path semantics live server-side.
-    pub fn new(root: impl Into<PathBuf>, transport: Box<dyn Transport>) -> Self {
+    ///
+    /// The transport is held behind an `Arc` so it can be **shared** with a
+    /// daemon-owned session driver — the explorer's `fs.*` traffic and the
+    /// `session.*` protocol then ride the same single `docker exec` bridge (see
+    /// [`crate::agent_runtime`]).
+    pub fn new(root: impl Into<PathBuf>, transport: Arc<dyn Transport>) -> Self {
         Self {
             root: root.into(),
             transport,
@@ -107,7 +112,7 @@ impl ServiceFs {
     ) -> io::Result<Self> {
         let root = root.into();
         let transport = ProcessTransport::spawn(agent_bin.as_ref(), &root, sink)?;
-        Ok(Self::new(root, Box::new(transport)))
+        Ok(Self::new(root, Arc::new(transport)))
     }
 
     /// Connect to the persistent `fleet-agent` daemon running **inside a
@@ -142,7 +147,7 @@ impl ServiceFs {
         sink: Option<NotificationSink>,
     ) -> io::Result<Self> {
         let transport = ProcessTransport::docker_exec(container_id, remote_user, agent_path, sink)?;
-        Ok(Self::new(root_display, Box::new(transport)))
+        Ok(Self::new(root_display, Arc::new(transport)))
     }
 
     fn call_typed<P, R>(&self, method: &str, params: P) -> Result<R, TransportError>
@@ -349,19 +354,30 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// take much longer than a filesystem RPC.
 const SESSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// Maps an in-flight request `id` to the channel its `call` waits on. Shared
+/// with the reader thread, which routes each response to the matching waiter —
+/// so multiple calls can be outstanding at once (e.g. the explorer's `fs.*`
+/// traffic alongside a multi-second `session.start` on the same connection).
+type PendingMap = Arc<Mutex<HashMap<u64, mpsc::Sender<io::Result<Vec<u8>>>>>>;
+
 /// A [`Transport`] that talks to a spawned `fleet-agent` child over its
 /// stdio pipes.
 ///
-/// A dedicated reader thread owns the child's stdout and forwards framed
-/// responses over a channel, so [`Transport::call`] can wait with a
-/// deadline ([`mpsc::Receiver::recv_timeout`]) instead of blocking
-/// forever on a read. On timeout, EOF, or IO error the transport is
-/// marked **unhealthy**: the child is killed and every subsequent call
-/// fails fast, so one wedged request can never permanently block the
-/// explorer or leak a blocking-pool thread.
+/// A dedicated reader thread owns the child's stdout and routes each framed
+/// response to the waiting [`Transport::call`] by request id, so several calls
+/// can be in flight concurrently and a slow call never blocks a fast one. Each
+/// call waits with a deadline ([`mpsc::Receiver::recv_timeout`]) instead of
+/// blocking forever on a read. On timeout, EOF, or IO error the transport is
+/// marked **unhealthy**: the child is killed, every pending and subsequent call
+/// fails fast, so one wedged request can never permanently block the explorer
+/// or leak a blocking-pool thread.
 #[derive(Debug)]
 pub struct ProcessTransport {
-    call: Mutex<CallChannel>,
+    /// Serializes frame writes to the child's stdin (held only for the write,
+    /// not while awaiting a response — that's what enables concurrent calls).
+    stdin: Mutex<ChildStdin>,
+    /// In-flight requests awaiting a response, keyed by id.
+    pending: PendingMap,
     child: Mutex<Child>,
     reader: Mutex<Option<JoinHandle<()>>>,
     next_id: AtomicU64,
@@ -369,12 +385,6 @@ pub struct ProcessTransport {
     timeout: Duration,
     /// Whether a [`NotificationSink`] was installed on the reader thread.
     has_sink: bool,
-}
-
-#[derive(Debug)]
-struct CallChannel {
-    stdin: ChildStdin,
-    rx: mpsc::Receiver<io::Result<Vec<u8>>>,
 }
 
 /// A callback invoked for every server-initiated notification (e.g.
@@ -385,12 +395,13 @@ pub type NotificationSink = Box<dyn Fn(Notification) + Send>;
 /// Read framed messages from the child's stdout until EOF or error. Each
 /// frame is classified ([`Incoming::from_slice`]): **responses** are
 /// forwarded to the call side (`tx`), while server-initiated
-/// **notifications** are handed to `sink` (if any). This demux is what lets
-/// the daemon push `fs.didChange` while requests are in flight without
-/// breaking the "next frame is my response" invariant on the call side.
+/// **notifications** are handed to `sink` (if any). Routing responses by id is
+/// what lets several calls be outstanding at once (and lets the daemon push
+/// `fs.didChange` while requests are in flight) without breaking any call's
+/// "this is my response" invariant.
 fn reader_loop(
     mut stdout: BufReader<ChildStdout>,
-    tx: mpsc::Sender<io::Result<Vec<u8>>>,
+    pending: PendingMap,
     sink: Option<NotificationSink>,
 ) {
     loop {
@@ -401,22 +412,50 @@ fn reader_loop(
                         sink(note);
                     }
                 }
-                // Responses (and anything we can't classify as a
-                // notification) go to the call side, which decodes and
-                // validates the id. Forwarding the raw body keeps the
-                // existing error handling unchanged.
-                Ok(Incoming::Response(_)) | Err(_) => {
-                    if tx.send(Ok(body)).is_err() {
-                        break;
+                // Route the response to its waiting call by id. An unmatched
+                // response (e.g. a call that already timed out and removed its
+                // entry) is simply dropped.
+                Ok(Incoming::Response(resp)) => {
+                    if let Some(waiter) = pending
+                        .lock()
+                        .expect("pending map poisoned")
+                        .remove(&resp.id)
+                    {
+                        let _ = waiter.send(Ok(body));
                     }
                 }
+                // A frame we can't classify breaks the protocol contract; stop
+                // reading and let every pending call fail fast below.
+                Err(_) => break,
             },
             Ok(None) => break, // EOF — the daemon closed stdout.
             Err(e) => {
-                let _ = tx.send(Err(e));
+                // Fatal read error: surface it to one waiter (best-effort) then
+                // fail the rest via the drain below.
+                let first = pending
+                    .lock()
+                    .expect("pending map poisoned")
+                    .keys()
+                    .next()
+                    .copied();
+                if let Some(id) = first
+                    && let Some(waiter) = pending.lock().expect("pending map poisoned").remove(&id)
+                {
+                    let _ = waiter.send(Err(e));
+                }
                 break;
             }
         }
+    }
+
+    // The reader is exiting (EOF, protocol error, or the child was killed on a
+    // timeout): unblock every still-pending call so none waits out its full
+    // deadline on a dead connection.
+    for (_, waiter) in pending.lock().expect("pending map poisoned").drain() {
+        let _ = waiter.send(Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "agent closed the connection",
+        )));
     }
 }
 
@@ -542,9 +581,9 @@ impl ProcessTransport {
     }
 
     /// Send a JSON-RPC **notification** (no `id`, no response) to the daemon.
-    /// Used for the high-frequency `acp.send` tunnel stream, which must not go
-    /// through the request/response + timeout machinery. Writes are serialized
-    /// with regular calls via the `call` mutex.
+    /// Used for the high-frequency `acp.send`/`session.prompt` tunnel streams,
+    /// which must not go through the request/response + timeout machinery.
+    /// Writes are serialized with regular calls via the `stdin` mutex.
     pub fn notify(&self, method: &str, params: Value) -> Result<(), TransportError> {
         if !self.healthy.load(Ordering::Acquire) {
             return Err(TransportError::Io(io::Error::new(
@@ -555,14 +594,12 @@ impl ProcessTransport {
         let note = Notification::new(method, params);
         let body = serde_json::to_vec(&note)
             .map_err(|e| TransportError::Protocol(format!("encode notification: {e}")))?;
-        let mut chan = self
-            .call
+        let mut stdin = self
+            .stdin
             .lock()
             .map_err(|_| TransportError::Protocol("transport mutex poisoned".into()))?;
-        if let Err(e) =
-            framing::write_frame(&mut chan.stdin, &body).and_then(|()| chan.stdin.flush())
-        {
-            drop(chan);
+        if let Err(e) = framing::write_frame(&mut *stdin, &body).and_then(|()| stdin.flush()) {
+            drop(stdin);
             self.mark_unhealthy();
             return Err(TransportError::Io(e));
         }
@@ -620,14 +657,18 @@ impl ProcessTransport {
             .take()
             .ok_or_else(|| io::Error::other("agent stdout not captured"))?;
 
-        let (tx, rx) = mpsc::channel();
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let has_sink = sink.is_some();
         let reader = std::thread::Builder::new()
             .name("fleet-agent-reader".into())
-            .spawn(move || reader_loop(BufReader::new(stdout), tx, sink))?;
+            .spawn({
+                let pending = pending.clone();
+                move || reader_loop(BufReader::new(stdout), pending, sink)
+            })?;
 
         let transport = Self {
-            call: Mutex::new(CallChannel { stdin, rx }),
+            stdin: Mutex::new(stdin),
+            pending,
             child: Mutex::new(child),
             reader: Mutex::new(Some(reader)),
             next_id: AtomicU64::new(0),
@@ -664,6 +705,14 @@ impl ProcessTransport {
     /// owned by the reader thread.
     fn has_notification_sink(&self) -> bool {
         self.has_sink
+    }
+
+    /// Drop a request's pending entry (on write failure or timeout) so the
+    /// reader never tries to route a response to a gone waiter.
+    fn forget_pending(&self, id: u64) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&id);
+        }
     }
 
     /// Mark the transport dead and tear down the child so no further call
@@ -725,30 +774,42 @@ impl Transport for ProcessTransport {
         let body = serde_json::to_vec(&request)
             .map_err(|e| TransportError::Protocol(format!("encode request: {e}")))?;
 
-        let mut chan = self
-            .call
+        // Register this request's response channel *before* writing, so a fast
+        // reply can never arrive before we're waiting for it.
+        let (tx, rx) = mpsc::channel();
+        self.pending
             .lock()
-            .map_err(|_| TransportError::Protocol("transport mutex poisoned".into()))?;
+            .map_err(|_| TransportError::Protocol("pending map poisoned".into()))?
+            .insert(id, tx);
 
-        if let Err(e) =
-            framing::write_frame(&mut chan.stdin, &body).and_then(|()| chan.stdin.flush())
+        // Write the frame under the stdin mutex only (released immediately), so
+        // other calls can be issued and awaited concurrently.
         {
-            drop(chan);
-            self.mark_unhealthy();
-            return Err(TransportError::Io(e));
+            let mut stdin = match self.stdin.lock() {
+                Ok(stdin) => stdin,
+                Err(_) => {
+                    self.forget_pending(id);
+                    return Err(TransportError::Protocol("transport mutex poisoned".into()));
+                }
+            };
+            if let Err(e) = framing::write_frame(&mut *stdin, &body).and_then(|()| stdin.flush()) {
+                drop(stdin);
+                self.forget_pending(id);
+                self.mark_unhealthy();
+                return Err(TransportError::Io(e));
+            }
         }
 
-        // Calls are serialized by the `call` mutex, so the next frame from
-        // the reader is unambiguously this request's response.
-        let resp_body = match chan.rx.recv_timeout(self.timeout) {
+        // Wait for the reader thread to route this id's response here.
+        let resp_body = match rx.recv_timeout(self.timeout) {
             Ok(Ok(body)) => body,
             Ok(Err(e)) => {
-                drop(chan);
+                self.forget_pending(id);
                 self.mark_unhealthy();
                 return Err(TransportError::Io(e));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                drop(chan);
+                self.forget_pending(id);
                 self.mark_unhealthy();
                 return Err(TransportError::Io(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -756,7 +817,7 @@ impl Transport for ProcessTransport {
                 )));
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                drop(chan);
+                self.forget_pending(id);
                 self.mark_unhealthy();
                 return Err(TransportError::Protocol(
                     "agent closed the connection".into(),
@@ -767,6 +828,7 @@ impl Transport for ProcessTransport {
         let response: Response = serde_json::from_slice(&resp_body)
             .map_err(|e| TransportError::Protocol(format!("decode response: {e}")))?;
 
+        // The reader routes by id, so a mismatch here would be a daemon bug.
         if response.id != id {
             return Err(TransportError::Protocol(format!(
                 "response id mismatch: expected {id}, got {}",
@@ -868,7 +930,7 @@ mod tests {
     }
 
     fn service(transport: FakeTransport) -> ServiceFs {
-        ServiceFs::new("/workspace", Box::new(transport))
+        ServiceFs::new("/workspace", Arc::new(transport))
     }
 
     #[test]
@@ -953,7 +1015,7 @@ mod tests {
             .collect();
         let fs = ServiceFs::new(
             "/workspace",
-            Box::new(RangeReadTransport { data: data.clone() }),
+            Arc::new(RangeReadTransport { data: data.clone() }),
         );
         assert_eq!(fs.read_file(Path::new("big.bin")).unwrap(), data);
     }
@@ -963,7 +1025,7 @@ mod tests {
         let data: Vec<u8> = vec![b'x'; 1000];
         let fs = ServiceFs::new(
             "/workspace",
-            Box::new(RangeReadTransport { data: data.clone() }),
+            Arc::new(RangeReadTransport { data: data.clone() }),
         );
 
         // Cap below the file size → truncated prefix.
