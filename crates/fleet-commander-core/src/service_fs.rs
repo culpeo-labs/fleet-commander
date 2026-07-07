@@ -577,6 +577,16 @@ impl ProcessTransport {
         if !init.capabilities.session {
             return Ok(None);
         }
+        // The shared bridge also carries the explorer's fs traffic, so start
+        // the live watch here. Best-effort: a watch failure must not sink the
+        // whole session connection (the explorer still works via polling).
+        if init.capabilities.watch {
+            let params = serde_json::to_value(FsWatchParams { enable: true })
+                .expect("serialize fs.watch params");
+            if let Err(e) = transport.call(methods::FS_WATCH, params) {
+                tracing::warn!(error = %e, "fs.watch subscription failed; explorer falls back to polling");
+            }
+        }
         Ok(Some(transport))
     }
 

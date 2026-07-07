@@ -365,6 +365,70 @@ fn agent_exited_marks_status_stopped() {
     assert_eq!(a1.status, AgentStatus::Stopped);
 }
 
+#[test]
+fn explorer_fs_event_stores_fs_on_agent() {
+    use fleet_commander_core::workspace_fs::LocalFs;
+    use std::sync::Arc;
+    let mut app = app_with_agents();
+    let fs: Arc<dyn WorkspaceFs> = Arc::new(LocalFs::new(PathBuf::from("/ws")));
+    app.handle(AppEvent::Session(SessionEvent::ExplorerFs {
+        agent_id: "a1".into(),
+        container_id: "c1".into(),
+        fs,
+    }));
+    let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
+    assert!(
+        a1.explorer_fs.is_some(),
+        "ExplorerFs should store the fs on the agent for re-entry"
+    );
+}
+
+#[test]
+fn agent_exit_clears_stored_explorer_fs() {
+    use fleet_commander_core::workspace_fs::LocalFs;
+    use std::sync::Arc;
+    let mut app = app_with_agents();
+    let fs: Arc<dyn WorkspaceFs> = Arc::new(LocalFs::new(PathBuf::from("/ws")));
+    app.handle(AppEvent::Session(SessionEvent::ExplorerFs {
+        agent_id: "a1".into(),
+        container_id: "c1".into(),
+        fs,
+    }));
+    app.handle(AppEvent::Session(SessionEvent::Exited {
+        agent_id: "a1".into(),
+        code: Some(0),
+    }));
+    let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
+    assert!(
+        a1.explorer_fs.is_none(),
+        "Exit must drop the shared-bridge fs so the docker exec can be torn down"
+    );
+}
+
+#[test]
+fn agent_branch_session_event_reemits_app_event() {
+    let agents = vec![Agent::new("a1", "First")];
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(Config::default(), agents, tx);
+    app.handle(AppEvent::Session(SessionEvent::AgentBranch {
+        agent_id: "a1".into(),
+        container_id: "c1".into(),
+        branch: Some("main".into()),
+    }));
+    match rx.try_recv().expect("expected a re-emitted AppEvent") {
+        AppEvent::AgentBranchReady {
+            agent_id,
+            container_id,
+            branch,
+        } => {
+            assert_eq!(agent_id, "a1");
+            assert_eq!(container_id, "c1");
+            assert_eq!(branch.as_deref(), Some("main"));
+        }
+        _ => panic!("AgentBranch should re-emit AppEvent::AgentBranchReady"),
+    }
+}
+
 #[tokio::test]
 async fn assistant_message_started_appends_handle() {
     use tokio::sync::watch;

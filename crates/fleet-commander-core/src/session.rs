@@ -181,6 +181,43 @@ pub enum SessionEvent {
         agent_id: AgentId,
         commands: Vec<AvailableCommand>,
     },
+    /// A container-backed [`crate::workspace_fs::WorkspaceFs`] is ready for the
+    /// agent's explorer. Delivered by the daemon-owned session driver, which
+    /// builds it over the **same** `fleet-agent` bridge that carries the
+    /// `session.*` protocol (Phase 4b2 y3 unification) — so the explorer no
+    /// longer opens its own `docker exec`. The consumer installs it if the
+    /// agent is still viewed on the same container.
+    ExplorerFs {
+        agent_id: AgentId,
+        container_id: String,
+        fs: Arc<dyn crate::workspace_fs::WorkspaceFs>,
+    },
+    /// A coalesced `fs.didChange` push from the shared bridge's live
+    /// `fs.watch` subscription: the in-container filesystem changed.
+    ExplorerFsChanged {
+        agent_id: AgentId,
+        container_id: String,
+    },
+    /// A batch of streamed content-search matches (`fs.searchResult`).
+    SearchResults {
+        agent_id: AgentId,
+        search_id: u64,
+        matches: Vec<crate::fleet_protocol::SearchMatch>,
+    },
+    /// A content search finished (`fs.searchDone`) with its terminal summary.
+    SearchDone {
+        agent_id: AgentId,
+        search_id: u64,
+        summary: crate::fleet_protocol::SearchSummary,
+    },
+    /// The agent's in-container git branch, read over the shared bridge.
+    /// `branch` is `None` when the workspace isn't a git tree (or the read
+    /// failed).
+    AgentBranch {
+        agent_id: AgentId,
+        container_id: String,
+        branch: Option<String>,
+    },
 }
 
 impl SessionEvent {
@@ -197,7 +234,12 @@ impl SessionEvent {
             | SessionEvent::PermissionRequest { agent_id, .. }
             | SessionEvent::Error { agent_id, .. }
             | SessionEvent::Exited { agent_id, .. }
-            | SessionEvent::AvailableCommands { agent_id, .. } => agent_id,
+            | SessionEvent::AvailableCommands { agent_id, .. }
+            | SessionEvent::ExplorerFs { agent_id, .. }
+            | SessionEvent::ExplorerFsChanged { agent_id, .. }
+            | SessionEvent::SearchResults { agent_id, .. }
+            | SessionEvent::SearchDone { agent_id, .. }
+            | SessionEvent::AgentBranch { agent_id, .. } => agent_id,
         }
     }
 }
