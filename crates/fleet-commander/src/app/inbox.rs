@@ -29,6 +29,9 @@ pub struct InboxMessage {
     pub target_name: String,
     /// The message body the sender wants delivered.
     pub body: String,
+    /// Correlation id (Feature 2d) threading a request/reply exchange between
+    /// the two agents. Shown to the target so it can echo it when replying.
+    pub thread: String,
 }
 
 /// FIFO queue of pending cross-workspace messages. The front entry is the one
@@ -76,6 +79,7 @@ impl App {
         sender_name: String,
         target_id: AgentId,
         message: String,
+        thread: String,
     ) {
         let Some(target) = self.agents.iter().find(|a| a.id == target_id) else {
             tracing::warn!(
@@ -92,6 +96,7 @@ impl App {
             target_id,
             target_name: target_name.clone(),
             body: message,
+            thread,
         });
         self.status_message = Some(format!(
             "📨 Message from {sender_name} to {target_name} awaiting approval ({} pending)",
@@ -101,7 +106,7 @@ impl App {
 
     /// Resolve the front inbox message. On `approve`, inject it into the target
     /// agent's session as a prompt (framed so the target knows it is a
-    /// cross-workspace message); otherwise discard it.
+    /// cross-workspace message, from whom, and how to reply); otherwise discard.
     pub(super) fn resolve_inbox(&mut self, approve: bool) {
         let Some(msg) = self.inbox.pop() else {
             return;
@@ -113,9 +118,18 @@ impl App {
             ));
             return;
         }
+        // Frame the delivered message with the sender's id and thread id, plus
+        // an instruction on how to reply (Feature 2d) — a reply flows back
+        // through the same `send_to_workspace` → inbox → approval path.
         let framed = format!(
-            "[cross-workspace message from workspace '{}']\n\n{}",
-            msg.sender_name, msg.body
+            "[cross-workspace message from workspace '{sender}' (id: {sender_id}, thread: {thread})]\n\n\
+             {body}\n\n\
+             ---\n\
+             To reply, call send_to_workspace with target=\"{sender_id}\" and thread=\"{thread}\".",
+            sender = msg.sender_name,
+            sender_id = msg.sender_id,
+            thread = msg.thread,
+            body = msg.body,
         );
         if let Some(agent) = self.agents.iter_mut().find(|a| a.id == msg.target_id) {
             agent.prompt(framed.clone());

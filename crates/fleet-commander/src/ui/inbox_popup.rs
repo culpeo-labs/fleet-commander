@@ -116,6 +116,7 @@ mod tests {
             target_id: "a2".into(),
             target_name: "Second".into(),
             body: "please update the changelog".into(),
+            thread: "xw-1".into(),
         }
     }
 
