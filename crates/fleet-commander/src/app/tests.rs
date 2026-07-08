@@ -1417,3 +1417,218 @@ fn activate_search_hit_sets_pending_open_with_line() {
     assert_eq!(app.explorer.pending_open, Some(PathBuf::from("src/b.rs")));
     assert_eq!(app.explorer.pending_open_line, Some(42));
 }
+
+// --- Feature 2: cross-workspace connect commands -------------------------
+// These cover the guard branches only; the happy path calls `save()` (disk
+// I/O), so persistence is exercised by the `pairing` module's unit tests.
+
+#[test]
+fn connect_requires_an_open_session() {
+    let mut app = app_with_agents(); // starts on the AgentList screen
+    app.execute_command("connect Second");
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some(":connect needs an open agent session")
+    );
+    assert!(app.pairings.lock().unwrap().peers("a1").is_empty());
+}
+
+#[test]
+fn connect_without_arg_shows_usage() {
+    let mut app = app_with_agents();
+    app.handle(press(KeyCode::Enter)); // enter session for a1 (First)
+    app.execute_command("connect");
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Usage: :connect <agent>")
+    );
+}
+
+#[test]
+fn connect_unknown_agent_reports_no_match() {
+    let mut app = app_with_agents();
+    app.handle(press(KeyCode::Enter)); // session for a1
+    app.execute_command("connect nonexistent");
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("No other agent matches 'nonexistent'")
+    );
+    assert!(app.pairings.lock().unwrap().peers("a1").is_empty());
+}
+
+#[test]
+fn connect_ambiguous_query_lists_candidates() {
+    let mut app = app_with_agents();
+    app.handle(press(KeyCode::Char('j'))); // select a2 (Second)
+    app.handle(press(KeyCode::Enter)); // session for a2
+    // "ir" matches both "First" (a1) and "Third" (a3), neither is current.
+    app.execute_command("connect ir");
+    let msg = app.status_message.clone().unwrap();
+    assert!(msg.starts_with("Ambiguous"), "unexpected: {msg}");
+    assert!(
+        msg.contains("a1") && msg.contains("a3"),
+        "unexpected: {msg}"
+    );
+    assert!(app.pairings.lock().unwrap().peers("a2").is_empty());
+}
+
+#[test]
+fn connections_lists_in_memory_peers() {
+    let mut app = app_with_agents();
+    app.handle(press(KeyCode::Enter)); // session for a1
+    // Seed an in-memory pairing directly (no disk write).
+    app.pairings.lock().unwrap().connect("a1", "a2");
+    app.show_connections();
+    assert_eq!(app.status_message.as_deref(), Some("Connected: a2"));
+}
+
+// --- Feature 2c: cross-workspace inbox -------------------------------------
+
+#[test]
+fn send_to_workspace_queues_message_in_inbox() {
+    let mut app = app_with_agents();
+    app.handle_send_to_workspace(
+        "copilot-feature".into(),
+        "feature".into(),
+        "a2".into(),
+        "update docs".into(),
+        "xw-1".into(),
+    );
+    assert_eq!(app.inbox.len(), 1);
+    let msg = app.inbox.front().unwrap();
+    assert_eq!(msg.sender_name, "feature");
+    assert_eq!(msg.target_id, "a2");
+    // Target's friendly name is resolved from the agent registry.
+    assert_eq!(msg.target_name, "Second");
+    assert_eq!(msg.body, "update docs");
+}
+
+#[test]
+fn send_to_workspace_drops_when_target_unknown() {
+    let mut app = app_with_agents();
+    app.handle_send_to_workspace(
+        "copilot-feature".into(),
+        "feature".into(),
+        "nonexistent".into(),
+        "update docs".into(),
+        "xw-1".into(),
+    );
+    assert!(app.inbox.is_empty());
+}
+
+#[test]
+fn approving_inbox_injects_prompt_into_target() {
+    let mut app = app_with_agents();
+    app.handle_send_to_workspace(
+        "copilot-feature".into(),
+        "feature".into(),
+        "a2".into(),
+        "update the changelog".into(),
+        "xw-1".into(),
+    );
+    app.resolve_inbox(true);
+    assert!(app.inbox.is_empty());
+    // The target agent (a2) now has the framed message as a prompt, including
+    // the sender id, thread id, and reply instructions (Feature 2d).
+    let a2 = app.agents.iter().find(|a| a.id == "a2").unwrap();
+    let injected = a2.history.iter().find_map(|h| match h {
+        HistoryEntry::Prompt(p) => Some(p.clone()),
+        _ => None,
+    });
+    let framed = injected.expect("expected framed prompt in target history");
+    assert!(
+        framed.contains("update the changelog"),
+        "body missing: {framed}"
+    );
+    assert!(framed.contains("feature"), "sender name missing: {framed}");
+    assert!(
+        framed.contains("copilot-feature"),
+        "sender id missing: {framed}"
+    );
+    assert!(framed.contains("xw-1"), "thread id missing: {framed}");
+    assert!(
+        framed.contains("send_to_workspace"),
+        "reply instruction missing: {framed}"
+    );
+}
+
+#[test]
+fn rejecting_inbox_discards_without_injecting() {
+    let mut app = app_with_agents();
+    app.handle_send_to_workspace(
+        "copilot-feature".into(),
+        "feature".into(),
+        "a2".into(),
+        "update the changelog".into(),
+        "xw-1".into(),
+    );
+    app.resolve_inbox(false);
+    assert!(app.inbox.is_empty());
+    let a2 = app.agents.iter().find(|a| a.id == "a2").unwrap();
+    assert!(
+        a2.history.is_empty(),
+        "rejected message must not be injected"
+    );
+}
+
+#[test]
+fn inbox_modal_captures_keys_and_approves_front() {
+    let mut app = app_with_agents();
+    app.handle_send_to_workspace(
+        "copilot-feature".into(),
+        "feature".into(),
+        "a2".into(),
+        "first message".into(),
+        "xw-1".into(),
+    );
+    app.handle_send_to_workspace(
+        "copilot-feature".into(),
+        "feature".into(),
+        "a2".into(),
+        "second message".into(),
+        "xw-1".into(),
+    );
+    // 'y' approves the front (FIFO) message and leaves the second queued.
+    app.handle(press(KeyCode::Char('y')));
+    assert_eq!(app.inbox.len(), 1);
+    assert_eq!(app.inbox.front().unwrap().body, "second message");
+}
+
+#[test]
+fn reply_threads_back_to_original_sender() {
+    let mut app = app_with_agents();
+    // a1 (First) messages a2 (Second) on thread xw-42.
+    app.handle_send_to_workspace(
+        "a1".into(),
+        "First".into(),
+        "a2".into(),
+        "please summarize".into(),
+        "xw-42".into(),
+    );
+    app.resolve_inbox(true);
+
+    // a2 replies to a1, echoing the same thread id. This is just another
+    // send_to_workspace in the opposite direction (symmetric pairing).
+    app.handle_send_to_workspace(
+        "a2".into(),
+        "Second".into(),
+        "a1".into(),
+        "here is the summary".into(),
+        "xw-42".into(),
+    );
+    let queued = app.inbox.front().unwrap();
+    assert_eq!(queued.target_id, "a1");
+    assert_eq!(queued.thread, "xw-42");
+    app.resolve_inbox(true);
+
+    // a1 now sees the reply framed with the same thread id.
+    let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
+    let got_reply = a1.history.iter().any(|h| match h {
+        HistoryEntry::Prompt(p) => p.contains("here is the summary") && p.contains("xw-42"),
+        _ => false,
+    });
+    assert!(
+        got_reply,
+        "expected threaded reply in original sender's history"
+    );
+}

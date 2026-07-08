@@ -29,6 +29,7 @@ mod init;
 mod keybind;
 mod markdown;
 mod mcp_server;
+mod pairing;
 mod ui;
 mod workspace;
 
