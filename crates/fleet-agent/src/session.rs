@@ -127,6 +127,21 @@ impl SessionOutbound {
         self.inner.lock().expect("session outbound poisoned").sink = None;
     }
 
+    /// Forward a frame to the attached host **without** buffering it into the
+    /// replay history. Used for ephemeral, tunnel-scoped traffic (the MCP
+    /// relay) that must not be replayed to a reattaching host. Returns whether
+    /// a live host received it.
+    fn send_live(&self, frame: Vec<u8>) -> bool {
+        let mut g = self.inner.lock().expect("session outbound poisoned");
+        if let Some(sink) = &g.sink {
+            if sink.send(frame).is_ok() {
+                return true;
+            }
+            g.sink = None;
+        }
+        false
+    }
+
     fn mark_dead(&self) {
         self.inner.lock().expect("session outbound poisoned").alive = false;
     }
@@ -286,6 +301,13 @@ impl SharedSession {
     /// Detach the current host without ending the session.
     pub(crate) fn detach(&self) {
         self.outbound.detach();
+    }
+
+    /// Forward an ephemeral frame to the attached host without recording it in
+    /// the replay buffer (used by the MCP relay tunnel, whose frames are
+    /// tunnel-scoped and must not replay to a reattaching host).
+    pub(crate) fn send_live(&self, frame: Vec<u8>) -> bool {
+        self.outbound.send_live(frame)
     }
 
     /// Feed a prompt turn to the running session. Ignored if the session has

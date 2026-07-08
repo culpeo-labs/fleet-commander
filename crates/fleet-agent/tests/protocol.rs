@@ -12,9 +12,10 @@ use fleet_protocol::{
     AcpDataParams, AcpStartParams, AcpStartResult, AcpStopResult, CancelSearchParams,
     CancelSearchResult, FsDidChangeParams, FsListParams, FsListResult, FsReadParams, FsReadResult,
     FsWatchParams, FsWatchResult, GitBranchResult, Incoming, InitializeParams, InitializeResult,
-    Notification, PROTOCOL_VERSION, Request, Response, SearchAck, SearchDoneParams, SearchParams,
-    SearchResultParams, SessionConnectedParams, SessionPromptParams, SessionPromptResultParams,
-    SessionStartParams, SessionStartResult, SessionUpdateParams, framing, methods,
+    McpBindParams, McpDataParams, McpTunnelParams, Notification, PROTOCOL_VERSION, Request,
+    Response, SearchAck, SearchDoneParams, SearchParams, SearchResultParams,
+    SessionConnectedParams, SessionPromptParams, SessionPromptResultParams, SessionStartParams,
+    SessionStartResult, SessionUpdateParams, framing, methods,
 };
 
 /// Generous ceiling for any single blocking read so a protocol regression
@@ -836,4 +837,120 @@ fn daemon_session_survives_disconnect_and_replays_on_reattach() {
             "reattach should replay the prior turn's update from the buffer"
         );
     }
+}
+
+/// Helper: start a daemon-owned session on a fresh bridge connection and wait
+/// until it is connected, so the session is registered (keyed by `cwd`) and the
+/// connection is the attached host.
+fn start_session_host(daemon: &SocketDaemon, command: &str, cwd: &str) -> AgentProcess {
+    let mut host = AgentProcess::spawn_bridge(&daemon.socket);
+    host.call(
+        methods::INITIALIZE,
+        InitializeParams {
+            protocol_version: PROTOCOL_VERSION,
+        },
+    );
+    host.call(
+        methods::SESSION_START,
+        SessionStartParams {
+            command: command.to_string(),
+            cwd: cwd.to_string(),
+            previous_session_id: None,
+            env: Vec::new(),
+            mcp: false,
+        },
+    );
+    host.next_notification(methods::SESSION_CONNECTED);
+    host
+}
+
+/// The daemon must bridge an in-container MCP relay connection to the session's
+/// attached host: `mcp.bind` opens a tunnel (`mcp.open` to the host), and
+/// `mcp.data` flows in both directions, stamped with the daemon-assigned tunnel
+/// id on the host-facing hop (Feature 2 F2a2b).
+#[test]
+fn daemon_bridges_mcp_relay_to_session_host() {
+    let root = tempfile::TempDir::new().unwrap();
+    let script = root.path().join("fake_acp.py");
+    std::fs::write(&script, FAKE_ACP_AGENT).unwrap();
+    let daemon = SocketDaemon::start(root.path());
+
+    let command = format!("python3 {}", script.display());
+    let cwd = root.path().display().to_string();
+
+    let mut host = start_session_host(&daemon, &command, &cwd);
+
+    // A second connection plays the in-container `fleet-agent mcp` relay: it
+    // binds using the session cwd as its token.
+    let mut relay = AgentProcess::spawn_bridge(&daemon.socket);
+    relay.send_notification(methods::MCP_BIND, McpBindParams { token: cwd.clone() });
+
+    // The host is told a tunnel opened and learns its id.
+    let open = host.next_notification(methods::MCP_OPEN);
+    let open: McpTunnelParams = serde_json::from_value(open.params.unwrap()).unwrap();
+    let tunnel_id = open.tunnel_id;
+    assert!(tunnel_id > 0);
+
+    // Agent → host: a relay `mcp.data` reaches the host stamped with the id.
+    relay.send_notification(
+        methods::MCP_DATA,
+        McpDataParams {
+            tunnel_id: 0,
+            message: serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        },
+    );
+    let note = host.next_notification(methods::MCP_DATA);
+    let data: McpDataParams = serde_json::from_value(note.params.unwrap()).unwrap();
+    assert_eq!(data.tunnel_id, tunnel_id);
+    assert_eq!(data.message["method"], "tools/list");
+
+    // Host → agent: an `mcp.data` the host sends is routed back to the relay.
+    host.send_notification(
+        methods::MCP_DATA,
+        McpDataParams {
+            tunnel_id,
+            message: serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [] } }),
+        },
+    );
+    let note = relay.next_notification(methods::MCP_DATA);
+    let data: McpDataParams = serde_json::from_value(note.params.unwrap()).unwrap();
+    assert_eq!(data.message["result"]["tools"], serde_json::json!([]));
+
+    // Dropping the relay connection tears the tunnel down: the host is told.
+    drop(relay);
+    let close = host.next_notification(methods::MCP_CLOSE);
+    let close: McpTunnelParams = serde_json::from_value(close.params.unwrap()).unwrap();
+    assert_eq!(close.tunnel_id, tunnel_id);
+}
+
+/// When the host closes a tunnel (`mcp.close`), the daemon forwards the close to
+/// the in-container relay so it can shut its MCP server down.
+#[test]
+fn daemon_forwards_host_mcp_close_to_relay() {
+    let root = tempfile::TempDir::new().unwrap();
+    let script = root.path().join("fake_acp.py");
+    std::fs::write(&script, FAKE_ACP_AGENT).unwrap();
+    let daemon = SocketDaemon::start(root.path());
+
+    let command = format!("python3 {}", script.display());
+    let cwd = root.path().display().to_string();
+
+    let mut host = start_session_host(&daemon, &command, &cwd);
+
+    let mut relay = AgentProcess::spawn_bridge(&daemon.socket);
+    relay.send_notification(methods::MCP_BIND, McpBindParams { token: cwd.clone() });
+    let open = host.next_notification(methods::MCP_OPEN);
+    let open: McpTunnelParams = serde_json::from_value(open.params.unwrap()).unwrap();
+
+    host.send_notification(
+        methods::MCP_CLOSE,
+        McpTunnelParams {
+            tunnel_id: open.tunnel_id,
+        },
+    );
+    // The relay observes the close it can act on.
+    assert_eq!(
+        relay.next_notification(methods::MCP_CLOSE).method,
+        methods::MCP_CLOSE
+    );
 }
