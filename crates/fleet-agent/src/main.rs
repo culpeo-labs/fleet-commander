@@ -16,13 +16,17 @@
 //! Args are hand-parsed (no `clap`) to keep the injected binary's
 //! dependency footprint and cold-start as small as possible.
 
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
 
 use fleet_agent::{DaemonState, Server};
+use fleet_protocol::{
+    McpBindParams, McpDataParams, McpTunnelParams, Notification, framing, methods,
+};
+use serde_json::{Value, to_vec};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -50,11 +54,16 @@ fn run(args: &[String]) -> Result<(), String> {
             let socket = parse_socket(iter)?;
             bridge(&socket)
         }
+        Some("mcp") => {
+            let opts = parse_mcp(iter)?;
+            mcp_relay(&opts.socket, &opts.token)
+        }
         Some("--help") | Some("-h") | None => {
             eprintln!(
                 "usage:\n  \
                  fleet-agent serve --root <path> [--socket <path>]\n  \
-                 fleet-agent bridge --socket <path>"
+                 fleet-agent bridge --socket <path>\n  \
+                 fleet-agent mcp --socket <path> --token <token>"
             );
             Ok(())
         }
@@ -180,6 +189,112 @@ fn copy_all<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<()>
     }
 }
 
+/// Relay an MCP stdio server (spawned inside the container by the coding agent
+/// via the ACP `session/new` `mcp_servers`) to the fleet-agent daemon, which
+/// tunnels it out to the host over the session connection (Feature 2).
+///
+/// MCP's stdio transport is newline-delimited JSON: one JSON-RPC message per
+/// line. We translate between that and the daemon's `Content-Length`-framed
+/// `mcp.*` notifications:
+///
+/// - `stdin` (agent → host): each MCP line is parsed and wrapped in an
+///   [`methods::MCP_DATA`] frame written to the socket.
+/// - `socket` (host → agent): each [`methods::MCP_DATA`] frame is unwrapped and
+///   the MCP message is written to `stdout` as one line; an
+///   [`methods::MCP_CLOSE`] frame ends the relay.
+///
+/// A one-shot [`methods::MCP_BIND`] frame announces the daemon-minted `token`
+/// first so the daemon can resolve which session's host to bridge to.
+fn mcp_relay(socket: &Path, token: &str) -> Result<(), String> {
+    let stream =
+        UnixStream::connect(socket).map_err(|e| format!("connect {}: {e}", socket.display()))?;
+    let mut to_socket = stream
+        .try_clone()
+        .map_err(|e| format!("clone socket: {e}"))?;
+    let from_socket = stream;
+
+    // Announce ourselves before relaying any MCP traffic.
+    let bind = Notification::new(
+        methods::MCP_BIND,
+        McpBindParams {
+            token: token.into(),
+        },
+    );
+    framing::write_frame(&mut to_socket, &to_vec(&bind).unwrap_or_default())
+        .map_err(|e| format!("write mcp.bind: {e}"))?;
+
+    // stdin (MCP requests from the agent) → socket as mcp.data frames. Detached:
+    // this thread may block indefinitely in `read_line` when the tunnel is torn
+    // down host-side, so we never `join` it — the process exit reaps it.
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let trimmed = line.trim_end_matches(['\r', '\n']);
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let Ok(message) = serde_json::from_str::<Value>(trimmed) else {
+                        // Skip anything that isn't a JSON message rather than
+                        // corrupting the tunnel.
+                        continue;
+                    };
+                    let note = Notification::new(
+                        methods::MCP_DATA,
+                        McpDataParams {
+                            tunnel_id: 0,
+                            message,
+                        },
+                    );
+                    if framing::write_frame(&mut to_socket, &to_vec(&note).unwrap_or_default())
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        // Agent's MCP client closed stdin → tell the daemon the tunnel is done,
+        // then close the socket so our read loop below unblocks and we exit.
+        let close = Notification::new(methods::MCP_CLOSE, McpTunnelParams { tunnel_id: 0 });
+        let _ = framing::write_frame(&mut to_socket, &to_vec(&close).unwrap_or_default());
+        let _ = to_socket.shutdown(std::net::Shutdown::Both);
+    });
+
+    // socket (host → agent) → stdout as MCP lines. Returning from this loop ends
+    // the relay; any still-blocked stdin thread is reaped on process exit.
+    let mut reader = BufReader::new(from_socket);
+    let mut stdout = io::stdout().lock();
+    while let Ok(Some(body)) = framing::read_frame(&mut reader) {
+        let Ok(note) = serde_json::from_slice::<Notification>(&body) else {
+            continue;
+        };
+        match note.method.as_str() {
+            methods::MCP_DATA => {
+                if let Some(params) = note
+                    .params
+                    .and_then(|p| serde_json::from_value::<McpDataParams>(p).ok())
+                {
+                    // MCP stdio framing: one compact JSON object per line.
+                    if writeln!(stdout, "{}", params.message).is_err() {
+                        break;
+                    }
+                    let _ = stdout.flush();
+                }
+            }
+            methods::MCP_CLOSE => break,
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
 struct ServeOpts {
     root: PathBuf,
     socket: Option<PathBuf>,
@@ -232,4 +347,39 @@ fn parse_socket<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<PathBu
         }
     }
     socket.ok_or_else(|| "bridge requires --socket <path>".to_string())
+}
+
+struct McpOpts {
+    socket: PathBuf,
+    token: String,
+}
+
+/// Parse `mcp` args: required `--socket <path>` and `--token <token>` (both
+/// also accept the `--flag=value` form).
+fn parse_mcp<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<McpOpts, String> {
+    let mut socket: Option<PathBuf> = None;
+    let mut token: Option<String> = None;
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--socket" => {
+                let value = iter.next().ok_or("--socket requires a value")?;
+                socket = Some(PathBuf::from(value));
+            }
+            other if other.starts_with("--socket=") => {
+                socket = Some(PathBuf::from(&other["--socket=".len()..]));
+            }
+            "--token" => {
+                let value = iter.next().ok_or("--token requires a value")?;
+                token = Some(value.clone());
+            }
+            other if other.starts_with("--token=") => {
+                token = Some(other["--token=".len()..].to_string());
+            }
+            other => return Err(format!("unexpected argument: {other}")),
+        }
+    }
+    Ok(McpOpts {
+        socket: socket.ok_or("mcp requires --socket <path>")?,
+        token: token.ok_or("mcp requires --token <token>")?,
+    })
 }

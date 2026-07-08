@@ -99,6 +99,14 @@ pub mod methods {
     pub const SESSION_AUTH_REQUIRED: &str = "session.authRequired";
 
     // --- MCP tunnel (Feature 2: cross-workspace connect) ---
+    /// Agent→daemon notification: the in-container `fleet-agent mcp` relay
+    /// announces itself and binds to a session, using the daemon-minted token
+    /// that was injected into the ACP session's MCP server command. The daemon
+    /// then bridges this connection to the session's attached host via
+    /// [`MCP_OPEN`]/[`MCP_DATA`]/[`MCP_CLOSE`]. On this agent↔daemon hop the
+    /// [`McpDataParams::tunnel_id`] is unused (there is one tunnel per relay
+    /// connection); the daemon stamps the real id when forwarding to the host.
+    pub const MCP_BIND: &str = "mcp.bind";
     /// Server→client notification: a new in-container MCP relay opened. The
     /// daemon assigns a `tunnel_id`; the host stands up an MCP server bound to
     /// this tunnel (and the owning agent's identity) to service it.
@@ -695,6 +703,14 @@ pub struct SessionAuthRequiredParams {
     pub command: Vec<String>,
 }
 
+/// Params for [`methods::MCP_BIND`]: the token the daemon injected into the
+/// session's MCP server command, used to resolve which session's host this
+/// relay connection belongs to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpBindParams {
+    pub token: String,
+}
+
 /// Params for [`methods::MCP_OPEN`] and [`methods::MCP_CLOSE`]: identifies one
 /// MCP relay tunnel between an in-container `fleet-agent mcp` process and the
 /// host MCP server.
@@ -991,6 +1007,19 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&data).unwrap()).unwrap();
         assert_eq!(back, data);
         assert_eq!(back.message["method"], "tools/list");
+    }
+
+    #[test]
+    fn mcp_bind_params_round_trip() {
+        let bind = McpBindParams {
+            token: "tok-abc-123".into(),
+        };
+        let note = Notification::new(methods::MCP_BIND, &bind);
+        let value: serde_json::Value = serde_json::to_value(&note).unwrap();
+        assert_eq!(value["method"], methods::MCP_BIND);
+        assert_eq!(value["params"]["token"], "tok-abc-123");
+        let back: McpBindParams = serde_json::from_value(value["params"].clone()).unwrap();
+        assert_eq!(back, bind);
     }
 
     #[test]
