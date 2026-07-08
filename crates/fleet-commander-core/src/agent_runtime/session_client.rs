@@ -17,10 +17,11 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use agent_client_protocol::schema::v1::{AvailableCommandInput, SessionUpdate};
 use fleet_protocol::{
-    Notification, SearchDoneParams, SearchResultParams, SessionConnectedParams, SessionErrorParams,
-    SessionExitParams, SessionOutputParams, SessionPermissionRequestParams,
-    SessionPermissionRespondParams, SessionPromptParams, SessionPromptResultParams,
-    SessionStartParams, SessionStartResult, SessionUpdateParams, methods,
+    McpDataParams, McpTunnelParams, Notification, SearchDoneParams, SearchResultParams,
+    SessionConnectedParams, SessionErrorParams, SessionExitParams, SessionOutputParams,
+    SessionPermissionRequestParams, SessionPermissionRespondParams, SessionPromptParams,
+    SessionPromptResultParams, SessionStartParams, SessionStartResult, SessionUpdateParams,
+    methods,
 };
 use tokio::sync::mpsc;
 use tracing::info;
@@ -34,6 +35,7 @@ use crate::workspace_fs::WorkspaceFs;
 
 use super::AcpLog;
 use super::auth::build_auth_command;
+use super::mcp_tunnel::{McpTunnels, SendData};
 use super::updates::apply_session_update;
 
 /// Why the daemon-owned session driver could not run to completion.
@@ -88,6 +90,21 @@ pub(super) async fn run(
     // prompt loop unwinds and the caller emits a single `Exited` event.
     let exited = Arc::new(tokio::sync::Notify::new());
 
+    // Cross-workspace MCP tunnels (Feature 2). Host→agent messages are sent as
+    // `mcp.data` over the same bridge, so the send closure upgrades the shared
+    // transport cell (built below) on demand.
+    let mcp_tunnels = {
+        let cell = transport_cell.clone();
+        let send: SendData = Arc::new(move |tunnel_id, message| {
+            if let Some(transport) = cell.get().and_then(Weak::upgrade) {
+                let payload = serde_json::to_value(McpDataParams { tunnel_id, message })
+                    .expect("serialize mcp.data params");
+                let _ = transport.notify(methods::MCP_DATA, payload);
+            }
+        });
+        Arc::new(McpTunnels::new(handle.clone(), send))
+    };
+
     let sink = build_sink(
         agent_id.clone(),
         ci.container_id.clone(),
@@ -96,6 +113,7 @@ pub(super) async fn run(
         handle.clone(),
         transport_cell.clone(),
         exited.clone(),
+        mcp_tunnels,
         acp_log,
     );
 
@@ -143,7 +161,11 @@ pub(super) async fn run(
         cwd: session_cwd.to_string_lossy().into_owned(),
         previous_session_id,
         env: Vec::new(),
-        mcp: false,
+        // Opt into the cross-workspace MCP tunnel: the daemon injects a relay
+        // MCP server into the ACP session, whose frames arrive here as
+        // `mcp.open`/`mcp.data`/`mcp.close` and are served by the host's
+        // `TuiMcpServer` (Feature 2).
+        mcp: true,
     };
     let params = serde_json::to_value(params).expect("serialize session.start params");
     let result: SessionStartResult = transport
@@ -227,6 +249,7 @@ fn build_sink(
     handle: tokio::runtime::Handle,
     transport_cell: Arc<OnceLock<Weak<ProcessTransport>>>,
     exited: Arc<tokio::sync::Notify>,
+    mcp_tunnels: Arc<McpTunnels>,
     acp_log: Option<AcpLog>,
 ) -> NotificationSink {
     Box::new(move |note: Notification| match note.method.as_str() {
@@ -397,6 +420,33 @@ fn build_sink(
                     agent_id: agent_id.clone(),
                     search_id: params.search_id,
                     summary: params.summary,
+                });
+            }
+        }
+        // Cross-workspace MCP tunnel (Feature 2). The daemon opens a tunnel when
+        // the in-container agent's MCP client connects; bridge it to a duplex
+        // and hand the server side to the consumer to serve `TuiMcpServer` over.
+        methods::MCP_OPEN => {
+            if let Some(params) = decode::<McpTunnelParams>(&note) {
+                let stream = mcp_tunnels.open(params.tunnel_id);
+                let _ = event_tx.send(SessionEvent::McpTunnelOpen {
+                    agent_id: agent_id.clone(),
+                    tunnel_id: params.tunnel_id,
+                    stream: Arc::new(Mutex::new(Some(stream))),
+                });
+            }
+        }
+        methods::MCP_DATA => {
+            if let Some(params) = decode::<McpDataParams>(&note) {
+                mcp_tunnels.data(params.tunnel_id, params.message);
+            }
+        }
+        methods::MCP_CLOSE => {
+            if let Some(params) = decode::<McpTunnelParams>(&note) {
+                mcp_tunnels.close(params.tunnel_id);
+                let _ = event_tx.send(SessionEvent::McpTunnelClose {
+                    agent_id: agent_id.clone(),
+                    tunnel_id: params.tunnel_id,
                 });
             }
         }
