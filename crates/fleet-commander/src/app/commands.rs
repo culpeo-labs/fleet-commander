@@ -159,7 +159,7 @@ impl App {
                 return;
             }
         };
-        if self.pairings.connect(&current, &target) {
+        if self.pairings.lock().unwrap().connect(&current, &target) {
             self.persist_pairings();
             self.status_message = Some(format!("Connected {current} ↔ {target}"));
         } else {
@@ -179,7 +179,7 @@ impl App {
         }
         // Match against existing peers first so a disconnect works even if the
         // peer agent is no longer open in this session.
-        let peers = self.pairings.peers(&current);
+        let peers = self.pairings.lock().unwrap().peers(&current);
         let q = query.to_lowercase();
         let matches: Vec<String> = peers
             .iter()
@@ -197,7 +197,7 @@ impl App {
                 return;
             }
         };
-        if self.pairings.disconnect(&current, &target) {
+        if self.pairings.lock().unwrap().disconnect(&current, &target) {
             self.persist_pairings();
             self.status_message = Some(format!("Disconnected {current} ↔ {target}"));
         }
@@ -209,7 +209,7 @@ impl App {
             self.status_message = Some(":connections needs an open agent session".into());
             return;
         };
-        let peers = self.pairings.peers(&current);
+        let peers = self.pairings.lock().unwrap().peers(&current);
         if peers.is_empty() {
             self.status_message = Some("No connected workspaces (use :connect <agent>)".into());
         } else {
@@ -242,7 +242,8 @@ impl App {
 
     /// Persist pairings, surfacing any write error in the status line.
     fn persist_pairings(&mut self) {
-        if let Err(e) = self.pairings.save() {
+        let result = self.pairings.lock().unwrap().save();
+        if let Err(e) = result {
             self.status_message = Some(format!("Failed to save pairings: {e}"));
         }
     }

@@ -233,7 +233,7 @@ impl App {
     /// tunnel closes (see [`SessionEvent::McpTunnelClose`]).
     fn serve_mcp_tunnel(
         &mut self,
-        _agent_id: AgentId,
+        agent_id: AgentId,
         tunnel_id: u64,
         stream: Arc<Mutex<Option<DuplexStream>>>,
     ) {
@@ -244,8 +244,10 @@ impl App {
         let ct = CancellationToken::new();
         self.mcp_tunnels.insert(tunnel_id, ct.clone());
         let tx = self.tx.clone();
+        let pairings = self.pairings.clone();
         tokio::spawn(async move {
-            match TuiMcpServer::new(tx).serve_with_ct(stream, ct).await {
+            let server = TuiMcpServer::for_tunnel(tx, agent_id, pairings);
+            match server.serve_with_ct(stream, ct).await {
                 Ok(service) => {
                     let _ = service.waiting().await;
                 }

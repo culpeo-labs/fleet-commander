@@ -1430,7 +1430,7 @@ fn connect_requires_an_open_session() {
         app.status_message.as_deref(),
         Some(":connect needs an open agent session")
     );
-    assert!(app.pairings.peers("a1").is_empty());
+    assert!(app.pairings.lock().unwrap().peers("a1").is_empty());
 }
 
 #[test]
@@ -1453,7 +1453,7 @@ fn connect_unknown_agent_reports_no_match() {
         app.status_message.as_deref(),
         Some("No other agent matches 'nonexistent'")
     );
-    assert!(app.pairings.peers("a1").is_empty());
+    assert!(app.pairings.lock().unwrap().peers("a1").is_empty());
 }
 
 #[test]
@@ -1469,7 +1469,7 @@ fn connect_ambiguous_query_lists_candidates() {
         msg.contains("a1") && msg.contains("a3"),
         "unexpected: {msg}"
     );
-    assert!(app.pairings.peers("a2").is_empty());
+    assert!(app.pairings.lock().unwrap().peers("a2").is_empty());
 }
 
 #[test]
@@ -1477,7 +1477,7 @@ fn connections_lists_in_memory_peers() {
     let mut app = app_with_agents();
     app.handle(press(KeyCode::Enter)); // session for a1
     // Seed an in-memory pairing directly (no disk write).
-    app.pairings.connect("a1", "a2");
+    app.pairings.lock().unwrap().connect("a1", "a2");
     app.show_connections();
     assert_eq!(app.status_message.as_deref(), Some("Connected: a2"));
 }
