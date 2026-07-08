@@ -1481,3 +1481,94 @@ fn connections_lists_in_memory_peers() {
     app.show_connections();
     assert_eq!(app.status_message.as_deref(), Some("Connected: a2"));
 }
+
+// --- Feature 2c: cross-workspace inbox -------------------------------------
+
+#[test]
+fn send_to_workspace_queues_message_in_inbox() {
+    let mut app = app_with_agents();
+    app.handle_send_to_workspace(
+        "copilot-feature".into(),
+        "feature".into(),
+        "a2".into(),
+        "update docs".into(),
+    );
+    assert_eq!(app.inbox.len(), 1);
+    let msg = app.inbox.front().unwrap();
+    assert_eq!(msg.sender_name, "feature");
+    assert_eq!(msg.target_id, "a2");
+    // Target's friendly name is resolved from the agent registry.
+    assert_eq!(msg.target_name, "Second");
+    assert_eq!(msg.body, "update docs");
+}
+
+#[test]
+fn send_to_workspace_drops_when_target_unknown() {
+    let mut app = app_with_agents();
+    app.handle_send_to_workspace(
+        "copilot-feature".into(),
+        "feature".into(),
+        "nonexistent".into(),
+        "update docs".into(),
+    );
+    assert!(app.inbox.is_empty());
+}
+
+#[test]
+fn approving_inbox_injects_prompt_into_target() {
+    let mut app = app_with_agents();
+    app.handle_send_to_workspace(
+        "copilot-feature".into(),
+        "feature".into(),
+        "a2".into(),
+        "update the changelog".into(),
+    );
+    app.resolve_inbox(true);
+    assert!(app.inbox.is_empty());
+    // The target agent (a2) now has the framed message as a prompt.
+    let a2 = app.agents.iter().find(|a| a.id == "a2").unwrap();
+    let injected = a2.history.iter().any(|h| match h {
+        HistoryEntry::Prompt(p) => p.contains("update the changelog") && p.contains("feature"),
+        _ => false,
+    });
+    assert!(injected, "expected framed prompt in target history");
+}
+
+#[test]
+fn rejecting_inbox_discards_without_injecting() {
+    let mut app = app_with_agents();
+    app.handle_send_to_workspace(
+        "copilot-feature".into(),
+        "feature".into(),
+        "a2".into(),
+        "update the changelog".into(),
+    );
+    app.resolve_inbox(false);
+    assert!(app.inbox.is_empty());
+    let a2 = app.agents.iter().find(|a| a.id == "a2").unwrap();
+    assert!(
+        a2.history.is_empty(),
+        "rejected message must not be injected"
+    );
+}
+
+#[test]
+fn inbox_modal_captures_keys_and_approves_front() {
+    let mut app = app_with_agents();
+    app.handle_send_to_workspace(
+        "copilot-feature".into(),
+        "feature".into(),
+        "a2".into(),
+        "first message".into(),
+    );
+    app.handle_send_to_workspace(
+        "copilot-feature".into(),
+        "feature".into(),
+        "a2".into(),
+        "second message".into(),
+    );
+    // 'y' approves the front (FIFO) message and leaves the second queued.
+    app.handle(press(KeyCode::Char('y')));
+    assert_eq!(app.inbox.len(), 1);
+    assert_eq!(app.inbox.front().unwrap().body, "second message");
+}

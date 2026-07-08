@@ -41,6 +41,16 @@ pub enum AppEvent {
         agent_id: AgentId,
         message: String,
     },
+    /// An MCP client called the `send_to_workspace` tool (Feature 2c). The
+    /// sender and target are a connected pair (enforced in the tool). The
+    /// message is queued in the inbox for the user's approval before it is
+    /// injected into the target agent's session.
+    McpSendToWorkspace {
+        sender_id: AgentId,
+        sender_name: String,
+        target_id: AgentId,
+        message: String,
+    },
     /// Request to reconnect an agent (e.g. after container rebuild).
     ReconnectAgent {
         agent_id: AgentId,

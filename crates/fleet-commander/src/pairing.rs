@@ -109,9 +109,8 @@ impl PairingStore {
         }
     }
 
-    /// Whether `a` and `b` are connected. Consumed by Feature 2c's
-    /// `send_to_workspace` authorization gate.
-    #[allow(dead_code)]
+    /// Whether `a` and `b` are connected. Feature 2c's `send_to_workspace`
+    /// authorization gate.
     pub fn is_connected(&self, a: &str, b: &str) -> bool {
         match normalize(a, b) {
             Some(p) => self.pairs.contains(&p),
