@@ -16,6 +16,7 @@
 
 mod auth;
 mod connection;
+mod mcp_tunnel;
 mod resume;
 mod session_client;
 mod tunnel;

@@ -218,6 +218,18 @@ pub enum SessionEvent {
         container_id: String,
         branch: Option<String>,
     },
+    /// A cross-workspace MCP tunnel opened (Feature 2): the in-container agent's
+    /// MCP client reached the host through the daemon. `stream` is the
+    /// server-side duplex half to serve an MCP server over; it is wrapped so
+    /// the consumer can `take` it once (the stream is not `Clone`).
+    McpTunnelOpen {
+        agent_id: AgentId,
+        tunnel_id: u64,
+        stream: Arc<Mutex<Option<tokio::io::DuplexStream>>>,
+    },
+    /// A cross-workspace MCP tunnel closed (Feature 2): the consumer should stop
+    /// serving the MCP server for `tunnel_id`.
+    McpTunnelClose { agent_id: AgentId, tunnel_id: u64 },
 }
 
 impl SessionEvent {
@@ -239,7 +251,9 @@ impl SessionEvent {
             | SessionEvent::ExplorerFsChanged { agent_id, .. }
             | SessionEvent::SearchResults { agent_id, .. }
             | SessionEvent::SearchDone { agent_id, .. }
-            | SessionEvent::AgentBranch { agent_id, .. } => agent_id,
+            | SessionEvent::AgentBranch { agent_id, .. }
+            | SessionEvent::McpTunnelOpen { agent_id, .. }
+            | SessionEvent::McpTunnelClose { agent_id, .. } => agent_id,
         }
     }
 }

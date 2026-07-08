@@ -11,9 +11,11 @@
 //! Input handling is dispatched per-screen so a keypress can never silently
 //! mutate a hidden buffer.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use fleet_commander_core::session::SessionEvent;
@@ -85,6 +87,10 @@ pub struct App {
     /// `fs.searchResult`/`fs.searchDone` events can be correlated to the
     /// pane that started them (and stale results dropped).
     pub search_next_id: u64,
+    /// Live cross-workspace MCP tunnels (Feature 2), keyed by tunnel id. Each
+    /// value cancels the `serve_server` task running a `TuiMcpServer` over that
+    /// tunnel; dropped/cancelled when the daemon reports the tunnel closed.
+    pub mcp_tunnels: HashMap<u64, CancellationToken>,
 }
 
 /// A tool permission request waiting for the user's decision. Rendered
@@ -136,6 +142,7 @@ impl App {
             search_mode: false,
             search_query: String::new(),
             search_next_id: 0,
+            mcp_tunnels: HashMap::new(),
         }
     }
 

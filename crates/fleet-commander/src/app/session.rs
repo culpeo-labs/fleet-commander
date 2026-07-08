@@ -3,8 +3,11 @@
 //! in-container `ServiceFs`, and per-agent branch/scroll bookkeeping.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use rmcp::ServiceExt;
+use tokio::io::DuplexStream;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use fleet_commander_core::agent_runtime;
@@ -13,6 +16,7 @@ use fleet_commander_core::workspace_fs::{LocalFs, WorkspaceFs};
 
 use crate::agent::{AgentId, AgentStatus, ContainerInfo, HistoryEntry};
 use crate::event::AppEvent;
+use crate::mcp_server::TuiMcpServer;
 use crate::workspace;
 
 use super::{App, PendingPermission, Screen, SessionFocus, SidePane};
@@ -209,7 +213,47 @@ impl App {
                     branch,
                 });
             }
+            SessionEvent::McpTunnelOpen {
+                agent_id,
+                tunnel_id,
+                stream,
+            } => self.serve_mcp_tunnel(agent_id, tunnel_id, stream),
+            SessionEvent::McpTunnelClose { tunnel_id, .. } => {
+                if let Some(ct) = self.mcp_tunnels.remove(&tunnel_id) {
+                    ct.cancel();
+                }
+            }
         }
+    }
+
+    /// Serve a [`TuiMcpServer`] over a freshly-opened cross-workspace MCP tunnel
+    /// (Feature 2). The daemon bridged the in-container agent's MCP client to
+    /// `stream` (a duplex over the session connection); we run an MCP server on
+    /// it so the agent can call the TUI's tools. The task is cancelled when the
+    /// tunnel closes (see [`SessionEvent::McpTunnelClose`]).
+    fn serve_mcp_tunnel(
+        &mut self,
+        _agent_id: AgentId,
+        tunnel_id: u64,
+        stream: Arc<Mutex<Option<DuplexStream>>>,
+    ) {
+        let Some(stream) = stream.lock().ok().and_then(|mut guard| guard.take()) else {
+            warn!(tunnel_id, "MCP tunnel opened without a stream");
+            return;
+        };
+        let ct = CancellationToken::new();
+        self.mcp_tunnels.insert(tunnel_id, ct.clone());
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match TuiMcpServer::new(tx).serve_with_ct(stream, ct).await {
+                Ok(service) => {
+                    let _ = service.waiting().await;
+                }
+                Err(e) => {
+                    warn!(tunnel_id, error = %e, "MCP tunnel server failed to start");
+                }
+            }
+        });
     }
     /// Start the ACP connection for an agent if not already connected.
     pub fn ensure_agent_connected(&mut self, agent_id: AgentId) {
