@@ -31,9 +31,9 @@ impl Server {
                 acp: true,
                 // The daemon owns the ACP client/session (Phase 4b2).
                 session: true,
-                // MCP relay is advertised once the tunnel is implemented
-                // (Feature 2 F2a2); protocol scaffolding only for now.
-                mcp: false,
+                // The daemon relays an in-container MCP stream to the host and
+                // injects the relay into `session/new` (Feature 2).
+                mcp: true,
             },
         })
     }

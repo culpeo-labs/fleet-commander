@@ -30,10 +30,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use agent_client_protocol::schema::ProtocolVersion;
+use std::path::PathBuf;
+
 use agent_client_protocol::schema::v1::{
     AuthMethod, AuthenticateRequest, ContentBlock, InitializeRequest, ListSessionsRequest,
-    LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    LoadSessionRequest, McpServer, McpServerStdio, NewSessionRequest, PermissionOptionKind,
+    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     ResumeSessionRequest, SelectedPermissionOutcome, SessionNotification, TextContent,
 };
 use agent_client_protocol::{
@@ -202,6 +204,7 @@ impl SharedSession {
     pub(crate) fn start(
         params: SessionStartParams,
         out: std_mpsc::Sender<Vec<u8>>,
+        mcp_socket: Option<PathBuf>,
     ) -> StartedSession {
         let (prompt_tx, prompt_rx) = tokio_mpsc::unbounded_channel::<String>();
         let perms: PermissionRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -236,6 +239,7 @@ impl SharedSession {
                     prompt_rx,
                     perms_worker,
                     outcome_tx,
+                    mcp_socket,
                 ));
             })
             .expect("spawn session thread");
@@ -362,12 +366,13 @@ impl crate::Server {
             }
         };
         let sessions = self.sessions.clone();
+        let mcp_socket = self.mcp_socket.clone();
         let out = out.clone();
         let slot = slot.clone();
         thread::Builder::new()
             .name("fleet-agent-session-start".into())
             .spawn(move || {
-                let result = start_or_reattach(&sessions, params, &out, &slot);
+                let result = start_or_reattach(&sessions, params, &out, &slot, mcp_socket);
                 send_response(&out, Response::ok(id, result));
             })
             .expect("spawn session-start thread");
@@ -382,6 +387,7 @@ fn start_or_reattach(
     params: SessionStartParams,
     out: &std_mpsc::Sender<Vec<u8>>,
     slot: &SessionSlot,
+    mcp_socket: Option<PathBuf>,
 ) -> SessionStartResult {
     let key = params.cwd.clone();
 
@@ -402,7 +408,7 @@ fn start_or_reattach(
 
     // No live session — start a fresh one (blocks on the handshake, but on this
     // worker thread, not the dispatch loop).
-    let started = SharedSession::start(params, out.clone());
+    let started = SharedSession::start(params, out.clone(), mcp_socket);
     let result = started.result.clone();
     if let Some(session) = started.session {
         sessions
@@ -498,6 +504,36 @@ fn terminal_auth_command(method: &AuthMethod) -> Option<Vec<String>> {
     Some(v)
 }
 
+/// Build the MCP servers to inject into the ACP session so the in-container
+/// agent can reach the host MCP server through the daemon (Feature 2). Empty
+/// unless the host opted in (`params.mcp`) and we know our own socket path; the
+/// injected stdio server runs `fleet-agent mcp --socket <sock> --token <cwd>`,
+/// whose token is the session cwd the daemon resolves in `mcp.bind`.
+fn mcp_servers_for(
+    params: &SessionStartParams,
+    mcp_socket: Option<&std::path::Path>,
+) -> Vec<McpServer> {
+    if !params.mcp {
+        return Vec::new();
+    }
+    let Some(socket) = mcp_socket else {
+        return Vec::new();
+    };
+    // Resolve our own binary path so the injected command works regardless of
+    // the agent's PATH inside the container.
+    let command = std::env::current_exe()
+        .ok()
+        .unwrap_or_else(|| PathBuf::from("fleet-agent"));
+    let server = McpServerStdio::new("fleet-commander", command).args(vec![
+        "mcp".to_string(),
+        "--socket".to_string(),
+        socket.display().to_string(),
+        "--token".to_string(),
+        params.cwd.clone(),
+    ]);
+    vec![McpServer::Stdio(server)]
+}
+
 /// Drive one daemon-owned ACP session to completion. Runs on the session
 /// thread's tokio runtime.
 async fn run_session(
@@ -506,6 +542,7 @@ async fn run_session(
     prompt_rx: tokio_mpsc::UnboundedReceiver<String>,
     perms: PermissionRegistry,
     outcome_tx: std_mpsc::Sender<StartOutcome>,
+    mcp_socket: Option<PathBuf>,
 ) {
     // The ACP handler closures require `Send + Sync` senders, but the outbound
     // buffer is fed through a std mpsc drain. Bridge through a tokio channel
@@ -547,6 +584,10 @@ async fn run_session(
     let component: DynConnectTo<agent_client_protocol::Client> = DynConnectTo::new(agent);
     let cwd = std::path::PathBuf::from(&params.cwd);
     let previous_session_id = params.previous_session_id.clone();
+    // When the host opted into MCP and we know our own socket, inject a stdio
+    // MCP server pointing the in-container agent back at us (Feature 2). The
+    // token is the session cwd — the key the daemon resolves in `mcp.bind`.
+    let mcp_servers = mcp_servers_for(&params, mcp_socket.as_deref());
 
     // Shared so the prompt loop and the handshake can both emit outbound frames.
     let outcome_tx = Arc::new(Mutex::new(Some(outcome_tx)));
@@ -654,11 +695,13 @@ async fn run_session(
                 let note_tx = note_tx.clone();
                 let outcome_tx = outcome_tx.clone();
                 let prompt_rx = prompt_rx;
+                let mcp_servers = mcp_servers.clone();
                 async move {
                     handshake_and_run(
                         connection,
                         cwd,
                         previous_session_id,
+                        mcp_servers,
                         note_tx,
                         outcome_tx,
                         prompt_rx,
@@ -697,6 +740,7 @@ async fn handshake_and_run(
     connection: ConnectionTo<AcpAgentRole>,
     cwd: std::path::PathBuf,
     previous_session_id: Option<String>,
+    mcp_servers: Vec<McpServer>,
     note_tx: tokio_mpsc::UnboundedSender<Vec<u8>>,
     outcome_tx: Arc<Mutex<Option<std_mpsc::Sender<StartOutcome>>>>,
     mut prompt_rx: tokio_mpsc::UnboundedReceiver<String>,
@@ -749,18 +793,34 @@ async fn handshake_and_run(
     // Resume an existing session when possible, else create a fresh one.
     let mut session_id: Option<String> = None;
     if let Some(ref prev) = previous_session_id {
-        session_id =
-            try_resume_specific(&connection, prev, &cwd, can_resume, can_load, &note_tx).await;
+        session_id = try_resume_specific(
+            &connection,
+            prev,
+            &cwd,
+            can_resume,
+            can_load,
+            &mcp_servers,
+            &note_tx,
+        )
+        .await;
     }
     if session_id.is_none() && can_list && (can_resume || can_load) {
-        session_id = try_find_and_resume(&connection, &cwd, can_resume, can_load, &note_tx).await;
+        session_id = try_find_and_resume(
+            &connection,
+            &cwd,
+            can_resume,
+            can_load,
+            &mcp_servers,
+            &note_tx,
+        )
+        .await;
     }
 
     let session_id: String = match session_id {
         Some(id) => id,
         None => {
             match connection
-                .send_request(NewSessionRequest::new(cwd.clone()))
+                .send_request(NewSessionRequest::new(cwd.clone()).mcp_servers(mcp_servers.clone()))
                 .block_task()
                 .await
             {
@@ -865,6 +925,7 @@ async fn try_resume_specific(
     cwd: &std::path::Path,
     can_resume: bool,
     can_load: bool,
+    mcp_servers: &[McpServer],
     note_tx: &tokio_mpsc::UnboundedSender<Vec<u8>>,
 ) -> Option<String> {
     let outcome = if can_resume {
@@ -875,10 +936,10 @@ async fn try_resume_specific(
             },
         ));
         connection
-            .send_request(ResumeSessionRequest::new(
-                prev_id.to_string(),
-                cwd.to_path_buf(),
-            ))
+            .send_request(
+                ResumeSessionRequest::new(prev_id.to_string(), cwd.to_path_buf())
+                    .mcp_servers(mcp_servers.to_vec()),
+            )
             .block_task()
             .await
             .map(|_| ())
@@ -890,10 +951,10 @@ async fn try_resume_specific(
             },
         ));
         connection
-            .send_request(LoadSessionRequest::new(
-                prev_id.to_string(),
-                cwd.to_path_buf(),
-            ))
+            .send_request(
+                LoadSessionRequest::new(prev_id.to_string(), cwd.to_path_buf())
+                    .mcp_servers(mcp_servers.to_vec()),
+            )
             .block_task()
             .await
             .map(|_| ())
@@ -921,6 +982,7 @@ async fn try_find_and_resume(
     cwd: &std::path::Path,
     can_resume: bool,
     can_load: bool,
+    mcp_servers: &[McpServer],
     note_tx: &tokio_mpsc::UnboundedSender<Vec<u8>>,
 ) -> Option<String> {
     let sessions = match connection
@@ -951,19 +1013,19 @@ async fn try_find_and_resume(
 
     let outcome = if can_resume {
         connection
-            .send_request(ResumeSessionRequest::new(
-                best.session_id.clone(),
-                cwd.to_path_buf(),
-            ))
+            .send_request(
+                ResumeSessionRequest::new(best.session_id.clone(), cwd.to_path_buf())
+                    .mcp_servers(mcp_servers.to_vec()),
+            )
             .block_task()
             .await
             .map(|_| ())
     } else if can_load {
         connection
-            .send_request(LoadSessionRequest::new(
-                best.session_id.clone(),
-                cwd.to_path_buf(),
-            ))
+            .send_request(
+                LoadSessionRequest::new(best.session_id.clone(), cwd.to_path_buf())
+                    .mcp_servers(mcp_servers.to_vec()),
+            )
             .block_task()
             .await
             .map(|_| ())

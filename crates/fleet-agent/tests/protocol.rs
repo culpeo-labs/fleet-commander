@@ -954,3 +954,116 @@ fn daemon_forwards_host_mcp_close_to_relay() {
         methods::MCP_CLOSE
     );
 }
+
+/// Like [`FAKE_ACP_AGENT`] but records the `mcp_servers` it receives in
+/// `session/new` to `session_new.json` next to the script, so a test can assert
+/// what the daemon injected (Feature 2 F2a2b-2). The recording dir is passed via
+/// the `FLEET_TEST_RECORD` env var.
+const RECORDING_ACP_AGENT: &str = r#"
+import sys, json, os
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid,
+              "result": {"protocolVersion": 1, "agentCapabilities": {}, "authMethods": []}})
+    elif method == "session/new":
+        rec = os.environ.get("FLEET_TEST_RECORD")
+        if rec:
+            with open(rec, "w") as f:
+                json.dump(msg.get("params", {}).get("mcpServers", []), f)
+        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "test-session-1"}})
+    elif method == "authenticate":
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+    elif mid is not None:
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+"#;
+
+/// With `mcp` opted in, the daemon injects a stdio MCP server into `session/new`
+/// pointing the in-container agent back at the daemon's own socket, tokened with
+/// the session cwd (Feature 2 F2a2b-2).
+#[test]
+fn daemon_injects_mcp_server_into_session_new() {
+    let root = tempfile::TempDir::new().unwrap();
+    let script = root.path().join("recording_acp.py");
+    std::fs::write(&script, RECORDING_ACP_AGENT).unwrap();
+    let record = root.path().join("session_new.json");
+    let daemon = SocketDaemon::start(root.path());
+
+    let cwd = root.path().display().to_string();
+    // Pass the recording path to the agent child through the session env.
+    let command = format!("python3 {}", script.display());
+
+    let mut host = AgentProcess::spawn_bridge(&daemon.socket);
+    host.call(
+        methods::INITIALIZE,
+        InitializeParams {
+            protocol_version: PROTOCOL_VERSION,
+        },
+    );
+    host.call(
+        methods::SESSION_START,
+        SessionStartParams {
+            command,
+            cwd: cwd.clone(),
+            previous_session_id: None,
+            env: vec![fleet_protocol::AcpEnvVar {
+                name: "FLEET_TEST_RECORD".into(),
+                value: record.display().to_string(),
+            }],
+            mcp: true,
+        },
+    );
+    host.next_notification(methods::SESSION_CONNECTED);
+
+    // The recording agent wrote the mcp_servers it saw in session/new.
+    let recorded: serde_json::Value = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(bytes) = std::fs::read(&record) {
+                break serde_json::from_slice(&bytes).unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "agent never recorded session/new mcp_servers"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    let servers = recorded.as_array().expect("mcpServers should be an array");
+    assert_eq!(servers.len(), 1, "exactly one MCP server injected");
+    let server = &servers[0];
+    // ACP serializes McpServer::Stdio untagged (no "type" discriminator).
+    assert_eq!(server["name"], "fleet-commander");
+    assert!(
+        server["command"].as_str().unwrap().ends_with("fleet-agent"),
+        "command should be the fleet-agent binary, got {:?}",
+        server["command"]
+    );
+    let args: Vec<String> = server["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        args,
+        vec![
+            "mcp".to_string(),
+            "--socket".to_string(),
+            daemon.socket.display().to_string(),
+            "--token".to_string(),
+            cwd,
+        ],
+    );
+}

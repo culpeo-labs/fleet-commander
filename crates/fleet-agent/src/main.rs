@@ -112,7 +112,9 @@ fn serve_socket(root: &Path, socket: &Path) -> Result<(), String> {
     // Daemon-scoped state shared by every connection. Its session registry is
     // what lets an ACP session outlive the client (TUI) that started it: a
     // reconnecting client reattaches to the same session instead of respawning.
-    let state = DaemonState::new();
+    // The socket path is recorded so `session/new` can inject an MCP server that
+    // dials back into this daemon (Feature 2).
+    let state = DaemonState::new().with_socket(socket.to_path_buf());
 
     // One thread per client connection. A single session holds *two* concurrent
     // connections (the fs/watch channel and the ACP session channel), so the

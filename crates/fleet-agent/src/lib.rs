@@ -42,6 +42,11 @@ use watch::WatchHandle;
 pub struct DaemonState {
     sessions: SessionRegistry,
     mcp: McpTunnels,
+    /// The daemon's own unix socket path, injected into ACP `session/new` so
+    /// the in-container agent can reach the host MCP server through us
+    /// (Feature 2). `None` for the stdio transport, which cannot be dialed
+    /// back into.
+    mcp_socket: Option<PathBuf>,
 }
 
 impl DaemonState {
@@ -49,7 +54,15 @@ impl DaemonState {
         Self {
             sessions: new_registry(),
             mcp: McpTunnels::new(),
+            mcp_socket: None,
         }
+    }
+
+    /// Record the daemon's own socket path so `session/new` can inject an MCP
+    /// server that dials back into it.
+    pub fn with_socket(mut self, socket: impl Into<PathBuf>) -> Self {
+        self.mcp_socket = Some(socket.into());
+        self
     }
 }
 
@@ -72,11 +85,14 @@ pub struct Server {
     /// Daemon-scoped registry of live MCP relay tunnels (Feature 2), shared so
     /// a host connection can route host→agent frames to the relay connection.
     mcp: McpTunnels,
+    /// The daemon's own socket path, injected into ACP `session/new` (Feature
+    /// 2). `None` for the stdio transport / non-socket servers.
+    mcp_socket: Option<PathBuf>,
 }
 
 impl Server {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self::with_sessions(root, new_registry(), McpTunnels::new())
+        Self::with_sessions(root, new_registry(), McpTunnels::new(), None)
     }
 
     /// Like [`new`](Self::new) but sharing an existing session registry and MCP
@@ -87,6 +103,7 @@ impl Server {
         root: impl Into<PathBuf>,
         sessions: SessionRegistry,
         mcp: McpTunnels,
+        mcp_socket: Option<PathBuf>,
     ) -> Self {
         let root = root.into();
         let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
@@ -95,6 +112,7 @@ impl Server {
             canonical_root,
             sessions,
             mcp,
+            mcp_socket,
         }
     }
 
@@ -102,7 +120,12 @@ impl Server {
     /// [`DaemonState`] (its session and MCP tunnel registries), so sessions
     /// survive a client disconnect and a reconnecting client reattaches to them.
     pub fn with_state(root: impl Into<PathBuf>, state: &DaemonState) -> Self {
-        Self::with_sessions(root, state.sessions.clone(), state.mcp.clone())
+        Self::with_sessions(
+            root,
+            state.sessions.clone(),
+            state.mcp.clone(),
+            state.mcp_socket.clone(),
+        )
     }
 
     /// Read framed requests from `reader` until EOF, dispatching each and
