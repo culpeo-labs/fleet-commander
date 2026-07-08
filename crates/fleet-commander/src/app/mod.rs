@@ -197,7 +197,8 @@ impl App {
                 sender_name,
                 target_id,
                 message,
-            } => self.handle_send_to_workspace(sender_id, sender_name, target_id, message),
+                thread,
+            } => self.handle_send_to_workspace(sender_id, sender_name, target_id, message, thread),
             AppEvent::ReconnectAgent { agent_id } => {
                 info!(agent_id = %agent_id, "Reconnecting agent after rebuild");
                 self.ensure_agent_connected(agent_id);

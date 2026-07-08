@@ -55,6 +55,11 @@ pub struct SendToWorkspaceParams {
     pub target: String,
     /// The message to deliver to the target workspace's agent.
     pub message: String,
+    /// Correlation id (Feature 2d). When replying to a cross-workspace message,
+    /// echo the `thread` you received so the recipient can correlate the reply.
+    /// Omit to start a new thread — the returned ack reports the generated id.
+    #[serde(default)]
+    pub thread: Option<String>,
 }
 
 /// Optional cross-workspace context (Feature 2). Present only when the server
@@ -123,6 +128,17 @@ struct ConnectedPeer {
 /// Derive a friendly workspace name from an [`AgentId`] (`copilot-{dir}` → `dir`).
 fn display_name(id: &str) -> String {
     id.strip_prefix("copilot-").unwrap_or(id).to_string()
+}
+
+/// Generate a fresh cross-workspace thread id (Feature 2d). Epoch-micros give
+/// a compact, monotonic-enough id for human-paced messaging without pulling in
+/// a uuid/rand dependency.
+fn new_thread_id() -> String {
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    format!("xw-{micros:x}")
 }
 
 #[tool_router]
@@ -207,12 +223,14 @@ impl TuiMcpServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    /// Send a message to a connected workspace's agent (Feature 2c). The
+    /// Send a message to a connected workspace's agent (Feature 2c/2d). The
     /// message is queued for the user's approval before it reaches the target.
     #[tool(
         description = "Send a message to a connected workspace's agent. `target` must be an id \
                        returned by list_connected. The message is queued for the user's approval \
-                       before it is delivered to the target workspace."
+                       before it is delivered to the target workspace. To reply to a message you \
+                       received, pass its `thread` id; omit `thread` to start a new exchange \
+                       (the ack reports the generated thread id)."
     )]
     fn send_to_workspace(
         &self,
@@ -239,17 +257,24 @@ impl TuiMcpServer {
                 None,
             ));
         }
+        // Continue the caller's thread if it supplied one, otherwise open a new
+        // one and report the id back so the caller can correlate the reply.
+        let thread = params
+            .thread
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(new_thread_id);
         self.tx
             .send(AppEvent::McpSendToWorkspace {
                 sender_id: cw.caller.clone(),
                 sender_name: display_name(&cw.caller),
                 target_id: params.target,
                 message: params.message,
+                thread: thread.clone(),
             })
             .map_err(|_| McpError::internal_error("TUI event loop closed", None))?;
-        Ok(CallToolResult::success(vec![Content::text(
-            "message queued for approval",
-        )]))
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "message queued for approval (thread: {thread})"
+        ))]))
     }
 }
 
@@ -410,6 +435,7 @@ mod tests {
         let params = SendToWorkspaceParams {
             target: "copilot-docs".into(),
             message: "hi".into(),
+            thread: None,
         };
         assert!(server.send_to_workspace(Parameters(params)).is_err());
     }
@@ -426,6 +452,7 @@ mod tests {
         let params = SendToWorkspaceParams {
             target: "copilot-docs".into(),
             message: "hi".into(),
+            thread: None,
         };
         assert!(server.send_to_workspace(Parameters(params)).is_err());
         // No event should have been emitted for an unauthorized target.
@@ -443,6 +470,7 @@ mod tests {
         let params = SendToWorkspaceParams {
             target: "copilot-docs".into(),
             message: "update the changelog".into(),
+            thread: None,
         };
         assert!(server.send_to_workspace(Parameters(params)).is_ok());
 
@@ -452,12 +480,36 @@ mod tests {
                 sender_name,
                 target_id,
                 message,
+                thread,
             } => {
                 assert_eq!(sender_id, "copilot-feature");
                 assert_eq!(sender_name, "feature");
                 assert_eq!(target_id, "copilot-docs");
                 assert_eq!(message, "update the changelog");
+                // A new thread id is generated when none is supplied.
+                assert!(thread.starts_with("xw-"), "unexpected thread: {thread}");
             }
+            other => panic!("expected McpSendToWorkspace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_to_workspace_preserves_supplied_thread() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut store = PairingStore::default();
+        store.connect("copilot-feature", "copilot-docs");
+        let pairings = Arc::new(Mutex::new(store));
+        let server = TuiMcpServer::for_tunnel(tx, "copilot-feature".into(), pairings);
+
+        let params = SendToWorkspaceParams {
+            target: "copilot-docs".into(),
+            message: "done".into(),
+            thread: Some("xw-abc".into()),
+        };
+        assert!(server.send_to_workspace(Parameters(params)).is_ok());
+
+        match rx.try_recv().unwrap() {
+            AppEvent::McpSendToWorkspace { thread, .. } => assert_eq!(thread, "xw-abc"),
             other => panic!("expected McpSendToWorkspace, got {other:?}"),
         }
     }

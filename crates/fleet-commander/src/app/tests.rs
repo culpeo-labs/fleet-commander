@@ -1492,6 +1492,7 @@ fn send_to_workspace_queues_message_in_inbox() {
         "feature".into(),
         "a2".into(),
         "update docs".into(),
+        "xw-1".into(),
     );
     assert_eq!(app.inbox.len(), 1);
     let msg = app.inbox.front().unwrap();
@@ -1510,6 +1511,7 @@ fn send_to_workspace_drops_when_target_unknown() {
         "feature".into(),
         "nonexistent".into(),
         "update docs".into(),
+        "xw-1".into(),
     );
     assert!(app.inbox.is_empty());
 }
@@ -1522,16 +1524,32 @@ fn approving_inbox_injects_prompt_into_target() {
         "feature".into(),
         "a2".into(),
         "update the changelog".into(),
+        "xw-1".into(),
     );
     app.resolve_inbox(true);
     assert!(app.inbox.is_empty());
-    // The target agent (a2) now has the framed message as a prompt.
+    // The target agent (a2) now has the framed message as a prompt, including
+    // the sender id, thread id, and reply instructions (Feature 2d).
     let a2 = app.agents.iter().find(|a| a.id == "a2").unwrap();
-    let injected = a2.history.iter().any(|h| match h {
-        HistoryEntry::Prompt(p) => p.contains("update the changelog") && p.contains("feature"),
-        _ => false,
+    let injected = a2.history.iter().find_map(|h| match h {
+        HistoryEntry::Prompt(p) => Some(p.clone()),
+        _ => None,
     });
-    assert!(injected, "expected framed prompt in target history");
+    let framed = injected.expect("expected framed prompt in target history");
+    assert!(
+        framed.contains("update the changelog"),
+        "body missing: {framed}"
+    );
+    assert!(framed.contains("feature"), "sender name missing: {framed}");
+    assert!(
+        framed.contains("copilot-feature"),
+        "sender id missing: {framed}"
+    );
+    assert!(framed.contains("xw-1"), "thread id missing: {framed}");
+    assert!(
+        framed.contains("send_to_workspace"),
+        "reply instruction missing: {framed}"
+    );
 }
 
 #[test]
@@ -1542,6 +1560,7 @@ fn rejecting_inbox_discards_without_injecting() {
         "feature".into(),
         "a2".into(),
         "update the changelog".into(),
+        "xw-1".into(),
     );
     app.resolve_inbox(false);
     assert!(app.inbox.is_empty());
@@ -1560,15 +1579,56 @@ fn inbox_modal_captures_keys_and_approves_front() {
         "feature".into(),
         "a2".into(),
         "first message".into(),
+        "xw-1".into(),
     );
     app.handle_send_to_workspace(
         "copilot-feature".into(),
         "feature".into(),
         "a2".into(),
         "second message".into(),
+        "xw-1".into(),
     );
     // 'y' approves the front (FIFO) message and leaves the second queued.
     app.handle(press(KeyCode::Char('y')));
     assert_eq!(app.inbox.len(), 1);
     assert_eq!(app.inbox.front().unwrap().body, "second message");
+}
+
+#[test]
+fn reply_threads_back_to_original_sender() {
+    let mut app = app_with_agents();
+    // a1 (First) messages a2 (Second) on thread xw-42.
+    app.handle_send_to_workspace(
+        "a1".into(),
+        "First".into(),
+        "a2".into(),
+        "please summarize".into(),
+        "xw-42".into(),
+    );
+    app.resolve_inbox(true);
+
+    // a2 replies to a1, echoing the same thread id. This is just another
+    // send_to_workspace in the opposite direction (symmetric pairing).
+    app.handle_send_to_workspace(
+        "a2".into(),
+        "Second".into(),
+        "a1".into(),
+        "here is the summary".into(),
+        "xw-42".into(),
+    );
+    let queued = app.inbox.front().unwrap();
+    assert_eq!(queued.target_id, "a1");
+    assert_eq!(queued.thread, "xw-42");
+    app.resolve_inbox(true);
+
+    // a1 now sees the reply framed with the same thread id.
+    let a1 = app.agents.iter().find(|a| a.id == "a1").unwrap();
+    let got_reply = a1.history.iter().any(|h| match h {
+        HistoryEntry::Prompt(p) => p.contains("here is the summary") && p.contains("xw-42"),
+        _ => false,
+    });
+    assert!(
+        got_reply,
+        "expected threaded reply in original sender's history"
+    );
 }
