@@ -93,7 +93,10 @@ pub struct App {
     pub mcp_tunnels: HashMap<u64, CancellationToken>,
     /// Undirected cross-workspace pairings (Feature 2). The user must connect
     /// two agents before they may message each other; persisted to disk.
-    pub pairings: crate::pairing::PairingStore,
+    /// Shared (`Arc<Mutex<_>>`) so a `TuiMcpServer` served over a cross-workspace
+    /// tunnel can consult the live set to answer `list_connected` without an
+    /// event round-trip.
+    pub pairings: Arc<Mutex<crate::pairing::PairingStore>>,
 }
 
 /// A tool permission request waiting for the user's decision. Rendered
@@ -146,7 +149,7 @@ impl App {
             search_query: String::new(),
             search_next_id: 0,
             mcp_tunnels: HashMap::new(),
-            pairings: crate::pairing::PairingStore::load(),
+            pairings: Arc::new(Mutex::new(crate::pairing::PairingStore::load())),
         }
     }
 
