@@ -15,6 +15,7 @@ use fleet_protocol::{Notification, Request, Response, RpcError, error_codes, fra
 
 mod acp;
 mod handlers;
+mod mcp;
 mod search;
 mod search_stream;
 mod session;
@@ -22,6 +23,10 @@ mod util;
 mod watch;
 
 use acp::{AcpChild, handle_acp_send, handle_acp_stop};
+use mcp::{
+    McpConn, McpTunnels, handle_mcp_bind, handle_mcp_host_close, handle_mcp_host_data,
+    handle_mcp_relay_data,
+};
 use search_stream::{SearchState, handle_cancel_search};
 use session::{
     SessionRegistry, SessionSlot, handle_session_cancel, handle_session_permission_respond,
@@ -36,12 +41,14 @@ use watch::WatchHandle;
 #[derive(Clone)]
 pub struct DaemonState {
     sessions: SessionRegistry,
+    mcp: McpTunnels,
 }
 
 impl DaemonState {
     pub fn new() -> Self {
         Self {
             sessions: new_registry(),
+            mcp: McpTunnels::new(),
         }
     }
 }
@@ -62,32 +69,40 @@ pub struct Server {
     /// Daemon-scoped registry of live ACP sessions, shared across every client
     /// connection so a reconnecting host reattaches to its existing session.
     sessions: SessionRegistry,
+    /// Daemon-scoped registry of live MCP relay tunnels (Feature 2), shared so
+    /// a host connection can route host→agent frames to the relay connection.
+    mcp: McpTunnels,
 }
 
 impl Server {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self::with_sessions(root, new_registry())
+        Self::with_sessions(root, new_registry(), McpTunnels::new())
     }
 
-    /// Like [`new`](Self::new) but sharing an existing session registry, so
-    /// multiple client connections (each with their own `Server`) observe the
-    /// same daemon-scoped sessions. Used by the socket daemon via
-    /// [`Server::with_state`].
-    pub(crate) fn with_sessions(root: impl Into<PathBuf>, sessions: SessionRegistry) -> Self {
+    /// Like [`new`](Self::new) but sharing an existing session registry and MCP
+    /// tunnel registry, so multiple client connections (each with their own
+    /// `Server`) observe the same daemon-scoped state. Used by the socket
+    /// daemon via [`Server::with_state`].
+    pub(crate) fn with_sessions(
+        root: impl Into<PathBuf>,
+        sessions: SessionRegistry,
+        mcp: McpTunnels,
+    ) -> Self {
         let root = root.into();
         let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
         Self {
             root,
             canonical_root,
             sessions,
+            mcp,
         }
     }
 
     /// Build a `Server` for one client connection that shares the daemon's
-    /// [`DaemonState`] (its session registry), so sessions survive a client
-    /// disconnect and a reconnecting client reattaches to them.
+    /// [`DaemonState`] (its session and MCP tunnel registries), so sessions
+    /// survive a client disconnect and a reconnecting client reattaches to them.
     pub fn with_state(root: impl Into<PathBuf>, state: &DaemonState) -> Self {
-        Self::with_sessions(root, state.sessions.clone())
+        Self::with_sessions(root, state.sessions.clone(), state.mcp.clone())
     }
 
     /// Read framed requests from `reader` until EOF, dispatching each and
@@ -140,6 +155,10 @@ impl Server {
         // Shared with the `session.start` worker thread via a slot so the read
         // loop stays free while a session's ACP handshake runs.
         let session: SessionSlot = new_slot();
+        // The MCP relay tunnel this connection is bound to, if it announced
+        // itself with `mcp.bind` (Feature 2). Dropping it on disconnect tears
+        // the tunnel down and notifies the host.
+        let mut mcp_conn: Option<McpConn> = None;
         let result = self.dispatch_loop(
             reader,
             &out_tx,
@@ -147,6 +166,7 @@ impl Server {
             &mut searches,
             &mut acp,
             &session,
+            &mut mcp_conn,
         );
 
         // Tear down in order: cancel + join any in-flight searches, stop the
@@ -158,6 +178,7 @@ impl Server {
         if let Some(session) = session.lock().expect("session slot poisoned").as_ref() {
             session.detach();
         }
+        drop(mcp_conn);
         drop(acp);
         drop(watch);
         drop(out_tx);
@@ -169,6 +190,8 @@ impl Server {
     /// outbound `out` channel. Long-running/streaming methods are handled
     /// out-of-band: `fs.watch` manages a subscription, and `fs.search` spawns
     /// a worker that streams results and sends the final response itself.
+    #[allow(clippy::too_many_arguments)] // per-connection state pieces have
+    // distinct teardown ordering in `serve_stdio`, so they stay separate.
     fn dispatch_loop<R: BufRead>(
         &self,
         reader: &mut R,
@@ -177,6 +200,7 @@ impl Server {
         searches: &mut SearchState,
         acp: &mut Option<AcpChild>,
         session: &SessionSlot,
+        mcp_conn: &mut Option<McpConn>,
     ) -> io::Result<()> {
         while let Some(body) = framing::read_frame(reader)? {
             // Peek at the raw object to tell requests (have an `id`, expect a
@@ -202,6 +226,27 @@ impl Server {
                         methods::SESSION_PROMPT => handle_session_prompt(&note, session),
                         methods::SESSION_PERMISSION_RESPOND => {
                             handle_session_permission_respond(&note, session)
+                        }
+                        // MCP relay tunnel (Feature 2). A connection that has
+                        // sent `mcp.bind` is an in-container relay (agent→host);
+                        // otherwise the frames come from the host (host→agent).
+                        methods::MCP_BIND => {
+                            if mcp_conn.is_none() {
+                                *mcp_conn = handle_mcp_bind(&note, &self.sessions, &self.mcp, out);
+                            }
+                        }
+                        methods::MCP_DATA => match mcp_conn.as_ref() {
+                            Some(conn) => handle_mcp_relay_data(&note, conn),
+                            None => handle_mcp_host_data(&note, &self.mcp),
+                        },
+                        methods::MCP_CLOSE => {
+                            if mcp_conn.is_some() {
+                                // Relay closed its side; dropping the tunnel
+                                // notifies the host and unregisters it.
+                                *mcp_conn = None;
+                            } else {
+                                handle_mcp_host_close(&note, &self.mcp);
+                            }
                         }
                         _ => {}
                     }
