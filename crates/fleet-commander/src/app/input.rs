@@ -67,6 +67,20 @@ impl App {
             return;
         }
 
+        // Cross-workspace message approval — a modal that owns input while the
+        // inbox has pending messages (Feature 2c). A permission request always
+        // takes precedence (handled above). Enter/'y' approves & delivers the
+        // front message; Esc/'n'/'q' rejects it. Because this returns, no
+        // keystrokes leak into the input box while messages await approval.
+        if !self.inbox.is_empty() {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') => self.resolve_inbox(true),
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => self.resolve_inbox(false),
+                _ => {}
+            }
+            return;
+        }
+
         // Command mode (`:` prompt) — intercept all keys.
         if self.command_mode {
             match key.code {

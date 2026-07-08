@@ -11,6 +11,7 @@ mod agent_list;
 mod agent_session;
 mod conversation;
 mod explorer;
+mod inbox_popup;
 mod input_box;
 mod keys_footer;
 mod overlay;
@@ -60,5 +61,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     // input box) and owns input while it's open.
     if let Some(perm) = &app.permission_pending {
         permission_popup::render(frame, area, perm);
+    } else if let Some(msg) = app.inbox.front() {
+        // The cross-workspace approval modal (Feature 2c) sits at the same
+        // layer, but a permission request always takes precedence.
+        inbox_popup::render(frame, area, msg, app.inbox.len());
     }
 }

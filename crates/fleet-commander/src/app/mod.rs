@@ -29,10 +29,12 @@ use crate::explorer::ExplorerState;
 mod actions;
 mod commands;
 mod explorer;
+mod inbox;
 mod input;
 mod search;
 mod session;
 mod types;
+pub use inbox::{Inbox, InboxMessage};
 pub use types::{Screen, SessionFocus, SidePane};
 
 use actions::{handle_list_action, handle_session_action, spawn_text_tracker, spawn_tool_tracker};
@@ -97,6 +99,9 @@ pub struct App {
     /// tunnel can consult the live set to answer `list_connected` without an
     /// event round-trip.
     pub pairings: Arc<Mutex<crate::pairing::PairingStore>>,
+    /// Pending cross-workspace messages (Feature 2c) awaiting the user's
+    /// per-message approval before injection into the target agent.
+    pub inbox: Inbox,
 }
 
 /// A tool permission request waiting for the user's decision. Rendered
@@ -150,6 +155,7 @@ impl App {
             search_next_id: 0,
             mcp_tunnels: HashMap::new(),
             pairings: Arc::new(Mutex::new(crate::pairing::PairingStore::load())),
+            inbox: Inbox::default(),
         }
     }
 
@@ -186,6 +192,12 @@ impl App {
                     agent.info(message);
                 }
             }
+            AppEvent::McpSendToWorkspace {
+                sender_id,
+                sender_name,
+                target_id,
+                message,
+            } => self.handle_send_to_workspace(sender_id, sender_name, target_id, message),
             AppEvent::ReconnectAgent { agent_id } => {
                 info!(agent_id = %agent_id, "Reconnecting agent after rebuild");
                 self.ensure_agent_connected(agent_id);

@@ -48,6 +48,15 @@ pub struct NotifyParams {
     pub message: String,
 }
 
+/// Parameters for the `send_to_workspace` tool (Feature 2c).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SendToWorkspaceParams {
+    /// Target workspace id — must be one of the ids returned by `list_connected`.
+    pub target: String,
+    /// The message to deliver to the target workspace's agent.
+    pub message: String,
+}
+
 /// Optional cross-workspace context (Feature 2). Present only when the server
 /// is served over a per-agent MCP tunnel — the caller's identity is the agent
 /// whose session opened the tunnel, so cross-workspace tools can be scoped to
@@ -197,6 +206,51 @@ impl TuiMcpServer {
             .map_err(|e| McpError::internal_error(format!("serialize failed: {e}"), None))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    /// Send a message to a connected workspace's agent (Feature 2c). The
+    /// message is queued for the user's approval before it reaches the target.
+    #[tool(
+        description = "Send a message to a connected workspace's agent. `target` must be an id \
+                       returned by list_connected. The message is queued for the user's approval \
+                       before it is delivered to the target workspace."
+    )]
+    fn send_to_workspace(
+        &self,
+        Parameters(params): Parameters<SendToWorkspaceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let cw = self.cross_workspace.as_ref().ok_or_else(|| {
+            McpError::invalid_request(
+                "cross-workspace tools are not available on this connection",
+                None,
+            )
+        })?;
+        // Authorize: the caller and target must be an explicitly connected pair.
+        let connected = cw
+            .pairings
+            .lock()
+            .map_err(|_| McpError::internal_error("pairing store poisoned", None))?
+            .is_connected(&cw.caller, &params.target);
+        if !connected {
+            return Err(McpError::invalid_request(
+                format!(
+                    "not connected to workspace '{}' — call list_connected first",
+                    params.target
+                ),
+                None,
+            ));
+        }
+        self.tx
+            .send(AppEvent::McpSendToWorkspace {
+                sender_id: cw.caller.clone(),
+                sender_name: display_name(&cw.caller),
+                target_id: params.target,
+                message: params.message,
+            })
+            .map_err(|_| McpError::internal_error("TUI event loop closed", None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            "message queued for approval",
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -211,7 +265,9 @@ impl ServerHandler for TuiMcpServer {
                 "MCP server for the multi-agent TUI. \
                  Tools: show_diff (display a diff), show_file (display a file), \
                  notify (send a message to an agent's conversation), \
-                 list_connected (list connected workspaces for cross-workspace messaging)."
+                 list_connected (list connected workspaces for cross-workspace messaging), \
+                 send_to_workspace (send a message to a connected workspace's agent, \
+                 subject to the user's approval)."
                     .to_string(),
             )
     }
@@ -345,5 +401,64 @@ mod tests {
         // Names are the id with the `copilot-` prefix stripped.
         assert_eq!(peers[0]["name"], "docs");
         assert_eq!(peers[1]["name"], "web");
+    }
+
+    #[test]
+    fn send_to_workspace_requires_tunnel_scope() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let server = TuiMcpServer::new(tx);
+        let params = SendToWorkspaceParams {
+            target: "copilot-docs".into(),
+            message: "hi".into(),
+        };
+        assert!(server.send_to_workspace(Parameters(params)).is_err());
+    }
+
+    #[test]
+    fn send_to_workspace_rejects_unpaired_target() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // Caller is paired with `web`, but not with `docs`.
+        let mut store = PairingStore::default();
+        store.connect("copilot-feature", "copilot-web");
+        let pairings = Arc::new(Mutex::new(store));
+        let server = TuiMcpServer::for_tunnel(tx, "copilot-feature".into(), pairings);
+
+        let params = SendToWorkspaceParams {
+            target: "copilot-docs".into(),
+            message: "hi".into(),
+        };
+        assert!(server.send_to_workspace(Parameters(params)).is_err());
+        // No event should have been emitted for an unauthorized target.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn send_to_workspace_queues_message_for_paired_target() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut store = PairingStore::default();
+        store.connect("copilot-feature", "copilot-docs");
+        let pairings = Arc::new(Mutex::new(store));
+        let server = TuiMcpServer::for_tunnel(tx, "copilot-feature".into(), pairings);
+
+        let params = SendToWorkspaceParams {
+            target: "copilot-docs".into(),
+            message: "update the changelog".into(),
+        };
+        assert!(server.send_to_workspace(Parameters(params)).is_ok());
+
+        match rx.try_recv().unwrap() {
+            AppEvent::McpSendToWorkspace {
+                sender_id,
+                sender_name,
+                target_id,
+                message,
+            } => {
+                assert_eq!(sender_id, "copilot-feature");
+                assert_eq!(sender_name, "feature");
+                assert_eq!(target_id, "copilot-docs");
+                assert_eq!(message, "update the changelog");
+            }
+            other => panic!("expected McpSendToWorkspace, got {other:?}"),
+        }
     }
 }
