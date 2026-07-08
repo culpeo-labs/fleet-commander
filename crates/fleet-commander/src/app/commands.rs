@@ -10,7 +10,7 @@ use fleet_commander_core::container;
 use fleet_commander_core::session::SessionEvent;
 use fleet_commander_core::workspace_fs::{LocalFs, WorkspaceFs};
 
-use crate::agent::{Agent, AgentStatus};
+use crate::agent::{Agent, AgentId, AgentStatus};
 use crate::agent_kind::AgentKind;
 use crate::event::AppEvent;
 use crate::{init, workspace};
@@ -42,6 +42,15 @@ impl App {
             }
             "commands" | "cmds" => {
                 self.open_commands_view();
+            }
+            "connect" => {
+                self.connect_workspace(rest);
+            }
+            "disconnect" => {
+                self.disconnect_workspace(rest);
+            }
+            "connections" | "connected" => {
+                self.show_connections();
             }
             "q" | "quit" => {
                 self.should_quit = true;
@@ -127,6 +136,114 @@ impl App {
                 commands,
                 scroll: 0,
             });
+        }
+    }
+
+    /// `:connect <agent>` — pair the current session's agent with another so
+    /// their agents may message each other (Feature 2). `<agent>` matches
+    /// another agent by id or name (case-insensitive substring; must be
+    /// unambiguous).
+    pub(super) fn connect_workspace(&mut self, query: &str) {
+        let Some(current) = self.viewed_agent_id() else {
+            self.status_message = Some(":connect needs an open agent session".into());
+            return;
+        };
+        if query.is_empty() {
+            self.status_message = Some("Usage: :connect <agent>".into());
+            return;
+        }
+        let target = match self.resolve_peer(&current, query) {
+            Ok(id) => id,
+            Err(msg) => {
+                self.status_message = Some(msg);
+                return;
+            }
+        };
+        if self.pairings.connect(&current, &target) {
+            self.persist_pairings();
+            self.status_message = Some(format!("Connected {current} ↔ {target}"));
+        } else {
+            self.status_message = Some(format!("Already connected to {target}"));
+        }
+    }
+
+    /// `:disconnect <agent>` — remove a pairing for the current session's agent.
+    pub(super) fn disconnect_workspace(&mut self, query: &str) {
+        let Some(current) = self.viewed_agent_id() else {
+            self.status_message = Some(":disconnect needs an open agent session".into());
+            return;
+        };
+        if query.is_empty() {
+            self.status_message = Some("Usage: :disconnect <agent>".into());
+            return;
+        }
+        // Match against existing peers first so a disconnect works even if the
+        // peer agent is no longer open in this session.
+        let peers = self.pairings.peers(&current);
+        let q = query.to_lowercase();
+        let matches: Vec<String> = peers
+            .iter()
+            .filter(|p| p.to_lowercase().contains(&q))
+            .cloned()
+            .collect();
+        let target = match matches.as_slice() {
+            [one] => one.clone(),
+            [] => {
+                self.status_message = Some(format!("No connected agent matches '{query}'"));
+                return;
+            }
+            many => {
+                self.status_message = Some(format!("Ambiguous — matches: {}", many.join(", ")));
+                return;
+            }
+        };
+        if self.pairings.disconnect(&current, &target) {
+            self.persist_pairings();
+            self.status_message = Some(format!("Disconnected {current} ↔ {target}"));
+        }
+    }
+
+    /// `:connections` — list the current session agent's connected peers.
+    pub(super) fn show_connections(&mut self) {
+        let Some(current) = self.viewed_agent_id() else {
+            self.status_message = Some(":connections needs an open agent session".into());
+            return;
+        };
+        let peers = self.pairings.peers(&current);
+        if peers.is_empty() {
+            self.status_message = Some("No connected workspaces (use :connect <agent>)".into());
+        } else {
+            self.status_message = Some(format!("Connected: {}", peers.join(", ")));
+        }
+    }
+
+    /// Resolve `query` to exactly one *other* agent id, matching by id or name
+    /// (case-insensitive substring). Returns a user-facing error otherwise.
+    fn resolve_peer(&self, current: &str, query: &str) -> Result<AgentId, String> {
+        let q = query.to_lowercase();
+        let matches: Vec<&crate::agent::Agent> = self
+            .agents
+            .iter()
+            .filter(|a| a.id != current)
+            .filter(|a| a.id.to_lowercase().contains(&q) || a.name.to_lowercase().contains(&q))
+            .collect();
+        match matches.as_slice() {
+            [one] => Ok(one.id.clone()),
+            [] => Err(format!("No other agent matches '{query}'")),
+            many => Err(format!(
+                "Ambiguous — matches: {}",
+                many.iter()
+                    .map(|a| a.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// Persist pairings, surfacing any write error in the status line.
+    fn persist_pairings(&mut self) {
+        if let Err(e) = self.pairings.save() {
+            self.status_message = Some(format!("Failed to save pairings: {e}"));
         }
     }
 

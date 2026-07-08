@@ -91,6 +91,9 @@ pub struct App {
     /// value cancels the `serve_server` task running a `TuiMcpServer` over that
     /// tunnel; dropped/cancelled when the daemon reports the tunnel closed.
     pub mcp_tunnels: HashMap<u64, CancellationToken>,
+    /// Undirected cross-workspace pairings (Feature 2). The user must connect
+    /// two agents before they may message each other; persisted to disk.
+    pub pairings: crate::pairing::PairingStore,
 }
 
 /// A tool permission request waiting for the user's decision. Rendered
@@ -143,6 +146,7 @@ impl App {
             search_query: String::new(),
             search_next_id: 0,
             mcp_tunnels: HashMap::new(),
+            pairings: crate::pairing::PairingStore::load(),
         }
     }
 

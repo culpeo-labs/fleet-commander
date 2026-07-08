@@ -1417,3 +1417,67 @@ fn activate_search_hit_sets_pending_open_with_line() {
     assert_eq!(app.explorer.pending_open, Some(PathBuf::from("src/b.rs")));
     assert_eq!(app.explorer.pending_open_line, Some(42));
 }
+
+// --- Feature 2: cross-workspace connect commands -------------------------
+// These cover the guard branches only; the happy path calls `save()` (disk
+// I/O), so persistence is exercised by the `pairing` module's unit tests.
+
+#[test]
+fn connect_requires_an_open_session() {
+    let mut app = app_with_agents(); // starts on the AgentList screen
+    app.execute_command("connect Second");
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some(":connect needs an open agent session")
+    );
+    assert!(app.pairings.peers("a1").is_empty());
+}
+
+#[test]
+fn connect_without_arg_shows_usage() {
+    let mut app = app_with_agents();
+    app.handle(press(KeyCode::Enter)); // enter session for a1 (First)
+    app.execute_command("connect");
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Usage: :connect <agent>")
+    );
+}
+
+#[test]
+fn connect_unknown_agent_reports_no_match() {
+    let mut app = app_with_agents();
+    app.handle(press(KeyCode::Enter)); // session for a1
+    app.execute_command("connect nonexistent");
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("No other agent matches 'nonexistent'")
+    );
+    assert!(app.pairings.peers("a1").is_empty());
+}
+
+#[test]
+fn connect_ambiguous_query_lists_candidates() {
+    let mut app = app_with_agents();
+    app.handle(press(KeyCode::Char('j'))); // select a2 (Second)
+    app.handle(press(KeyCode::Enter)); // session for a2
+    // "ir" matches both "First" (a1) and "Third" (a3), neither is current.
+    app.execute_command("connect ir");
+    let msg = app.status_message.clone().unwrap();
+    assert!(msg.starts_with("Ambiguous"), "unexpected: {msg}");
+    assert!(
+        msg.contains("a1") && msg.contains("a3"),
+        "unexpected: {msg}"
+    );
+    assert!(app.pairings.peers("a2").is_empty());
+}
+
+#[test]
+fn connections_lists_in_memory_peers() {
+    let mut app = app_with_agents();
+    app.handle(press(KeyCode::Enter)); // session for a1
+    // Seed an in-memory pairing directly (no disk write).
+    app.pairings.connect("a1", "a2");
+    app.show_connections();
+    assert_eq!(app.status_message.as_deref(), Some("Connected: a2"));
+}
