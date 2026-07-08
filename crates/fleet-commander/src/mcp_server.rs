@@ -156,7 +156,7 @@ impl TuiMcpServer {
                 content: params.content,
             })
             .map_err(|_| McpError::internal_error("TUI event loop closed", None))?;
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             "diff displayed",
         )]))
     }
@@ -174,7 +174,7 @@ impl TuiMcpServer {
                 content: params.content,
             })
             .map_err(|_| McpError::internal_error("TUI event loop closed", None))?;
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             "file displayed",
         )]))
     }
@@ -191,7 +191,9 @@ impl TuiMcpServer {
                 message: params.message,
             })
             .map_err(|_| McpError::internal_error("TUI event loop closed", None))?;
-        Ok(CallToolResult::success(vec![Content::text("notified")]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            "notified",
+        )]))
     }
 
     /// List the workspaces the calling agent is connected to (Feature 2).
@@ -220,7 +222,7 @@ impl TuiMcpServer {
             .collect();
         let json = serde_json::to_string(&list)
             .map_err(|e| McpError::internal_error(format!("serialize failed: {e}"), None))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     /// Send a message to a connected workspace's agent (Feature 2c/2d). The
@@ -272,7 +274,7 @@ impl TuiMcpServer {
                 thread: thread.clone(),
             })
             .map_err(|_| McpError::internal_error("TUI event loop closed", None))?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "message queued for approval (thread: {thread})"
         ))]))
     }
@@ -416,8 +418,8 @@ mod tests {
         let result = server.list_connected().expect("tool should succeed");
 
         // Extract the JSON payload from the tool result.
-        let text = match &result.content[0].raw {
-            RawContent::Text(t) => t.text.clone(),
+        let text = match &result.content[0] {
+            ContentBlock::Text(t) => t.text.clone(),
             other => panic!("expected text content, got {other:?}"),
         };
         let peers: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
