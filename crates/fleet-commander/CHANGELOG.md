@@ -1,5 +1,17 @@
 # fleet-commander
 
+## 0.4.1 — 2026-07-10
+
+### Patch changes
+
+- [0515937](https://github.com/culpeo-labs/fleet-commander/commit/0515937b21bb9858e6963178fb2e148f663c2f9c) Fix a silent failure in the cross-workspace inbox: when a `send_to_workspace`
+  message's target agent was no longer available (e.g. its container/session
+  was closed after pairing), the message was dropped with only a
+  `tracing::warn!` — nothing was ever shown in the TUI, so the sender had no
+  indication delivery failed. This now surfaces a status message
+  ("could not be delivered — target agent '<id>' is no longer available") so
+  the failure is visible instead of silent.
+
 ## 0.4.0 — 2026-07-08
 
 ### Minor changes
