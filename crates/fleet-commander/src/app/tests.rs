@@ -1514,6 +1514,14 @@ fn send_to_workspace_drops_when_target_unknown() {
         "xw-1".into(),
     );
     assert!(app.inbox.is_empty());
+    // Regression: previously this failure was only logged via tracing::warn
+    // and never surfaced in the TUI, so the sender's message silently
+    // vanished with no indication that delivery failed.
+    let status = app.status_message.as_deref().unwrap_or_default();
+    assert!(
+        status.contains("could not be delivered") && status.contains("nonexistent"),
+        "expected a visible delivery failure message, got: {status:?}"
+    );
 }
 
 #[test]
