@@ -87,6 +87,13 @@ impl App {
                 %target_id,
                 "Dropping cross-workspace message: target agent not found"
             );
+            // Surface this in the TUI too — previously this failure was only
+            // ever visible in the trace log, so the sender's message vanished
+            // with no indication that delivery failed (e.g. the target
+            // agent's container/session was closed after pairing).
+            self.status_message = Some(format!(
+                "⚠ Message from {sender_name} could not be delivered — target agent '{target_id}' is no longer available"
+            ));
             return;
         };
         let target_name = target.name.clone();
